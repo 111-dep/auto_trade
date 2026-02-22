@@ -169,6 +169,19 @@ class OKXClientResilienceTests(unittest.TestCase):
         self.assertEqual(body.get("newSlOrdPx"), "-1")
         self.assertEqual(body.get("newSlTriggerPxType"), "mark")
 
+    def test_build_attach_tpsl_ords_keeps_attach_algo_cl_id(self) -> None:
+        client = OKXClient(_cfg())
+        ords = client.build_attach_tpsl_ords(
+            tp_price=1.23,
+            sl_price=1.11,
+            attach_algo_cl_ord_id="ALG-CL-001",
+        )
+        self.assertEqual(len(ords), 1)
+        row = ords[0]
+        self.assertEqual(row.get("attachAlgoClOrdId"), "ALG-CL-001")
+        self.assertEqual(row.get("tpOrdPx"), "-1")
+        self.assertEqual(row.get("slOrdPx"), "-1")
+
 
 if __name__ == "__main__":
     unittest.main()

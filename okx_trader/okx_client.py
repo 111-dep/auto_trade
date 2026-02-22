@@ -751,7 +751,13 @@ class OKXClient:
                     return recovered
                 raise
 
-    def build_attach_tpsl_ords(self, tp_price: float, sl_price: float) -> List[Dict[str, str]]:
+    def build_attach_tpsl_ords(
+        self,
+        tp_price: float,
+        sl_price: float,
+        *,
+        attach_algo_cl_ord_id: str = "",
+    ) -> List[Dict[str, str]]:
         if tp_price <= 0 or sl_price <= 0:
             return []
         px_type = self.cfg.attach_tpsl_trigger_px_type
@@ -763,6 +769,9 @@ class OKXClient:
             "tpTriggerPxType": px_type,
             "slTriggerPxType": px_type,
         }
+        algo_cl_id = str(attach_algo_cl_ord_id or "").strip()
+        if algo_cl_id:
+            ord_item["attachAlgoClOrdId"] = algo_cl_id
         return [ord_item]
 
     def get_order(self, inst_id: str, ord_id: str = "", cl_ord_id: str = "") -> Dict[str, Any]:

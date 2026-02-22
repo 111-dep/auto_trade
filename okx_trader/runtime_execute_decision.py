@@ -719,6 +719,7 @@ def execute_decision(
         planned_stop: float,
         *,
         tp_r_override: Optional[float] = None,
+        attach_algo_cl_ord_id: str = "",
     ) -> Optional[List[Dict[str, Any]]]:
         if not cfg.attach_tpsl_on_entry:
             return None
@@ -743,7 +744,11 @@ def execute_decision(
             return None
         if risk <= 0 or tp <= 0:
             return None
-        ords = client.build_attach_tpsl_ords(tp_price=float(tp), sl_price=float(planned_stop))
+        ords = client.build_attach_tpsl_ords(
+            tp_price=float(tp),
+            sl_price=float(planned_stop),
+            attach_algo_cl_ord_id=str(attach_algo_cl_ord_id or "").strip(),
+        )
         if ords:
             log(
                 f"[{inst_id}] Attach TP/SL on entry: side={target_side} "
@@ -971,10 +976,12 @@ def execute_decision(
     ) -> tuple[float, Dict[str, Any], Dict[str, Any], str]:
         norm_size, _ = client.normalize_order_size(inst_id, size, reduce_only=False)
         cl_ord_id = build_cl_ord_id(entry_side, action_tag)
+        attach_algo_cl_ord_id = build_cl_ord_id(entry_side, f"{action_tag}_algo")
         attach_algo_ords = build_entry_attach_ords(
             entry_side,
             planned_stop,
             tp_r_override=tp_r_override,
+            attach_algo_cl_ord_id=attach_algo_cl_ord_id,
         )
         if entry_side == "long":
             side = "buy"
@@ -1003,6 +1010,8 @@ def execute_decision(
                 cl_ord_id=cl_ord_id,
             )
         meta = extract_order_meta(resp)
+        if attach_algo_ords and attach_algo_cl_ord_id and ("attach_algo_cl_ord_id" not in meta):
+            meta["attach_algo_cl_ord_id"] = attach_algo_cl_ord_id
         if cl_ord_id and "entry_cl_ord_id" not in meta:
             meta["entry_cl_ord_id"] = cl_ord_id
         return float(norm_size), resp, meta, cl_ord_id

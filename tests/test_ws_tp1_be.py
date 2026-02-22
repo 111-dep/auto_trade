@@ -102,6 +102,38 @@ class WsTp1BeTests(unittest.TestCase):
         self.assertEqual(len(client.order_calls), 0)
         self.assertFalse(bool(inst_state["trade"].get("tp1_done")))
 
+    def test_algo_cl_id_only_still_uses_amend_algos(self) -> None:
+        cfg = _cfg()
+        client = _FakeClient()
+        inst_state = {
+            "trade": {
+                "side": "short",
+                "entry_price": 10.0,
+                "hard_stop": 10.5,
+                "open_size": 8.0,
+                "remaining_size": 8.0,
+                "exchange_split_tp_enabled": True,
+                "exchange_tp2_size": 4.0,
+                "attach_algo_id": "",
+                "attach_algo_cl_ord_id": "ALGCL-ONLY-1",
+                "entry_ord_id": "O-2",
+                "entry_cl_ord_id": "C-2",
+            }
+        }
+        changed = handle_tp1_fill_from_position(
+            cfg=cfg,
+            client=client,  # type: ignore[arg-type]
+            inst_id="SUI-USDT-SWAP",
+            inst_state=inst_state,
+            pos_side="short",
+            pos_size=4.0,
+            event_ts_ms=1_700_000_000_000,
+        )
+        self.assertTrue(changed)
+        self.assertEqual(len(client.algo_calls), 1)
+        self.assertEqual(len(client.order_calls), 0)
+        self.assertEqual(client.algo_calls[0].get("algo_cl_ord_id"), "ALGCL-ONLY-1")
+
     def test_fallback_to_amend_order_without_algo_id(self) -> None:
         cfg = _cfg()
         client = _FakeClient()
