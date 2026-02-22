@@ -1,0 +1,29 @@
+# --- Secrets / env ---
+okx_auto_trader.env
+.env
+.env.*
+!.env.example
+!okx_auto_trader.env.example
+
+# --- Runtime state / journals ---
+.okx_auto_trader_state.json
+okx_trader/.okx_auto_trader_state.json
+okx_trader/.okx_auto_trader_state.json.lock
+trade_journal.csv
+okx_trader/trade_journal.csv
+
+# --- Logs ---
+*.log
+runtime.log
+alerts.log
+nohup.out
+logs/
+batch_logs/
+
+# --- Cache / temp ---
+.cache/
+okx_trader/.cache/
+__pycache__/
+okx_trader/__pycache__/
+tests/__pycache__/
+*.pyc
