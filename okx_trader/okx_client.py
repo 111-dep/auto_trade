@@ -836,6 +836,39 @@ class OKXClient:
 
         return self._request("POST", "/api/v5/trade/amend-order", body=body, private=True)
 
+    def amend_algo_sl(
+        self,
+        *,
+        inst_id: str,
+        new_sl_trigger_px: float,
+        algo_id: str = "",
+        algo_cl_ord_id: str = "",
+    ) -> Dict[str, Any]:
+        if new_sl_trigger_px <= 0:
+            raise RuntimeError("new_sl_trigger_px must be > 0")
+
+        algo_id_txt = str(algo_id or "").strip()
+        algo_cl_id_txt = str(algo_cl_ord_id or "").strip()
+        if not algo_id_txt and not algo_cl_id_txt:
+            raise RuntimeError("algo_id or algo_cl_ord_id is required for amend_algo_sl")
+
+        body: Dict[str, str] = {
+            "instId": inst_id,
+            "newSlTriggerPx": self._fmt_price(float(new_sl_trigger_px)),
+            "newSlOrdPx": "-1",
+            "newSlTriggerPxType": self.cfg.attach_tpsl_trigger_px_type,
+        }
+        if algo_id_txt:
+            body["algoId"] = algo_id_txt
+        if algo_cl_id_txt:
+            body["algoClOrdId"] = algo_cl_id_txt
+
+        if self.cfg.dry_run:
+            log(f"[DRY-RUN] amend_algo_sl payload={json.dumps(body, ensure_ascii=False)}")
+            return {"data": [{"sCode": "0", "sMsg": "", "algoId": algo_id_txt or "DRY_RUN"}]}
+
+        return self._request("POST", "/api/v5/trade/amend-algos", body=body, private=True)
+
 
 def parse_position(rows: List[Dict[str, Any]], pos_mode: str) -> PositionState:
     if not rows:

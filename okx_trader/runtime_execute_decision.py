@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Optional
 
 from .alerts import handle_entry_alert, notify_trade_execution
@@ -9,7 +10,6 @@ from .decision_core import resolve_entry_decision
 from .models import Config, PositionState
 from .okx_client import OKXClient, calc_order_size
 from .risk_guard import (
-    is_daily_loss_halted,
     is_open_limit_reached,
     min_open_gap_remaining_minutes,
     normalize_loss_base_mode,
@@ -214,7 +214,13 @@ def execute_decision(
             allow_future_ms=5 * 60 * 1000,
         )
 
-    def compute_trade_pnl_usdt(side: str, entry_px: float, exit_px: float, close_size: float) -> float:
+    def compute_trade_pnl_usdt_for_inst(
+        target_inst_id: str,
+        side: str,
+        entry_px: float,
+        exit_px: float,
+        close_size: float,
+    ) -> float:
         if close_size <= 0 or entry_px <= 0 or exit_px <= 0:
             return 0.0
         side_l = str(side).strip().lower()
@@ -223,7 +229,7 @@ def execute_decision(
         sign = 1.0 if side_l == "long" else -1.0
 
         try:
-            info = client.get_instrument(inst_id)
+            info = client.get_instrument(str(target_inst_id).strip().upper())
             ct_val = float(info.get("ctVal", "0") or "0")
             ct_val_ccy = str(info.get("ctValCcy", "")).strip().upper()
         except Exception:
@@ -232,11 +238,14 @@ def execute_decision(
 
         if ct_val <= 0:
             return 0.0
-        parts = inst_id.split("-")
+        parts = str(target_inst_id).strip().upper().split("-")
         quote_ccy = parts[1].upper() if len(parts) >= 2 else ""
         if ct_val_ccy and quote_ccy and ct_val_ccy == quote_ccy:
             return sign * ((exit_px - entry_px) / entry_px) * close_size * ct_val
         return sign * (exit_px - entry_px) * close_size * ct_val
+
+    def compute_trade_pnl_usdt(side: str, entry_px: float, exit_px: float, close_size: float) -> float:
+        return compute_trade_pnl_usdt_for_inst(inst_id, side, entry_px, exit_px, close_size)
 
     def _build_trade_id(side: str, trade_ref: Optional[Dict[str, Any]] = None) -> str:
         ref = trade_ref if isinstance(trade_ref, dict) else {}
@@ -363,10 +372,61 @@ def execute_decision(
         )
         return float(pnl_usdt)
 
-    def can_open_by_daily_loss() -> bool:
+    def iter_script_trade_states() -> List[tuple[str, Dict[str, Any]]]:
+        out: List[tuple[str, Dict[str, Any]]] = []
+        inst_bucket = global_state.get("inst_state")
+        if isinstance(inst_bucket, dict):
+            for one_inst, one_state in inst_bucket.items():
+                if not isinstance(one_state, dict):
+                    continue
+                one_trade = one_state.get("trade")
+                if not is_script_trade_state(one_trade):
+                    continue
+                out.append((str(one_inst).strip().upper(), one_trade))
+            if out:
+                return out
+        one_trade = state.get("trade")
+        if is_script_trade_state(one_trade):
+            out.append((inst_id, one_trade))
+        return out
+
+    def calc_trade_potential_loss_usdt(one_inst_id: str, trade: Dict[str, Any]) -> float:
+        if not is_script_trade_state(trade):
+            return 0.0
+        side_l = str(trade.get("side", "") or "").strip().lower()
+        if side_l not in {"long", "short"}:
+            return 0.0
+        entry_px = float(trade.get("entry_price", 0.0) or 0.0)
+        stop_px = float(trade.get("hard_stop", trade.get("stop", 0.0)) or 0.0)
+        if entry_px <= 0 or stop_px <= 0:
+            return 0.0
+        remain_size = float(trade.get("remaining_size", trade.get("open_size", 0.0)) or 0.0)
+        if remain_size <= 0:
+            return 0.0
+        pnl_at_stop = compute_trade_pnl_usdt_for_inst(
+            str(one_inst_id).strip().upper(),
+            side_l,
+            entry_px,
+            stop_px,
+            remain_size,
+        )
+        if pnl_at_stop >= 0:
+            return 0.0
+        return abs(float(pnl_at_stop))
+
+    def sum_open_potential_loss_usdt() -> float:
+        total = 0.0
+        for one_inst_id, one_trade in iter_script_trade_states():
+            try:
+                total += max(0.0, calc_trade_potential_loss_usdt(one_inst_id, one_trade))
+            except Exception:
+                continue
+        return total
+
+    def get_daily_loss_budget_snapshot() -> Optional[Dict[str, float]]:
         limit_ratio = float(getattr(cfg.params, "daily_loss_limit_pct", 0.0) or 0.0)
         if limit_ratio <= 0:
-            return True
+            return None
         base_fixed_usdt = float(getattr(cfg.params, "daily_loss_base_usdt", 0.0) or 0.0)
         base_mode = normalize_loss_base_mode(str(getattr(cfg.params, "daily_loss_base_mode", "current") or "current"))
 
@@ -375,36 +435,93 @@ def execute_decision(
             has_creds = bool(cfg.api_key and cfg.secret_key and cfg.passphrase)
             if has_creds:
                 eq_now = client.get_account_equity()
-
         base_usdt = resolve_loss_base(base_mode, eq_now, base_fixed_usdt)
-
         if base_usdt <= 0:
-            return True
+            return None
 
         events = prune_script_loss_events()
         loss_sum = rolling_loss_sum(events)
+        open_potential_loss = sum_open_potential_loss_usdt()
         limit_usdt = base_usdt * limit_ratio
-        if not is_daily_loss_halted(loss_sum, base_usdt, limit_ratio):
-            return True
+        return {
+            "limit_ratio": float(limit_ratio),
+            "base_usdt": float(base_usdt),
+            "base_mode": str(base_mode),
+            "loss_sum": float(loss_sum),
+            "open_potential_loss": float(open_potential_loss),
+            "limit_usdt": float(limit_usdt),
+        }
 
+    def _log_daily_loss_halt_once(log_key: str, message: str) -> None:
         now_ts = int(sig["signal_ts_ms"])
         guard = global_state.get("daily_loss_guard")
         if not isinstance(guard, dict):
             guard = {}
             global_state["daily_loss_guard"] = guard
-        last_log_signal_ts = int(guard.get("last_halt_log_signal_ts_ms", 0) or 0)
-        if last_log_signal_ts != now_ts:
-            guard["last_halt_log_signal_ts_ms"] = now_ts
-            log(
-                "RiskGuard: script-only 24h loss halt active (loss={}usdt >= limit={}usdt, "
-                "base={}usdt mode={} limit_pct={:.2f}%), skip entry.".format(
-                    round(loss_sum, 6),
-                    round(limit_usdt, 6),
-                    round(base_usdt, 6),
-                    base_mode,
-                    limit_ratio * 100.0,
+        key_name = f"last_{log_key}_signal_ts_ms"
+        last_log_signal_ts = int(guard.get(key_name, 0) or 0)
+        if last_log_signal_ts == now_ts:
+            return
+        guard[key_name] = now_ts
+        log(message)
+
+    def can_open_by_daily_loss() -> bool:
+        snap = get_daily_loss_budget_snapshot()
+        if not isinstance(snap, dict):
+            return True
+        projected_without_new = float(snap["loss_sum"]) + float(snap["open_potential_loss"])
+        limit_usdt = float(snap["limit_usdt"])
+        if projected_without_new < limit_usdt:
+            return True
+        _log_daily_loss_halt_once(
+            "halt_log",
+            "RiskGuard: projected 24h loss halt active "
+            "(realized_loss={}usdt + open_risk={}usdt >= limit={}usdt, "
+            "base={}usdt mode={} limit_pct={:.2f}%), skip entry.".format(
+                round(float(snap["loss_sum"]), 6),
+                round(float(snap["open_potential_loss"]), 6),
+                round(limit_usdt, 6),
+                round(float(snap["base_usdt"]), 6),
+                str(snap["base_mode"]),
+                float(snap["limit_ratio"]) * 100.0,
+            ),
+        )
+        return False
+
+    def can_open_by_projected_loss(entry_side: str, planned_stop: float, planned_size: float) -> bool:
+        snap = get_daily_loss_budget_snapshot()
+        if not isinstance(snap, dict):
+            return True
+        candidate_loss = 0.0
+        try:
+            candidate_loss = abs(
+                min(
+                    0.0,
+                    compute_trade_pnl_usdt(
+                        side=entry_side,
+                        entry_px=float(sig["close"]),
+                        exit_px=float(planned_stop),
+                        close_size=float(planned_size),
+                    ),
                 )
             )
+        except Exception:
+            candidate_loss = 0.0
+        projected_with_new = float(snap["loss_sum"]) + float(snap["open_potential_loss"]) + float(candidate_loss)
+        limit_usdt = float(snap["limit_usdt"])
+        if projected_with_new <= limit_usdt + 1e-12:
+            return True
+        _log_daily_loss_halt_once(
+            "projected_halt_log",
+            "RiskGuard: projected 24h loss would exceed limit after new entry "
+            "(realized_loss={}usdt + open_risk={}usdt + new_risk={}usdt > limit={}usdt), "
+            "skip entry.".format(
+                round(float(snap["loss_sum"]), 6),
+                round(float(snap["open_potential_loss"]), 6),
+                round(float(candidate_loss), 6),
+                round(limit_usdt, 6),
+            ),
+        )
         return False
 
     def can_open_by_stop_guard(entry_side: str, planned_level: int) -> bool:
@@ -597,14 +714,19 @@ def execute_decision(
             entry_side=entry_side,
         )
 
-    def build_entry_attach_ords(entry_side: str, planned_stop: float) -> Optional[List[Dict[str, Any]]]:
+    def build_entry_attach_ords(
+        entry_side: str,
+        planned_stop: float,
+        *,
+        tp_r_override: Optional[float] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
         if not cfg.attach_tpsl_on_entry:
             return None
         entry_price = float(sig["close"])
         if planned_stop <= 0 or entry_price <= 0:
             return None
         target_side = "LONG" if entry_side == "long" else "SHORT"
-        attach_tp_r = float(cfg.attach_tpsl_tp_r)
+        attach_tp_r = float(tp_r_override) if tp_r_override is not None else float(cfg.attach_tpsl_tp_r)
         if not cfg.params.enable_close:
             # When script close-management is disabled, use TP1 as exchange TP target.
             attach_tp_r = float(cfg.params.tp1_r_mult)
@@ -629,6 +751,48 @@ def execute_decision(
             )
             return ords
         return None
+
+    def should_split_tp_on_entry() -> bool:
+        if not bool(getattr(cfg.params, "split_tp_on_entry", False)):
+            return False
+        if not cfg.attach_tpsl_on_entry:
+            return False
+        if not cfg.params.enable_close:
+            return False
+        pct = float(cfg.params.tp1_close_pct)
+        return 0.0 < pct < 1.0
+
+    def calc_split_entry_sizes(total_size: float) -> Optional[tuple[float, float]]:
+        try:
+            info = client.get_instrument(inst_id)
+            lot_sz = Decimal(str(info.get("lotSz", "0") or "0"))
+            min_sz = Decimal(str(info.get("minSz", "0") or "0"))
+            d_total = Decimal(str(total_size))
+            d_pct = Decimal(str(float(cfg.params.tp1_close_pct)))
+        except Exception:
+            return None
+        if d_total <= 0 or d_pct <= 0 or d_pct >= 1:
+            return None
+        if lot_sz <= 0:
+            return None
+        if min_sz <= 0:
+            min_sz = lot_sz
+
+        d_tp1 = (d_total * d_pct / lot_sz).to_integral_value(rounding=ROUND_DOWN) * lot_sz
+        d_tp2 = d_total - d_tp1
+        if d_tp1 <= 0 or d_tp2 <= 0:
+            return None
+        if d_tp1 < min_sz or d_tp2 < min_sz:
+            return None
+
+        try:
+            tp1_size, _ = client.normalize_order_size(inst_id, float(d_tp1), reduce_only=False)
+            tp2_size, _ = client.normalize_order_size(inst_id, float(d_tp2), reduce_only=False)
+        except Exception:
+            return None
+        if tp1_size <= 0 or tp2_size <= 0:
+            return None
+        return float(tp1_size), float(tp2_size)
 
     def extract_order_meta(order_resp: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
@@ -678,6 +842,14 @@ def execute_decision(
         target_sl: float,
         reason: str,
     ) -> None:
+        def _should_retry_with_amend_algos(err: Exception) -> bool:
+            msg = str(err or "").strip().lower()
+            if not msg:
+                return False
+            if "51503" in msg:
+                return True
+            return "already been filled or canceled" in msg
+
         if not cfg.attach_tpsl_on_entry:
             return
         if not cfg.params.enable_close:
@@ -743,6 +915,33 @@ def execute_decision(
                 f"(reason={reason}, old={old_sl:.6f})"
             )
         except Exception as e:
+            if (
+                (attach_algo_id or attach_algo_cl_id)
+                and _should_retry_with_amend_algos(e)
+            ):
+                try:
+                    client.amend_algo_sl(
+                        inst_id=inst_id,
+                        algo_id=attach_algo_id,
+                        algo_cl_ord_id=attach_algo_cl_id,
+                        new_sl_trigger_px=new_sl,
+                    )
+                    trade["exchange_sl_px"] = float(new_sl)
+                    trade["exchange_sl_last_sync_ts_ms"] = now_ts
+                    trade["exchange_sl_last_reason"] = f"{reason}:amend_algos_fallback"
+                    log(
+                        f"[{inst_id}] Exchange SL synced ({side_l}) -> {new_sl:.6f} "
+                        f"(reason={reason}, old={old_sl:.6f}, via=amend-algos)"
+                    )
+                    return
+                except Exception as e2:
+                    trade["exchange_sl_last_fail_ts_ms"] = now_ts
+                    log(
+                        f"[{inst_id}] Exchange SL sync failed after amend-algos fallback "
+                        f"({side_l}, reason={reason}): amend-order={e} | amend-algos={e2}",
+                        level="WARN",
+                    )
+                    return
             trade["exchange_sl_last_fail_ts_ms"] = now_ts
             log(
                 f"[{inst_id}] Exchange SL sync failed ({side_l}, reason={reason}): {e}",
@@ -762,13 +961,58 @@ def execute_decision(
             extra=str(sig.get("strategy_variant", "") or ""),
         )
 
+    def place_open_leg(
+        *,
+        entry_side: str,
+        size: float,
+        planned_stop: float,
+        action_tag: str,
+        tp_r_override: Optional[float] = None,
+    ) -> tuple[float, Dict[str, Any], Dict[str, Any], str]:
+        norm_size, _ = client.normalize_order_size(inst_id, size, reduce_only=False)
+        cl_ord_id = build_cl_ord_id(entry_side, action_tag)
+        attach_algo_ords = build_entry_attach_ords(
+            entry_side,
+            planned_stop,
+            tp_r_override=tp_r_override,
+        )
+        if entry_side == "long":
+            side = "buy"
+            pos_side = "long"
+        else:
+            side = "sell"
+            pos_side = "short"
+        if cfg.pos_mode == "net":
+            resp = client.place_order(
+                inst_id,
+                side,
+                norm_size,
+                pos_side=None,
+                reduce_only=False,
+                attach_algo_ords=attach_algo_ords,
+                cl_ord_id=cl_ord_id,
+            )
+        else:
+            resp = client.place_order(
+                inst_id,
+                side,
+                norm_size,
+                pos_side=pos_side,
+                reduce_only=False,
+                attach_algo_ords=attach_algo_ords,
+                cl_ord_id=cl_ord_id,
+            )
+        meta = extract_order_meta(resp)
+        if cl_ord_id and "entry_cl_ord_id" not in meta:
+            meta["entry_cl_ord_id"] = cl_ord_id
+        return float(norm_size), resp, meta, cl_ord_id
+
     def open_long() -> float:
         nonlocal entry_order_meta, entry_order_resp
         entry_order_meta = {}
         entry_order_resp = None
         if not can_open_entry("long", entry_level):
             return 0.0
-        cl_ord_id = build_cl_ord_id("long", "open")
         raw_stop = float(entry_stop or float(sig["long_stop"]))
         planned_stop = normalize_entry_stop_for_attach("long", raw_stop)
         if planned_stop != raw_stop:
@@ -777,45 +1021,104 @@ def execute_decision(
             )
         size = prepare_new_entry("long", planned_stop)
         size, _ = client.normalize_order_size(inst_id, size, reduce_only=False)
-        attach_algo_ords = build_entry_attach_ords("long", planned_stop)
-        if cfg.pos_mode == "net":
-            resp = client.place_order(
-                inst_id,
-                "buy",
-                size,
-                pos_side=None,
-                reduce_only=False,
-                attach_algo_ords=attach_algo_ords,
-                cl_ord_id=cl_ord_id,
-            )
-        else:
-            resp = client.place_order(
-                inst_id,
-                "buy",
-                size,
-                pos_side="long",
-                reduce_only=False,
-                attach_algo_ords=attach_algo_ords,
-                cl_ord_id=cl_ord_id,
-            )
+        if not can_open_by_projected_loss("long", float(planned_stop), float(size)):
+            return 0.0
+        if should_split_tp_on_entry():
+            leg_sizes = calc_split_entry_sizes(size)
+            if leg_sizes:
+                tp1_size, tp2_size = leg_sizes
+                try:
+                    # Place TP2 leg first so we always keep a managed core position.
+                    opened_tp2, resp_tp2, meta_tp2, cl_tp2 = place_open_leg(
+                        entry_side="long",
+                        size=tp2_size,
+                        planned_stop=planned_stop,
+                        action_tag="open_tp2",
+                        tp_r_override=float(cfg.params.tp2_r_mult),
+                    )
+                except Exception as e:
+                    log(f"[{inst_id}] Split TP open skipped (tp2 leg failed), fallback to single order: {e}", level="WARN")
+                else:
+                    opened_tp1 = 0.0
+                    resp_tp1: Optional[Dict[str, Any]] = None
+                    meta_tp1: Dict[str, Any] = {}
+                    cl_tp1 = ""
+                    try:
+                        opened_tp1, resp_tp1, meta_tp1, cl_tp1 = place_open_leg(
+                            entry_side="long",
+                            size=tp1_size,
+                            planned_stop=planned_stop,
+                            action_tag="open_tp1",
+                            tp_r_override=float(cfg.params.tp1_r_mult),
+                        )
+                    except Exception as e:
+                        log(
+                            f"[{inst_id}] Split TP tp1 leg failed, keep tp2-only position: {e}",
+                            level="WARN",
+                        )
+                    opened_total = float(opened_tp1 + opened_tp2)
+                    if opened_total > 0:
+                        mark_open_entry()
+                        entry_order_meta = dict(meta_tp2)
+                        entry_order_meta["planned_stop"] = float(planned_stop)
+                        entry_order_resp = resp_tp2
+                        if opened_tp1 > 0 and opened_tp2 > 0:
+                            entry_order_meta["exchange_split_tp_enabled"] = True
+                            entry_order_meta["exchange_tp1_size"] = float(opened_tp1)
+                            entry_order_meta["exchange_tp2_size"] = float(opened_tp2)
+                            entry_order_meta["exchange_tp1_ord_id"] = str(meta_tp1.get("entry_ord_id", "") or "")
+                            entry_order_meta["exchange_tp1_cl_ord_id"] = str(meta_tp1.get("entry_cl_ord_id", cl_tp1) or "")
+                            entry_order_meta["exchange_tp2_ord_id"] = str(meta_tp2.get("entry_ord_id", "") or "")
+                            entry_order_meta["exchange_tp2_cl_ord_id"] = str(meta_tp2.get("entry_cl_ord_id", cl_tp2) or "")
+                            log(
+                                f"[{inst_id}] Action: OPEN LONG SPLIT | tp1={round_size(opened_tp1)} tp2={round_size(opened_tp2)} "
+                                f"total={round_size(opened_total)} clOrdId(tp1={cl_tp1},tp2={cl_tp2})"
+                            )
+                        else:
+                            log(
+                                f"[{inst_id}] Action: OPEN LONG partial split fallback | size={round_size(opened_total)} "
+                                f"clOrdId(tp2={cl_tp2})"
+                            )
+                        notify_trade_execution(
+                            cfg,
+                            inst_id,
+                            "LONG",
+                            opened_total,
+                            sig,
+                            order_resp=entry_order_resp,
+                            planned_stop=planned_stop,
+                            entry_level=entry_level,
+                        )
+                        return opened_total
+            else:
+                log(
+                    f"[{inst_id}] Split TP skipped: size={round_size(size)} can't be split by lot/min constraints.",
+                    level="WARN",
+                )
+
+        opened_size, resp, meta, cl_ord_id = place_open_leg(
+            entry_side="long",
+            size=size,
+            planned_stop=planned_stop,
+            action_tag="open",
+            tp_r_override=None,
+        )
         mark_open_entry()
-        entry_order_meta = extract_order_meta(resp)
-        if cl_ord_id and "entry_cl_ord_id" not in entry_order_meta:
-            entry_order_meta["entry_cl_ord_id"] = cl_ord_id
+        entry_order_meta = dict(meta)
         entry_order_meta["planned_stop"] = float(planned_stop)
         entry_order_resp = resp
-        log(f"[{inst_id}] Action: OPEN LONG | size={round_size(size)} clOrdId={cl_ord_id}")
+        log(f"[{inst_id}] Action: OPEN LONG | size={round_size(opened_size)} clOrdId={cl_ord_id}")
         notify_trade_execution(
             cfg,
             inst_id,
             "LONG",
-            size,
+            opened_size,
             sig,
             order_resp=resp,
             planned_stop=planned_stop,
             entry_level=entry_level,
         )
-        return float(size)
+        return float(opened_size)
 
     def open_short() -> float:
         nonlocal entry_order_meta, entry_order_resp
@@ -823,7 +1126,6 @@ def execute_decision(
         entry_order_resp = None
         if not can_open_entry("short", entry_level):
             return 0.0
-        cl_ord_id = build_cl_ord_id("short", "open")
         raw_stop = float(entry_stop or float(sig["short_stop"]))
         planned_stop = normalize_entry_stop_for_attach("short", raw_stop)
         if planned_stop != raw_stop:
@@ -832,45 +1134,103 @@ def execute_decision(
             )
         size = prepare_new_entry("short", planned_stop)
         size, _ = client.normalize_order_size(inst_id, size, reduce_only=False)
-        attach_algo_ords = build_entry_attach_ords("short", planned_stop)
-        if cfg.pos_mode == "net":
-            resp = client.place_order(
-                inst_id,
-                "sell",
-                size,
-                pos_side=None,
-                reduce_only=False,
-                attach_algo_ords=attach_algo_ords,
-                cl_ord_id=cl_ord_id,
-            )
-        else:
-            resp = client.place_order(
-                inst_id,
-                "sell",
-                size,
-                pos_side="short",
-                reduce_only=False,
-                attach_algo_ords=attach_algo_ords,
-                cl_ord_id=cl_ord_id,
-            )
+        if not can_open_by_projected_loss("short", float(planned_stop), float(size)):
+            return 0.0
+        if should_split_tp_on_entry():
+            leg_sizes = calc_split_entry_sizes(size)
+            if leg_sizes:
+                tp1_size, tp2_size = leg_sizes
+                try:
+                    opened_tp2, resp_tp2, meta_tp2, cl_tp2 = place_open_leg(
+                        entry_side="short",
+                        size=tp2_size,
+                        planned_stop=planned_stop,
+                        action_tag="open_tp2",
+                        tp_r_override=float(cfg.params.tp2_r_mult),
+                    )
+                except Exception as e:
+                    log(f"[{inst_id}] Split TP open skipped (tp2 leg failed), fallback to single order: {e}", level="WARN")
+                else:
+                    opened_tp1 = 0.0
+                    resp_tp1: Optional[Dict[str, Any]] = None
+                    meta_tp1: Dict[str, Any] = {}
+                    cl_tp1 = ""
+                    try:
+                        opened_tp1, resp_tp1, meta_tp1, cl_tp1 = place_open_leg(
+                            entry_side="short",
+                            size=tp1_size,
+                            planned_stop=planned_stop,
+                            action_tag="open_tp1",
+                            tp_r_override=float(cfg.params.tp1_r_mult),
+                        )
+                    except Exception as e:
+                        log(
+                            f"[{inst_id}] Split TP tp1 leg failed, keep tp2-only position: {e}",
+                            level="WARN",
+                        )
+                    opened_total = float(opened_tp1 + opened_tp2)
+                    if opened_total > 0:
+                        mark_open_entry()
+                        entry_order_meta = dict(meta_tp2)
+                        entry_order_meta["planned_stop"] = float(planned_stop)
+                        entry_order_resp = resp_tp2
+                        if opened_tp1 > 0 and opened_tp2 > 0:
+                            entry_order_meta["exchange_split_tp_enabled"] = True
+                            entry_order_meta["exchange_tp1_size"] = float(opened_tp1)
+                            entry_order_meta["exchange_tp2_size"] = float(opened_tp2)
+                            entry_order_meta["exchange_tp1_ord_id"] = str(meta_tp1.get("entry_ord_id", "") or "")
+                            entry_order_meta["exchange_tp1_cl_ord_id"] = str(meta_tp1.get("entry_cl_ord_id", cl_tp1) or "")
+                            entry_order_meta["exchange_tp2_ord_id"] = str(meta_tp2.get("entry_ord_id", "") or "")
+                            entry_order_meta["exchange_tp2_cl_ord_id"] = str(meta_tp2.get("entry_cl_ord_id", cl_tp2) or "")
+                            log(
+                                f"[{inst_id}] Action: OPEN SHORT SPLIT | tp1={round_size(opened_tp1)} tp2={round_size(opened_tp2)} "
+                                f"total={round_size(opened_total)} clOrdId(tp1={cl_tp1},tp2={cl_tp2})"
+                            )
+                        else:
+                            log(
+                                f"[{inst_id}] Action: OPEN SHORT partial split fallback | size={round_size(opened_total)} "
+                                f"clOrdId(tp2={cl_tp2})"
+                            )
+                        notify_trade_execution(
+                            cfg,
+                            inst_id,
+                            "SHORT",
+                            opened_total,
+                            sig,
+                            order_resp=entry_order_resp,
+                            planned_stop=planned_stop,
+                            entry_level=entry_level,
+                        )
+                        return opened_total
+            else:
+                log(
+                    f"[{inst_id}] Split TP skipped: size={round_size(size)} can't be split by lot/min constraints.",
+                    level="WARN",
+                )
+
+        opened_size, resp, meta, cl_ord_id = place_open_leg(
+            entry_side="short",
+            size=size,
+            planned_stop=planned_stop,
+            action_tag="open",
+            tp_r_override=None,
+        )
         mark_open_entry()
-        entry_order_meta = extract_order_meta(resp)
-        if cl_ord_id and "entry_cl_ord_id" not in entry_order_meta:
-            entry_order_meta["entry_cl_ord_id"] = cl_ord_id
+        entry_order_meta = dict(meta)
         entry_order_meta["planned_stop"] = float(planned_stop)
         entry_order_resp = resp
-        log(f"[{inst_id}] Action: OPEN SHORT | size={round_size(size)} clOrdId={cl_ord_id}")
+        log(f"[{inst_id}] Action: OPEN SHORT | size={round_size(opened_size)} clOrdId={cl_ord_id}")
         notify_trade_execution(
             cfg,
             inst_id,
             "SHORT",
-            size,
+            opened_size,
             sig,
             order_resp=resp,
             planned_stop=planned_stop,
             entry_level=entry_level,
         )
-        return float(size)
+        return float(opened_size)
 
     def close_long(size: float, action_tag: str = "close") -> float:
         if size <= 0:
@@ -1038,7 +1398,15 @@ def execute_decision(
         log("Action: HOLD (no trade state available)")
         return
     try:
-        trade_state["remaining_size"] = float(pos.size)
+        prev_remaining_size = float(trade_state.get("remaining_size", pos.size) or 0.0)
+    except Exception:
+        prev_remaining_size = float(pos.size)
+    try:
+        current_pos_size = float(pos.size)
+    except Exception:
+        current_pos_size = 0.0
+    try:
+        trade_state["remaining_size"] = float(current_pos_size)
     except Exception:
         pass
     if not cfg.params.enable_close:
@@ -1050,12 +1418,53 @@ def execute_decision(
         risk = float(trade_state.get("risk", max(float(sig["atr"]), entry * 0.001)))
         peak = max(float(trade_state.get("peak_price", entry)), float(sig["close"]))
         trade_state["peak_price"] = peak
+        split_tp_enabled = bool(trade_state.get("exchange_split_tp_enabled", False))
+
+        if split_tp_enabled and (not trade_state.get("tp1_done", False)):
+            expected_tp2_size = float(trade_state.get("exchange_tp2_size", 0.0) or 0.0)
+            size_tol = max(1e-9, expected_tp2_size * 0.002)
+            if (
+                expected_tp2_size > 0
+                and current_pos_size > 0
+                and prev_remaining_size > expected_tp2_size + size_tol
+                and current_pos_size <= expected_tp2_size + size_tol
+            ):
+                trade_state["tp1_done"] = True
+                trade_state["be_armed"] = True
+                be_total_offset = max(0.0, float(cfg.params.be_offset_pct) + float(cfg.params.be_fee_buffer_pct))
+                be_stop = entry * (1.0 + be_total_offset)
+                trade_state["hard_stop"] = max(float(trade_state.get("hard_stop", be_stop)), be_stop)
+                sync_exchange_attached_sl(
+                    trade_state,
+                    side="long",
+                    target_sl=float(trade_state["hard_stop"]),
+                    reason="tp1_be_inferred",
+                )
+                closed_est = max(0.0, float(prev_remaining_size) - float(current_pos_size))
+                if closed_est > 0:
+                    tp1_px = entry + risk * cfg.params.tp1_r_mult
+                    journal_trade_event(
+                        event_type="PARTIAL_CLOSE",
+                        side="long",
+                        size=closed_est,
+                        reason="tp1_external_fill",
+                        entry_px=entry,
+                        exit_px=float(sig["close"]),
+                        stop_px=float(trade_state.get("hard_stop", sig["long_stop"])),
+                        tp1_px=tp1_px,
+                        entry_level_value=int(trade_state.get("entry_level", 0) or 0),
+                        trade_ref=trade_state,
+                    )
+                log(
+                    f"[{inst_id}] Management: TP1 inferred by external partial fill (long). "
+                    f"remain={round_size(current_pos_size)} be_sl={float(trade_state['hard_stop']):.6f}"
+                )
 
         if (not trade_state.get("be_armed", False)) and float(sig["close"]) >= entry + risk * cfg.params.be_trigger_r_mult:
             trade_state["be_armed"] = True
             log("Management: BE armed (long).")
 
-        if (not trade_state.get("tp1_done", False)) and cfg.params.tp1_close_pct > 0:
+        if (not split_tp_enabled) and (not trade_state.get("tp1_done", False)) and cfg.params.tp1_close_pct > 0:
             tp1_price = entry + risk * cfg.params.tp1_r_mult
             if float(sig["close"]) >= tp1_price:
                 pct = min(max(cfg.params.tp1_close_pct, 0.0), 1.0)
@@ -1283,12 +1692,53 @@ def execute_decision(
         risk = float(trade_state.get("risk", max(float(sig["atr"]), entry * 0.001)))
         trough = min(float(trade_state.get("trough_price", entry)), float(sig["close"]))
         trade_state["trough_price"] = trough
+        split_tp_enabled = bool(trade_state.get("exchange_split_tp_enabled", False))
+
+        if split_tp_enabled and (not trade_state.get("tp1_done", False)):
+            expected_tp2_size = float(trade_state.get("exchange_tp2_size", 0.0) or 0.0)
+            size_tol = max(1e-9, expected_tp2_size * 0.002)
+            if (
+                expected_tp2_size > 0
+                and current_pos_size > 0
+                and prev_remaining_size > expected_tp2_size + size_tol
+                and current_pos_size <= expected_tp2_size + size_tol
+            ):
+                trade_state["tp1_done"] = True
+                trade_state["be_armed"] = True
+                be_total_offset = max(0.0, float(cfg.params.be_offset_pct) + float(cfg.params.be_fee_buffer_pct))
+                be_stop = entry * (1.0 - be_total_offset)
+                trade_state["hard_stop"] = min(float(trade_state.get("hard_stop", be_stop)), be_stop)
+                sync_exchange_attached_sl(
+                    trade_state,
+                    side="short",
+                    target_sl=float(trade_state["hard_stop"]),
+                    reason="tp1_be_inferred",
+                )
+                closed_est = max(0.0, float(prev_remaining_size) - float(current_pos_size))
+                if closed_est > 0:
+                    tp1_px = entry - risk * cfg.params.tp1_r_mult
+                    journal_trade_event(
+                        event_type="PARTIAL_CLOSE",
+                        side="short",
+                        size=closed_est,
+                        reason="tp1_external_fill",
+                        entry_px=entry,
+                        exit_px=float(sig["close"]),
+                        stop_px=float(trade_state.get("hard_stop", sig["short_stop"])),
+                        tp1_px=tp1_px,
+                        entry_level_value=int(trade_state.get("entry_level", 0) or 0),
+                        trade_ref=trade_state,
+                    )
+                log(
+                    f"[{inst_id}] Management: TP1 inferred by external partial fill (short). "
+                    f"remain={round_size(current_pos_size)} be_sl={float(trade_state['hard_stop']):.6f}"
+                )
 
         if (not trade_state.get("be_armed", False)) and float(sig["close"]) <= entry - risk * cfg.params.be_trigger_r_mult:
             trade_state["be_armed"] = True
             log("Management: BE armed (short).")
 
-        if (not trade_state.get("tp1_done", False)) and cfg.params.tp1_close_pct > 0:
+        if (not split_tp_enabled) and (not trade_state.get("tp1_done", False)) and cfg.params.tp1_close_pct > 0:
             tp1_price = entry - risk * cfg.params.tp1_r_mult
             if float(sig["close"]) <= tp1_price:
                 pct = min(max(cfg.params.tp1_close_pct, 0.0), 1.0)

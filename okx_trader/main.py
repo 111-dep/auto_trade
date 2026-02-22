@@ -14,6 +14,7 @@ from .instance_lock import SingleInstanceLock
 from .okx_client import OKXClient
 from .runtime import print_stats, run_once
 from .state_store import load_state
+from .ws_tp1_be import OKXWsTp1BeWorker
 
 
 def main() -> int:
@@ -96,6 +97,7 @@ def main() -> int:
     set_log_level(cfg.log_level)
 
     lock: Optional[SingleInstanceLock] = None
+    ws_worker: Optional[OKXWsTp1BeWorker] = None
     lock_enabled = parse_bool(os.getenv("OKX_SINGLE_INSTANCE_LOCK", "1"), True) and (not args.no_instance_lock)
     lock_needed = (not args.backtest) and (not args.stats) and (not args.test_alert)
     if lock_needed and lock_enabled:
@@ -286,6 +288,9 @@ def main() -> int:
             f"journal_path={cfg.trade_journal_path} "
             f"close_enabled={cfg.params.enable_close} "
             f"signal_exit_enabled={cfg.params.signal_exit_enabled} "
+            f"split_tp_on_entry={cfg.params.split_tp_on_entry} "
+            f"ws_tp1_be={cfg.ws_tp1_be_enabled} "
+            f"ws_url={cfg.ws_private_url} "
             f"skip_foreign_mgnmode={cfg.params.skip_on_foreign_mgnmode_pos} "
             f"alert_only={cfg.alert_only} email_enabled={cfg.alert_email_enabled} "
             f"tg_enabled={cfg.alert_tg_enabled} max_level={cfg.alert_max_level} "
@@ -293,6 +298,9 @@ def main() -> int:
             f"intrabar={cfg.alert_intrabar_enabled} stats_keep_days={cfg.alert_stats_keep_days} "
             f"local_sound={cfg.alert_local_sound} local_file={cfg.alert_local_file}"
         )
+        if not args.once:
+            ws_worker = OKXWsTp1BeWorker(cfg, client, state)
+            ws_worker.start()
 
         try:
             if args.once:
@@ -313,6 +321,8 @@ def main() -> int:
             log("Stopped by user.")
             return 0
     finally:
+        if ws_worker is not None:
+            ws_worker.stop()
         if lock is not None:
             lock.release()
             log("Instance lock released.")

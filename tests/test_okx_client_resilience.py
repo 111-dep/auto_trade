@@ -142,6 +142,33 @@ class OKXClientResilienceTests(unittest.TestCase):
         self.assertEqual(data["data"][0].get("ordId"), "123456")
         self.assertEqual(data["data"][0].get("clOrdId"), "T-CLID-2")
 
+    def test_amend_algo_sl_requires_algo_identifier(self) -> None:
+        client = OKXClient(_cfg())
+        with self.assertRaises(RuntimeError):
+            client.amend_algo_sl(
+                inst_id="BTC-USDT-SWAP",
+                new_sl_trigger_px=100.0,
+            )
+
+    def test_amend_algo_sl_posts_expected_payload(self) -> None:
+        client = OKXClient(_cfg())
+        with patch.object(client, "_request", return_value={"code": "0", "data": []}) as mocked:
+            client.amend_algo_sl(
+                inst_id="SUI-USDT-SWAP",
+                new_sl_trigger_px=0.939,
+                algo_id="3330260971104681984",
+            )
+        self.assertEqual(mocked.call_count, 1)
+        args, kwargs = mocked.call_args
+        self.assertEqual(args[0], "POST")
+        self.assertEqual(args[1], "/api/v5/trade/amend-algos")
+        self.assertTrue(kwargs.get("private"))
+        body = kwargs.get("body") or {}
+        self.assertEqual(body.get("instId"), "SUI-USDT-SWAP")
+        self.assertEqual(body.get("algoId"), "3330260971104681984")
+        self.assertEqual(body.get("newSlOrdPx"), "-1")
+        self.assertEqual(body.get("newSlTriggerPxType"), "mark")
+
 
 if __name__ == "__main__":
     unittest.main()

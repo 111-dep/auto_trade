@@ -197,6 +197,7 @@ def _build_base_strategy_params() -> StrategyParams:
         exec_l3_inst_ids=parse_inst_ids(os.getenv("STRAT_EXEC_L3_INST_IDS", "")),
         enable_close=parse_bool(os.getenv("STRAT_ENABLE_CLOSE", "1"), True),
         signal_exit_enabled=parse_bool(os.getenv("STRAT_SIGNAL_EXIT_ENABLED", "0"), False),
+        split_tp_on_entry=parse_bool(os.getenv("STRAT_SPLIT_TP_ON_ENTRY", "0"), False),
         allow_reverse=parse_bool(os.getenv("STRAT_ALLOW_REVERSE", "1"), True),
         manage_only_script_positions=parse_bool(os.getenv("STRAT_MANAGE_ONLY_SCRIPT_POSITIONS", "1"), True),
         skip_on_foreign_mgnmode_pos=parse_bool(os.getenv("STRAT_SKIP_ON_FOREIGN_MGNMODE_POS", "1"), True),
@@ -517,6 +518,12 @@ def read_config(state_file_override: Optional[str]) -> Config:
         loc_bar=os.getenv("OKX_LOC_BAR", "1H"),
         ltf_bar=os.getenv("OKX_LTF_BAR", os.getenv("OKX_BAR", "15m")),
         poll_seconds=max(3, int(os.getenv("OKX_POLL_SECONDS", "10"))),
+        ws_tp1_be_enabled=parse_bool(os.getenv("OKX_WS_TP1_BE_ENABLED", "1"), True),
+        ws_private_url=os.getenv(
+            "OKX_WS_PRIVATE_URL",
+            "wss://wspap.okx.com:8443/ws/v5/private" if parse_bool(os.getenv("OKX_PAPER", "1"), True) else "wss://ws.okx.com:8443/ws/v5/private",
+        ).strip(),
+        ws_reconnect_seconds=max(1, int(os.getenv("OKX_WS_RECONNECT_SECONDS", "3"))),
         candle_limit=max(120, int(os.getenv("OKX_CANDLE_LIMIT", "300"))),
         history_cache_enabled=parse_bool(os.getenv("OKX_HISTORY_CACHE_ENABLED", "1"), True),
         history_cache_dir=os.getenv("OKX_HISTORY_CACHE_DIR", default_history_cache_dir).strip(),
@@ -599,6 +606,10 @@ def read_config(state_file_override: Optional[str]) -> Config:
         cfg.trade_journal_path = default_trade_journal_file
     if cfg.log_level not in {"DEBUG", "INFO", "WARN", "ERROR"}:
         cfg.log_level = "INFO"
+    if not cfg.ws_private_url:
+        cfg.ws_private_url = "wss://ws.okx.com:8443/ws/v5/private"
+    if cfg.ws_reconnect_seconds < 1:
+        cfg.ws_reconnect_seconds = 1
     if cfg.log_heartbeat_seconds < 30:
         cfg.log_heartbeat_seconds = 30
     if cfg.attach_tpsl_tp_r <= 0:

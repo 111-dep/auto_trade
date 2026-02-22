@@ -69,6 +69,19 @@ class ConfigProfileGroupsTests(unittest.TestCase):
         self.assertTrue(cfg.strategy_profiles["BTCETH"].signal_exit_enabled)
         self.assertFalse(cfg.strategy_profiles["DEFAULT"].signal_exit_enabled)
 
+    def test_split_tp_default_off_and_profile_override(self) -> None:
+        env = {
+            "OKX_INST_IDS": "BTC-USDT-SWAP,SOL-USDT-SWAP",
+            "STRAT_PROFILE_INST_GROUPS": "BTCETH:BTC-USDT-SWAP",
+            "STRAT_SPLIT_TP_ON_ENTRY": "0",
+            "STRAT_PROFILE_BTCETH_SPLIT_TP_ON_ENTRY": "1",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            cfg = read_config(None)
+        self.assertFalse(cfg.params.split_tp_on_entry)
+        self.assertTrue(cfg.strategy_profiles["BTCETH"].split_tp_on_entry)
+        self.assertFalse(cfg.strategy_profiles["DEFAULT"].split_tp_on_entry)
+
 
 if __name__ == "__main__":
     unittest.main()

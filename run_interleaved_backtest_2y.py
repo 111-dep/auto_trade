@@ -34,7 +34,6 @@ from okx_trader.decision_core import resolve_entry_decision
 from okx_trader.okx_client import OKXClient
 from okx_trader.profile_vote import merge_entry_votes
 from okx_trader.risk_guard import (
-    is_daily_loss_halted,
     is_open_limit_reached,
     min_open_gap_remaining_minutes,
     normalize_loss_base_mode,
@@ -170,6 +169,34 @@ def _close_remaining_r(side: str, entry: float, risk: float, close_px: float) ->
     if side_u == "LONG":
         return (float(close_px) - float(entry)) / float(risk)
     return (float(entry) - float(close_px)) / float(risk)
+
+
+def _position_potential_loss_usdt(pos: Dict[str, Any]) -> float:
+    risk_amt = max(0.0, float(pos.get("risk_amt", 0.0) or 0.0))
+    if risk_amt <= 0:
+        return 0.0
+    qty_rem = max(0.0, float(pos.get("qty_rem", 0.0) or 0.0))
+    if qty_rem <= 0:
+        return 0.0
+    side = str(pos.get("side", "") or "").strip().upper()
+    if side not in {"LONG", "SHORT"}:
+        return 0.0
+    entry = float(pos.get("entry", 0.0) or 0.0)
+    risk = max(1e-8, float(pos.get("risk", 0.0) or 0.0))
+    hard_stop = float(pos.get("hard_stop", pos.get("stop", entry)) or entry)
+    r_at_stop = float(qty_rem) * float(_close_remaining_r(side, entry, risk, hard_stop))
+    if r_at_stop >= 0:
+        return 0.0
+    return abs(float(r_at_stop) * float(risk_amt))
+
+
+def _sum_open_positions_potential_loss(open_positions: Dict[str, Dict[str, Any]]) -> float:
+    total = 0.0
+    for _, pos in open_positions.items():
+        if not isinstance(pos, dict):
+            continue
+        total += max(0.0, _position_potential_loss_usdt(pos))
+    return total
 
 
 def _simulate_live_position_step(
@@ -582,7 +609,7 @@ def main() -> int:
         )
     print(
         f"constraints: min_gap={min_gap_minutes}m inst_cap={per_inst_cap}/24h global_cap={global_cap}/24h "
-        f"loss_guard={loss_limit_pct*100:.2f}%({loss_base_mode})",
+        f"loss_guard={loss_limit_pct*100:.2f}%({loss_base_mode},projected)",
         flush=True,
     )
     print(
@@ -871,7 +898,7 @@ def main() -> int:
             max_dd_peak_ts = peak_ts
             max_dd_trough_ts = int(exit_ts)
 
-    def _can_open(inst: str, side: str, level: int, ts: int) -> bool:
+    def _can_open(inst: str, side: str, level: int, ts: int, candidate_loss_usdt: float = 0.0) -> bool:
         nonlocal skip_gap, skip_inst_cap, skip_global_cap, skip_loss_guard
         prune_ts_deque_window(global_open_ts, ts, window_ms)
         q_inst = inst_open_ts[inst]
@@ -893,8 +920,11 @@ def main() -> int:
 
         if loss_limit_pct > 0:
             rolling_loss = sum(x[1] for x in loss_events)
+            open_risk = _sum_open_positions_potential_loss(open_positions)
+            projected_loss = float(rolling_loss) + float(open_risk) + max(0.0, float(candidate_loss_usdt))
             base_val = resolve_loss_base(loss_base_mode, float(equity), float(loss_base_fixed))
-            if is_daily_loss_halted(rolling_loss, base_val, loss_limit_pct):
+            limit_val = float(base_val) * float(loss_limit_pct)
+            if projected_loss > limit_val + 1e-12:
                 skip_loss_guard += 1
                 return False
         return True
@@ -905,17 +935,16 @@ def main() -> int:
             return False
         side = str(decision.side)
         level = int(decision.level)
-        if not _can_open(inst, side, level, ts):
+        risk_amt = max(0.0, float(equity) * risk_frac)
+        if risk_amt <= 0:
+            return False
+        if not _can_open(inst, side, level, ts, candidate_loss_usdt=float(risk_amt)):
             return False
         if miss_prob > 0:
             miss_key = f"{inst}|{int(ts)}|{side}|{int(level)}|{'rev' if is_reverse else 'std'}"
             if stable_u01(miss_key) < miss_prob:
                 skip_miss += 1
                 return False
-
-        risk_amt = max(0.0, float(equity) * risk_frac)
-        if risk_amt <= 0:
-            return False
 
         pos = _new_sim_position(
             decision=decision,
@@ -1168,7 +1197,7 @@ def main() -> int:
     )
     summary.append(
         f"约束：min_gap={min_gap_minutes}m inst_cap={per_inst_cap}/24h global_cap={global_cap}/24h "
-        f"loss_guard={loss_limit_pct*100:.2f}%({loss_base_mode}) "
+        f"loss_guard={loss_limit_pct*100:.2f}%({loss_base_mode},projected) "
         f"tp1_only={tp1_only} managed_exit={managed_exit}"
     )
     summary.append(

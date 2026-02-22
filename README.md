@@ -10,6 +10,7 @@
 - 同币多策略投票后只下一个单（`STRAT_PROFILE_VOTE_*`）。
 - 分级执行与白名单（L1/L2/L3，`STRAT_EXEC_MAX_LEVEL` + `STRAT_EXEC_L3_INST_IDS`）。
 - Managed Exit：TP1 分批、TP2、保本/费用缓冲、移动止损。
+- 开仓可选拆分双腿（TP1/TP2）并在 TP1 后自动推进剩余仓位保本止损（支持 WS 快速通道）。
 - 风控：日亏熔断、开仓频率限制、连续止损冷却/冻结、风险开仓硬保护。
 - 下单幂等：支持 `clOrdId`（客户端订单号）以降低重复下单风险。
 - 进程安全：单实例锁（默认开启，防止重复启动多个实盘进程）。
@@ -108,14 +109,19 @@ python3 -m unittest discover -s tests -p "test_*.py"
 
 ## 5. 关键风控开关
 
-- `STRAT_DAILY_LOSS_LIMIT_PCT`: 24h 脚本订单亏损熔断阈值。
+- `STRAT_DAILY_LOSS_LIMIT_PCT`: 24h 风控阈值（当前按“已实现亏损 + 持仓潜在亏损 + 新单潜在亏损”预算）。
 - `STRAT_STOP_REENTRY_COOLDOWN_MINUTES`: 止损后同方向冷却。
 - `STRAT_STOP_STREAK_FREEZE_COUNT` + `STRAT_STOP_STREAK_FREEZE_HOURS`: 连续止损冻结。
 - `STRAT_STOP_STREAK_L2_ONLY`: 冻结期间仅禁 L3 或全禁。
 - `STRAT_ENABLE_CLOSE`: 是否允许脚本主动平仓（止盈/止损/反手）。
+- `STRAT_SIGNAL_EXIT_ENABLED`: 是否启用信号失效提前平仓（默认建议 `0`，更贴近当前回测口径）。
+- `STRAT_SPLIT_TP_ON_ENTRY`: 是否拆分 TP1/TP2 双腿下单（建议 `1`）。
 - `STRAT_SKIP_ON_FOREIGN_MGNMODE_POS`: 是否因异保证金模式仓位而跳过该币种。
 - `OKX_SINGLE_INSTANCE_LOCK`: 是否启用单实例锁（默认 `1`）。
 - `OKX_INSTANCE_LOCK_FILE`: 单实例锁文件路径（默认 `${OKX_STATE_FILE}.lock`）。
+- `OKX_WS_TP1_BE_ENABLED`: 是否启用私有 WS 快速管理（TP1 成交后尽快推保本止损）。
+- `OKX_WS_PRIVATE_URL`: 私有 WS 地址（实盘/模拟盘请按账户环境填写）。
+- `OKX_WS_RECONNECT_SECONDS`: 私有 WS 断线重连间隔。
 
 ## 6. 多策略档案与投票
 
@@ -234,6 +240,17 @@ tail -f /home/dandan/Workspace/test/okx_trade_suite/trade_journal.csv
 ## 9. 重大更新记录（持续维护）
 
 > 约定：每次“影响实盘行为、风控、仓位或回测口径”的更新，都要在这里追加一条。
+
+### 2026-02-22
+
+- 实盘管理新增“私有 WS 快速通道”：订阅 `positions` 后，TP1 成交可不等 15m 收线，尽快推进剩余仓位保本止损。
+- 新增 WS 相关配置：`OKX_WS_TP1_BE_ENABLED`、`OKX_WS_PRIVATE_URL`、`OKX_WS_RECONNECT_SECONDS`。
+- 新增 `amend-order` 失败回退 `amend-algos`，提高“修改交易所止损”成功率（典型处理母单已完成/取消场景）。
+- 日亏风控升级为“预计亏损预算”：
+  - 开仓前校验 `已实现亏损 + 当前持仓潜在亏损 + 新单潜在亏损 <= 日亏上限`，
+  - 不再仅依赖“亏损发生后”才熔断，避免同一时刻过多风险暴露。
+- 2Y 组合回测同步同口径风控（projected loss guard），减少实盘/回测偏差。
+- 新增最小回归测试：`tests/test_ws_tp1_be.py`、`tests/test_projected_open_risk.py`。
 
 ### 2026-02-21
 

@@ -78,6 +78,7 @@ class StrategyParams:
     exec_l3_inst_ids: List[str]
     enable_close: bool
     signal_exit_enabled: bool
+    split_tp_on_entry: bool
     allow_reverse: bool
     manage_only_script_positions: bool
     skip_on_foreign_mgnmode_pos: bool
@@ -96,6 +97,9 @@ class Config:
     loc_bar: str
     ltf_bar: str
     poll_seconds: int
+    ws_tp1_be_enabled: bool
+    ws_private_url: str
+    ws_reconnect_seconds: int
     candle_limit: int
     history_cache_enabled: bool
     history_cache_dir: str
