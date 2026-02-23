@@ -10,6 +10,7 @@ okx_auto_trader.env
 okx_trader/.okx_auto_trader_state.json
 okx_trader/.okx_auto_trader_state.json.lock
 trade_journal.csv
+trade_journal_order_links.csv
 okx_trader/trade_journal.csv
 
 # --- Logs ---

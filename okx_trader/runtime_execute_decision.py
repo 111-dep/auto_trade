@@ -20,7 +20,7 @@ from .risk_guard import (
     rolling_loss_sum,
 )
 from .signals import compute_alert_targets
-from .trade_journal import append_trade_journal
+from .trade_journal import append_trade_journal, append_trade_order_link
 from .runtime_order_id import build_runtime_order_cl_id
 
 def execute_decision(
@@ -301,10 +301,13 @@ def execute_decision(
         entry_ord_id = str(ref.get("entry_ord_id", "") or "").strip()
         entry_cl_ord_id = str(ref.get("entry_cl_ord_id", "") or "").strip()
         ord_id_new, cl_id_new = _extract_order_ids(order_resp)
-        if ord_id_new:
-            entry_ord_id = ord_id_new
-        if cl_id_new:
-            entry_cl_ord_id = cl_id_new
+        event_ord_id = str(ord_id_new or "").strip()
+        event_cl_ord_id = str(cl_id_new or "").strip()
+        # Keep stable entry order ids; only backfill from event response when local entry ids are missing.
+        if (not entry_ord_id) and event_ord_id:
+            entry_ord_id = event_ord_id
+        if (not entry_cl_ord_id) and event_cl_ord_id:
+            entry_cl_ord_id = event_cl_ord_id
 
         trade_id_val = str(trade_id or "").strip() or _build_trade_id(side, ref if ref else {"entry_ord_id": entry_ord_id})
 
@@ -337,6 +340,25 @@ def execute_decision(
             "vote_winner_level": int(sig.get("vote_winner_level", 0) or 0),
         }
         append_trade_journal(cfg, row)
+        append_trade_order_link(
+            cfg,
+            {
+                "event_ts_ms": event_ts_ms,
+                "signal_ts_ms": signal_ts_ms,
+                "event_type": str(event_type or "").strip().upper(),
+                "trade_id": trade_id_val,
+                "inst_id": inst_id,
+                "side": str(side or "").strip().lower(),
+                "size": size_v,
+                "reason": str(reason or "").strip(),
+                "entry_ord_id": entry_ord_id,
+                "entry_cl_ord_id": entry_cl_ord_id,
+                "event_ord_id": event_ord_id,
+                "event_cl_ord_id": event_cl_ord_id,
+                "profile_id": profile_id,
+                "strategy_variant": str(sig.get("strategy_variant", "") or ""),
+            },
+        )
 
     def record_script_realized_loss(
         side: str,
@@ -348,29 +370,163 @@ def execute_decision(
         if close_size <= 0:
             return 0.0
         pnl_usdt = compute_trade_pnl_usdt(side=side, entry_px=entry_px, exit_px=exit_px, close_size=close_size)
-        if pnl_usdt >= 0:
-            return float(pnl_usdt)
-        loss_usdt = abs(pnl_usdt)
-        events = prune_script_loss_events()
-        events.append(
-            {
-                "ts_ms": int(sig["signal_ts_ms"]),
-                "inst_id": inst_id,
-                "loss_usdt": float(loss_usdt),
-                "reason": reason,
-            }
-        )
-        global_state["script_loss_events"] = events
-        log(
-            "[{}] RiskGuard: script loss recorded loss={}usdt side={} close_size={} reason={}".format(
-                inst_id,
-                round(loss_usdt, 6),
-                side,
-                round_size(close_size),
-                reason,
+        if pnl_usdt < 0:
+            loss_usdt = abs(pnl_usdt)
+            events = prune_script_loss_events()
+            events.append(
+                {
+                    "ts_ms": int(sig["signal_ts_ms"]),
+                    "inst_id": inst_id,
+                    "loss_usdt": float(loss_usdt),
+                    "reason": reason,
+                }
             )
-        )
+            global_state["script_loss_events"] = events
+            log(
+                "[{}] RiskGuard: script loss recorded loss={}usdt side={} close_size={} reason={}".format(
+                    inst_id,
+                    round(loss_usdt, 6),
+                    side,
+                    round_size(close_size),
+                    reason,
+                )
+            )
         return float(pnl_usdt)
+
+    def _safe_float(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    def _safe_int(v: Any, default: int = 0) -> int:
+        try:
+            return int(v)
+        except Exception:
+            return int(default)
+
+    def _trade_open_size(trade_ref: Dict[str, Any]) -> float:
+        return max(0.0, _safe_float(trade_ref.get("open_size", 0.0), 0.0))
+
+    def _trade_realized_size(trade_ref: Dict[str, Any]) -> float:
+        if "realized_size" in trade_ref:
+            return max(0.0, _safe_float(trade_ref.get("realized_size", 0.0), 0.0))
+        # Backward compatibility for older states:
+        # if TP1 is already done but no realized_size field, infer realized from open-remaining.
+        if bool(trade_ref.get("tp1_done", False)):
+            open_size = _trade_open_size(trade_ref)
+            rem_size = max(0.0, _safe_float(trade_ref.get("remaining_size", open_size), open_size))
+            if open_size > 0 and rem_size <= open_size:
+                return max(0.0, open_size - rem_size)
+        return 0.0
+
+    def _trade_unclosed_size(trade_ref: Dict[str, Any], *, fallback_remaining: float = 0.0) -> float:
+        open_size = _trade_open_size(trade_ref)
+        realized_size = _trade_realized_size(trade_ref)
+        if open_size > 0:
+            out = max(0.0, open_size - min(open_size, realized_size))
+            if out > 0:
+                return out
+        fb = max(0.0, float(fallback_remaining or 0.0))
+        return fb
+
+    def _mark_trade_realized(trade_ref: Dict[str, Any], *, size_delta: float, pnl_delta: float = 0.0) -> None:
+        if not isinstance(trade_ref, dict):
+            return
+        add_size = max(0.0, float(size_delta or 0.0))
+        if add_size <= 0:
+            return
+        open_size = _trade_open_size(trade_ref)
+        realized_size_old = _trade_realized_size(trade_ref)
+        realized_size_new = realized_size_old + add_size
+        if open_size > 0:
+            realized_size_new = min(open_size, realized_size_new)
+            trade_ref["remaining_size"] = max(0.0, open_size - realized_size_new)
+        trade_ref["realized_size"] = realized_size_new
+        trade_ref["realized_pnl_usdt"] = _safe_float(trade_ref.get("realized_pnl_usdt", 0.0), 0.0) + float(
+            pnl_delta or 0.0
+        )
+
+    def _infer_external_close_is_stop(side: str, exit_px: float, hard_stop: float) -> bool:
+        s = str(side or "").strip().lower()
+        stop = float(hard_stop or 0.0)
+        px = float(exit_px or 0.0)
+        if stop <= 0 or px <= 0:
+            return False
+        tol = max(1e-9, abs(stop) * 8e-4)
+        if s == "long":
+            return px <= (stop + tol)
+        if s == "short":
+            return px >= (stop - tol)
+        return False
+
+    def _mark_seen_closed_pos_id(pos_id: str) -> None:
+        pid = str(pos_id or "").strip()
+        if not pid:
+            return
+        key = "closed_pos_history_seen_ids"
+        raw = state.get(key)
+        seen: List[str] = [str(x).strip() for x in raw if str(x).strip()] if isinstance(raw, list) else []
+        if pid in seen:
+            state[key] = seen[-200:]
+            return
+        seen.append(pid)
+        state[key] = seen[-200:]
+
+    def _fetch_closed_position_history_row(side: str, created_ts_ms: int) -> Optional[Dict[str, Any]]:
+        direction = str(side or "").strip().lower()
+        if direction not in {"long", "short"}:
+            return None
+        try:
+            payload = client._request(
+                "GET",
+                "/api/v5/account/positions-history",
+                params={"instType": "SWAP", "instId": inst_id, "state": "filled", "limit": "20"},
+                private=True,
+            )
+            rows = payload.get("data", []) or []
+        except Exception as e:
+            log(f"[{inst_id}] Positions-history lookup failed: {e}", level="WARN")
+            return None
+
+        seen_key = "closed_pos_history_seen_ids"
+        seen_set = set(str(x).strip() for x in (state.get(seen_key) or []) if str(x).strip())
+        created_cut = int(created_ts_ms or 0)
+        best: Optional[Dict[str, Any]] = None
+        best_ut = -1
+        for row in rows:
+            if str(row.get("instId", "")).strip().upper() != str(inst_id).strip().upper():
+                continue
+            if str(row.get("direction", "")).strip().lower() != direction:
+                continue
+            if str(row.get("mgnMode", "")).strip().lower() != str(cfg.td_mode).strip().lower():
+                continue
+            pos_id = str(row.get("posId", "") or "").strip()
+            if pos_id and pos_id in seen_set:
+                continue
+            u_time = _safe_int(row.get("uTime"), 0)
+            c_time = _safe_int(row.get("cTime"), 0)
+            if created_cut > 0:
+                # Position close/open should be later than the tracked trade creation.
+                if u_time > 0 and u_time + 2 * 60 * 1000 < created_cut:
+                    continue
+                if c_time > 0 and c_time + 30 * 60 * 1000 < created_cut:
+                    continue
+            if u_time > best_ut:
+                best_ut = u_time
+                best = row
+        if not isinstance(best, dict):
+            return None
+        return {
+            "pos_id": str(best.get("posId", "") or "").strip(),
+            "open_avg_px": _safe_float(best.get("openAvgPx"), 0.0),
+            "close_avg_px": _safe_float(best.get("closeAvgPx"), 0.0),
+            "open_max_pos": _safe_float(best.get("openMaxPos"), 0.0),
+            "close_total_pos": _safe_float(best.get("closeTotalPos"), 0.0),
+            "realized_pnl": _safe_float(best.get("realizedPnl"), 0.0),
+            "u_time": _safe_int(best.get("uTime"), 0),
+            "c_time": _safe_int(best.get("cTime"), 0),
+        }
 
     def iter_script_trade_states() -> List[tuple[str, Dict[str, Any]]]:
         out: List[tuple[str, Dict[str, Any]]] = []
@@ -665,6 +821,8 @@ def execute_decision(
                 "managed_by": "script",
                 "open_size": size_val,
                 "remaining_size": size_val,
+                "realized_size": 0.0,
+                "realized_pnl_usdt": 0.0,
             }
             return
 
@@ -684,6 +842,8 @@ def execute_decision(
             "managed_by": "script",
             "open_size": size_val,
             "remaining_size": size_val,
+            "realized_size": 0.0,
+            "realized_pnl_usdt": 0.0,
         }
 
     def ensure_trade_state_for_position() -> None:
@@ -1241,35 +1401,35 @@ def execute_decision(
         )
         return float(opened_size)
 
-    def close_long(size: float, action_tag: str = "close") -> float:
+    def close_long(size: float, action_tag: str = "close") -> tuple[float, Dict[str, Any]]:
         if size <= 0:
-            return 0.0
+            return 0.0, {}
         try:
             size, _ = client.normalize_order_size(inst_id, size, reduce_only=True)
         except Exception:
             size = float(size)
         cl_ord_id = build_cl_ord_id("long", action_tag)
         if cfg.pos_mode == "net":
-            client.place_order(inst_id, "sell", size, pos_side=None, reduce_only=True, cl_ord_id=cl_ord_id)
+            resp = client.place_order(inst_id, "sell", size, pos_side=None, reduce_only=True, cl_ord_id=cl_ord_id)
         else:
-            client.place_order(inst_id, "sell", size, pos_side="long", reduce_only=True, cl_ord_id=cl_ord_id)
+            resp = client.place_order(inst_id, "sell", size, pos_side="long", reduce_only=True, cl_ord_id=cl_ord_id)
         log(f"[{inst_id}] Action: CLOSE LONG clOrdId={cl_ord_id}")
-        return float(size)
+        return float(size), resp if isinstance(resp, dict) else {}
 
-    def close_short(size: float, action_tag: str = "close") -> float:
+    def close_short(size: float, action_tag: str = "close") -> tuple[float, Dict[str, Any]]:
         if size <= 0:
-            return 0.0
+            return 0.0, {}
         try:
             size, _ = client.normalize_order_size(inst_id, size, reduce_only=True)
         except Exception:
             size = float(size)
         cl_ord_id = build_cl_ord_id("short", action_tag)
         if cfg.pos_mode == "net":
-            client.place_order(inst_id, "buy", size, pos_side=None, reduce_only=True, cl_ord_id=cl_ord_id)
+            resp = client.place_order(inst_id, "buy", size, pos_side=None, reduce_only=True, cl_ord_id=cl_ord_id)
         else:
-            client.place_order(inst_id, "buy", size, pos_side="short", reduce_only=True, cl_ord_id=cl_ord_id)
+            resp = client.place_order(inst_id, "buy", size, pos_side="short", reduce_only=True, cl_ord_id=cl_ord_id)
         log(f"[{inst_id}] Action: CLOSE SHORT clOrdId={cl_ord_id}")
-        return float(size)
+        return float(size), resp if isinstance(resp, dict) else {}
 
     if pos.side == "flat":
         prev_trade = state.get("trade") if isinstance(state.get("trade"), dict) else None
@@ -1283,14 +1443,69 @@ def execute_decision(
                 prev_rem = float(prev_trade.get("remaining_size", prev_trade.get("open_size", 0.0)) or 0.0)
             except Exception:
                 prev_rem = 0.0
-            if prev_side in {"long", "short"} and prev_rem > 0:
-                pnl_usdt = record_script_realized_loss(
-                    side=prev_side,
-                    entry_px=prev_entry,
-                    exit_px=float(sig["close"]),
-                    close_size=prev_rem,
-                    reason="external_close_or_attached_tpsl",
+            prev_open_size = _trade_open_size(prev_trade)
+            prev_unclosed_size = _trade_unclosed_size(prev_trade, fallback_remaining=prev_rem)
+            if prev_side in {"long", "short"} and prev_unclosed_size > 0:
+                close_size = float(prev_unclosed_size)
+                close_entry_px = float(prev_entry)
+                close_exit_px = float(sig["close"])
+                used_hist = False
+
+                hist = _fetch_closed_position_history_row(
+                    prev_side,
+                    _safe_int(prev_trade.get("created_ts_ms"), 0),
                 )
+                if isinstance(hist, dict):
+                    hist_close_size = max(0.0, float(hist.get("close_total_pos", 0.0) or 0.0))
+                    hist_open_size = max(0.0, float(hist.get("open_max_pos", 0.0) or 0.0))
+                    if hist_close_size > 0:
+                        if prev_open_size > 0 and hist_open_size > 0:
+                            if abs(hist_open_size - prev_open_size) <= max(1e-9, prev_open_size * 0.30):
+                                close_size = max(close_size, hist_close_size)
+                                used_hist = True
+                        elif hist_close_size >= close_size * 0.95:
+                            close_size = max(close_size, hist_close_size)
+                            used_hist = True
+                    hist_open_px = float(hist.get("open_avg_px", 0.0) or 0.0)
+                    hist_close_px = float(hist.get("close_avg_px", 0.0) or 0.0)
+                    if used_hist and hist_open_px > 0:
+                        close_entry_px = hist_open_px
+                    if used_hist and hist_close_px > 0:
+                        close_exit_px = hist_close_px
+                    if used_hist:
+                        _mark_seen_closed_pos_id(str(hist.get("pos_id", "") or ""))
+
+                if used_hist:
+                    pnl_usdt = float(hist.get("realized_pnl", 0.0) or 0.0)
+                    if pnl_usdt < 0:
+                        loss_usdt = abs(pnl_usdt)
+                        events = prune_script_loss_events()
+                        events.append(
+                            {
+                                "ts_ms": int(sig["signal_ts_ms"]),
+                                "inst_id": inst_id,
+                                "loss_usdt": float(loss_usdt),
+                                "reason": "external_close_or_attached_tpsl",
+                            }
+                        )
+                        global_state["script_loss_events"] = events
+                        log(
+                            "[{}] RiskGuard: script loss recorded (history) loss={}usdt side={} close_size={} reason={}".format(
+                                inst_id,
+                                round(loss_usdt, 6),
+                                prev_side,
+                                round_size(close_size),
+                                "external_close_or_attached_tpsl",
+                            )
+                        )
+                else:
+                    pnl_usdt = record_script_realized_loss(
+                        side=prev_side,
+                        entry_px=close_entry_px,
+                        exit_px=close_exit_px,
+                        close_size=close_size,
+                        reason="external_close_or_attached_tpsl",
+                    )
                 prev_stop = None
                 try:
                     prev_stop = float(prev_trade.get("hard_stop", 0.0) or 0.0)
@@ -1299,14 +1514,20 @@ def execute_decision(
                 journal_trade_event(
                     event_type="EXTERNAL_CLOSE",
                     side=prev_side,
-                    size=prev_rem,
+                    size=close_size,
                     reason="external_close_or_attached_tpsl",
-                    entry_px=prev_entry,
-                    exit_px=float(sig["close"]),
+                    entry_px=close_entry_px,
+                    exit_px=close_exit_px,
                     stop_px=prev_stop if prev_stop and prev_stop > 0 else None,
                     pnl_usdt=float(pnl_usdt),
                     entry_level_value=int(prev_trade.get("entry_level", 0) or 0),
                     trade_ref=prev_trade,
+                )
+                stop_hit = _infer_external_close_is_stop(prev_side, close_exit_px, float(prev_stop or 0.0))
+                _record_stop_guard(
+                    prev_side,
+                    is_stop_event=bool(stop_hit),
+                    reason="external_close_or_attached_tpsl",
                 )
         clear_trade_state()
         if exec_long_entry:
@@ -1406,6 +1627,17 @@ def execute_decision(
     if not trade_state:
         log("Action: HOLD (no trade state available)")
         return
+    if isinstance(trade_state, dict):
+        if "realized_size" not in trade_state:
+            inferred = 0.0
+            if bool(trade_state.get("tp1_done", False)):
+                open_sz = _trade_open_size(trade_state)
+                rem_sz = max(0.0, _safe_float(trade_state.get("remaining_size", open_sz), open_sz))
+                if open_sz > 0 and rem_sz <= open_sz:
+                    inferred = max(0.0, open_sz - rem_sz)
+            trade_state["realized_size"] = float(inferred)
+        if "realized_pnl_usdt" not in trade_state:
+            trade_state["realized_pnl_usdt"] = 0.0
     try:
         prev_remaining_size = float(trade_state.get("remaining_size", pos.size) or 0.0)
     except Exception:
@@ -1451,6 +1683,12 @@ def execute_decision(
                 )
                 closed_est = max(0.0, float(prev_remaining_size) - float(current_pos_size))
                 if closed_est > 0:
+                    partial_pnl = compute_trade_pnl_usdt(
+                        side="long",
+                        entry_px=entry,
+                        exit_px=float(sig["close"]),
+                        close_size=closed_est,
+                    )
                     tp1_px = entry + risk * cfg.params.tp1_r_mult
                     journal_trade_event(
                         event_type="PARTIAL_CLOSE",
@@ -1464,6 +1702,7 @@ def execute_decision(
                         entry_level_value=int(trade_state.get("entry_level", 0) or 0),
                         trade_ref=trade_state,
                     )
+                    _mark_trade_realized(trade_state, size_delta=closed_est, pnl_delta=partial_pnl)
                 log(
                     f"[{inst_id}] Management: TP1 inferred by external partial fill (long). "
                     f"remain={round_size(current_pos_size)} be_sl={float(trade_state['hard_stop']):.6f}"
@@ -1479,7 +1718,7 @@ def execute_decision(
                 pct = min(max(cfg.params.tp1_close_pct, 0.0), 1.0)
                 close_size = pos.size * pct
                 if close_size >= pos.size * 0.999:
-                    closed_sz = close_long(pos.size, action_tag="tp1_full")
+                    closed_sz, close_resp = close_long(pos.size, action_tag="tp1_full")
                     pnl_usdt = record_script_realized_loss(
                         side="long",
                         entry_px=entry,
@@ -1499,6 +1738,7 @@ def execute_decision(
                         pnl_usdt=float(pnl_usdt),
                         entry_level_value=int(trade_state.get("entry_level", 0) or 0),
                         trade_ref=trade_state,
+                        order_resp=close_resp,
                     )
                     _record_stop_guard("long", is_stop_event=False, reason="tp1_full")
                     clear_trade_state()
@@ -1510,7 +1750,7 @@ def execute_decision(
                         log(
                             f"[{inst_id}] Management: TP1 partial close not tradable ({e}), fallback to full close."
                         )
-                        closed_sz = close_long(pos.size, action_tag="tp1_full_fallback")
+                        closed_sz, close_resp = close_long(pos.size, action_tag="tp1_full_fallback")
                         pnl_usdt = record_script_realized_loss(
                             side="long",
                             entry_px=entry,
@@ -1530,11 +1770,12 @@ def execute_decision(
                             pnl_usdt=float(pnl_usdt),
                             entry_level_value=int(trade_state.get("entry_level", 0) or 0),
                             trade_ref=trade_state,
+                            order_resp=close_resp,
                         )
                         _record_stop_guard("long", is_stop_event=False, reason="tp1_full_fallback")
                         clear_trade_state()
                         return
-                    closed_sz = close_long(close_size, action_tag="tp1_partial")
+                    closed_sz, close_resp = close_long(close_size, action_tag="tp1_partial")
                     pnl_usdt = record_script_realized_loss(
                         side="long",
                         entry_px=entry,
@@ -1554,7 +1795,9 @@ def execute_decision(
                         pnl_usdt=float(pnl_usdt),
                         entry_level_value=int(trade_state.get("entry_level", 0) or 0),
                         trade_ref=trade_state,
+                        order_resp=close_resp,
                     )
+                    _mark_trade_realized(trade_state, size_delta=closed_sz, pnl_delta=float(pnl_usdt))
                     trade_state["tp1_done"] = True
                     trade_state["be_armed"] = True
                     remain = max(0.0, float(trade_state.get("remaining_size", pos.size)) - float(closed_sz))
@@ -1578,7 +1821,7 @@ def execute_decision(
         if cfg.params.tp2_close_rest and trade_state.get("tp1_done", False):
             tp2_price = entry + risk * cfg.params.tp2_r_mult
             if float(sig["close"]) >= tp2_price and pos.size > 0:
-                closed_sz = close_long(pos.size, action_tag="tp2_full")
+                closed_sz, close_resp = close_long(pos.size, action_tag="tp2_full")
                 pnl_usdt = record_script_realized_loss(
                     side="long",
                     entry_px=entry,
@@ -1598,6 +1841,7 @@ def execute_decision(
                     pnl_usdt=float(pnl_usdt),
                     entry_level_value=int(trade_state.get("entry_level", 0) or 0),
                     trade_ref=trade_state,
+                    order_resp=close_resp,
                 )
                 _record_stop_guard("long", is_stop_event=False, reason="tp2_full")
                 clear_trade_state()
@@ -1622,7 +1866,7 @@ def execute_decision(
         stop_hit = float(sig["close"]) <= dynamic_stop
         signal_exit_hit = bool(cfg.params.signal_exit_enabled) and bool(sig.get("long_exit", False))
         if signal_exit_hit or stop_hit:
-            closed_sz = close_long(pos.size, action_tag="close_exit")
+            closed_sz, close_resp = close_long(pos.size, action_tag="close_exit")
             close_reason = "long_stop" if stop_hit else "long_exit"
             pnl_usdt = record_script_realized_loss(
                 side="long",
@@ -1642,6 +1886,7 @@ def execute_decision(
                 pnl_usdt=float(pnl_usdt),
                 entry_level_value=int(trade_state.get("entry_level", 0) or 0),
                 trade_ref=trade_state,
+                order_resp=close_resp,
             )
             _record_stop_guard("long", is_stop_event=stop_hit, reason=close_reason)
             clear_trade_state()
@@ -1725,6 +1970,12 @@ def execute_decision(
                 )
                 closed_est = max(0.0, float(prev_remaining_size) - float(current_pos_size))
                 if closed_est > 0:
+                    partial_pnl = compute_trade_pnl_usdt(
+                        side="short",
+                        entry_px=entry,
+                        exit_px=float(sig["close"]),
+                        close_size=closed_est,
+                    )
                     tp1_px = entry - risk * cfg.params.tp1_r_mult
                     journal_trade_event(
                         event_type="PARTIAL_CLOSE",
@@ -1738,6 +1989,7 @@ def execute_decision(
                         entry_level_value=int(trade_state.get("entry_level", 0) or 0),
                         trade_ref=trade_state,
                     )
+                    _mark_trade_realized(trade_state, size_delta=closed_est, pnl_delta=partial_pnl)
                 log(
                     f"[{inst_id}] Management: TP1 inferred by external partial fill (short). "
                     f"remain={round_size(current_pos_size)} be_sl={float(trade_state['hard_stop']):.6f}"
@@ -1753,7 +2005,7 @@ def execute_decision(
                 pct = min(max(cfg.params.tp1_close_pct, 0.0), 1.0)
                 close_size = pos.size * pct
                 if close_size >= pos.size * 0.999:
-                    closed_sz = close_short(pos.size, action_tag="tp1_full")
+                    closed_sz, close_resp = close_short(pos.size, action_tag="tp1_full")
                     pnl_usdt = record_script_realized_loss(
                         side="short",
                         entry_px=entry,
@@ -1773,6 +2025,7 @@ def execute_decision(
                         pnl_usdt=float(pnl_usdt),
                         entry_level_value=int(trade_state.get("entry_level", 0) or 0),
                         trade_ref=trade_state,
+                        order_resp=close_resp,
                     )
                     _record_stop_guard("short", is_stop_event=False, reason="tp1_full")
                     clear_trade_state()
@@ -1784,7 +2037,7 @@ def execute_decision(
                         log(
                             f"[{inst_id}] Management: TP1 partial close not tradable ({e}), fallback to full close."
                         )
-                        closed_sz = close_short(pos.size, action_tag="tp1_full_fallback")
+                        closed_sz, close_resp = close_short(pos.size, action_tag="tp1_full_fallback")
                         pnl_usdt = record_script_realized_loss(
                             side="short",
                             entry_px=entry,
@@ -1804,11 +2057,12 @@ def execute_decision(
                             pnl_usdt=float(pnl_usdt),
                             entry_level_value=int(trade_state.get("entry_level", 0) or 0),
                             trade_ref=trade_state,
+                            order_resp=close_resp,
                         )
                         _record_stop_guard("short", is_stop_event=False, reason="tp1_full_fallback")
                         clear_trade_state()
                         return
-                    closed_sz = close_short(close_size, action_tag="tp1_partial")
+                    closed_sz, close_resp = close_short(close_size, action_tag="tp1_partial")
                     pnl_usdt = record_script_realized_loss(
                         side="short",
                         entry_px=entry,
@@ -1828,7 +2082,9 @@ def execute_decision(
                         pnl_usdt=float(pnl_usdt),
                         entry_level_value=int(trade_state.get("entry_level", 0) or 0),
                         trade_ref=trade_state,
+                        order_resp=close_resp,
                     )
+                    _mark_trade_realized(trade_state, size_delta=closed_sz, pnl_delta=float(pnl_usdt))
                     trade_state["tp1_done"] = True
                     trade_state["be_armed"] = True
                     remain = max(0.0, float(trade_state.get("remaining_size", pos.size)) - float(closed_sz))
@@ -1852,7 +2108,7 @@ def execute_decision(
         if cfg.params.tp2_close_rest and trade_state.get("tp1_done", False):
             tp2_price = entry - risk * cfg.params.tp2_r_mult
             if float(sig["close"]) <= tp2_price and pos.size > 0:
-                closed_sz = close_short(pos.size, action_tag="tp2_full")
+                closed_sz, close_resp = close_short(pos.size, action_tag="tp2_full")
                 pnl_usdt = record_script_realized_loss(
                     side="short",
                     entry_px=entry,
@@ -1872,6 +2128,7 @@ def execute_decision(
                     pnl_usdt=float(pnl_usdt),
                     entry_level_value=int(trade_state.get("entry_level", 0) or 0),
                     trade_ref=trade_state,
+                    order_resp=close_resp,
                 )
                 _record_stop_guard("short", is_stop_event=False, reason="tp2_full")
                 clear_trade_state()
@@ -1896,7 +2153,7 @@ def execute_decision(
         stop_hit = float(sig["close"]) >= dynamic_stop
         signal_exit_hit = bool(cfg.params.signal_exit_enabled) and bool(sig.get("short_exit", False))
         if signal_exit_hit or stop_hit:
-            closed_sz = close_short(pos.size, action_tag="close_exit")
+            closed_sz, close_resp = close_short(pos.size, action_tag="close_exit")
             close_reason = "short_stop" if stop_hit else "short_exit"
             pnl_usdt = record_script_realized_loss(
                 side="short",
@@ -1916,6 +2173,7 @@ def execute_decision(
                 pnl_usdt=float(pnl_usdt),
                 entry_level_value=int(trade_state.get("entry_level", 0) or 0),
                 trade_ref=trade_state,
+                order_resp=close_resp,
             )
             _record_stop_guard("short", is_stop_event=stop_hit, reason=close_reason)
             clear_trade_state()

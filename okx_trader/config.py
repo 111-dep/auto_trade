@@ -571,6 +571,7 @@ def read_config(state_file_override: Optional[str]) -> Config:
         alert_smtp_use_ssl=parse_bool(os.getenv("ALERT_SMTP_USE_SSL", "1"), True),
         alert_smtp_starttls=parse_bool(os.getenv("ALERT_SMTP_STARTTLS", "0"), False),
         alert_tg_enabled=parse_bool(os.getenv("ALERT_TG_ENABLED", "0"), False),
+        alert_tg_trade_exec_enabled=parse_bool(os.getenv("ALERT_TG_TRADE_EXEC_ENABLED", "1"), True),
         alert_tg_bot_token=os.getenv("ALERT_TG_BOT_TOKEN", "").strip(),
         alert_tg_chat_id=os.getenv("ALERT_TG_CHAT_ID", "").strip(),
         alert_tg_api_base=os.getenv("ALERT_TG_API_BASE", "https://api.telegram.org").strip(),
@@ -585,6 +586,8 @@ def read_config(state_file_override: Optional[str]) -> Config:
         alert_local_file_path=os.getenv("ALERT_LOCAL_FILE_PATH", default_alert_file).strip(),
         trade_journal_enabled=parse_bool(os.getenv("TRADE_JOURNAL_ENABLED", "1"), True),
         trade_journal_path=os.getenv("TRADE_JOURNAL_PATH", default_trade_journal_file).strip(),
+        trade_order_link_enabled=parse_bool(os.getenv("TRADE_ORDER_LINK_ENABLED", "1"), True),
+        trade_order_link_path=os.getenv("TRADE_ORDER_LINK_PATH", "").strip(),
         params=params,
         strategy_profile_map=strategy_profile_map,
         strategy_profile_vote_map=strategy_profile_vote_map,
@@ -604,6 +607,12 @@ def read_config(state_file_override: Optional[str]) -> Config:
         cfg.history_cache_dir = default_history_cache_dir
     if not cfg.trade_journal_path:
         cfg.trade_journal_path = default_trade_journal_file
+    if not cfg.trade_order_link_path:
+        base, ext = os.path.splitext(cfg.trade_journal_path)
+        if ext.lower() == ".csv":
+            cfg.trade_order_link_path = f"{base}_order_links.csv"
+        else:
+            cfg.trade_order_link_path = f"{cfg.trade_journal_path}.order_links.csv"
     if cfg.log_level not in {"DEBUG", "INFO", "WARN", "ERROR"}:
         cfg.log_level = "INFO"
     if not cfg.ws_private_url:

@@ -141,6 +141,7 @@ class Config:
     alert_smtp_use_ssl: bool
     alert_smtp_starttls: bool
     alert_tg_enabled: bool
+    alert_tg_trade_exec_enabled: bool
     alert_tg_bot_token: str
     alert_tg_chat_id: str
     alert_tg_api_base: str
@@ -155,6 +156,8 @@ class Config:
     alert_local_file_path: str
     trade_journal_enabled: bool
     trade_journal_path: str
+    trade_order_link_enabled: bool
+    trade_order_link_path: str
     params: StrategyParams
     strategy_profile_map: Dict[str, str]
     strategy_profile_vote_map: Dict[str, List[str]]

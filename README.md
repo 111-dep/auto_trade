@@ -17,6 +17,7 @@
 - 可选按风险百分比自动算仓（`OKX_MARGIN_USDT=0` + `STRAT_RISK_FRAC`）。
 - 非同保证金模式仓位处理（`STRAT_SKIP_ON_FOREIGN_MGNMODE_POS`）。
 - 逐笔交易台账（CSV，开仓/部分止盈/平仓/外部平仓）。
+- 订单关联台账（CSV，按 `trade_id` 记录 `entry/event ordId/clOrdId`，便于精确对账）。
 - 回测：
   - `okx_auto_trader.py --backtest`（单路径回测）
   - `run_interleaved_backtest_2y.py`（2Y 多币组合、真实顺序）
@@ -35,6 +36,7 @@
 - `runtime.log`: 实盘运行日志。
 - `alerts.log`: 本地提醒日志。
 - `trade_journal.csv`: 逐笔交易台账。
+- `trade_journal_order_links.csv`: 订单关联台账（复盘/对账用）。
 
 ## 3. 快速启动
 
@@ -87,6 +89,13 @@ pkill -TERM -f "python3 -u /home/dandan/Workspace/test/okx_trade_suite/okx_auto_
 # 仅停止 / 仅启动
 /home/dandan/Workspace/test/okx_trade_suite/restart_live_trader.sh --stop
 /home/dandan/Workspace/test/okx_trade_suite/restart_live_trader.sh --start
+
+# 启动时关闭“开仓执行TG消息”（仅本次进程）
+/home/dandan/Workspace/test/okx_trade_suite/restart_live_trader.sh --start --no-open-tg
+
+# 启动 + 一键安装每天07:00的24h日报TG（含净收益/权益）
+/home/dandan/Workspace/test/okx_trade_suite/restart_live_trader.sh \
+  --start --no-open-tg --setup-daily-recap-7am
 ```
 
 7. 最小回归测试（本地无交易所依赖）
@@ -249,17 +258,134 @@ python3 -u /home/dandan/Workspace/test/okx_trade_suite/check_recent_signals_stri
 ```env
 TRADE_JOURNAL_ENABLED=1
 TRADE_JOURNAL_PATH=/home/dandan/Workspace/test/okx_trade_suite/trade_journal.csv
+TRADE_ORDER_LINK_ENABLED=1
+TRADE_ORDER_LINK_PATH=/home/dandan/Workspace/test/okx_trade_suite/trade_journal_order_links.csv
 ```
 
 查看：
 
 ```bash
 tail -f /home/dandan/Workspace/test/okx_trade_suite/trade_journal.csv
+tail -f /home/dandan/Workspace/test/okx_trade_suite/trade_journal_order_links.csv
 ```
 
 字段包含：`event_type`、`trade_id`、`inst_id`、`side`、`size`、`entry_price`、`exit_price`、`reason`、`pnl_usdt`、`profile_id`、`strategy_variant`、`vote_*` 等。
+订单关联台账额外包含：`entry_ord_id`、`entry_cl_ord_id`、`event_ord_id`、`event_cl_ord_id`。
 
-## 9. 重大更新记录（持续维护）
+实盘“净收益”对账（含手续费/资金费）：
+
+```bash
+cd /home/dandan/Workspace/test/okx_trade_suite
+NOW_UTC="$(date -u '+%Y-%m-%d %H:%M:%S')"
+
+python3 reconcile_okx_bills.py \
+  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
+  --start "2026-02-22 00:00:00" \
+  --end "$NOW_UTC" \
+  --trade-filter-mode merge \
+  --trade-clord-prefix AT \
+  --order-link-path /home/dandan/Workspace/test/okx_trade_suite/trade_journal_order_links.csv \
+  --show-trade-ids 20 \
+  --dump-trade-id-csv /home/dandan/Workspace/test/okx_trade_suite/logs/trade_id_reconcile.csv \
+  --funding-scope matched-trade-inst
+```
+
+说明：
+- `trade_net = sum(pnl + fee)`（type=2，支持 `clOrdId` 前缀 + 订单关联台账双重过滤）
+- `funding_net = sum(balChg)`（type=8，默认只统计“脚本实际交易过的币种”）
+- `recommended_net = trade_net + funding_net`
+- `raw_balChg_all` 仅作账户流水参考，不能直接当策略净收益（会混入逐仓保证金进出）
+- `--show-trade-ids` 会打印按 `trade_id` 聚合后的 top/bottom（`bill_net`、`journal_pnl`、delta）。
+- `--dump-trade-id-csv` 会导出逐 `trade_id` 对账明细，便于月度复盘。
+
+## 9. 每日复盘（自动化）
+
+手动生成今日复盘（默认 `+08:00`）：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/run_daily_recap.sh
+```
+
+指定日期复盘：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/run_daily_recap.sh \
+  --date 2026-02-23 \
+  --tz-offset +08:00
+```
+
+按“过去 24 小时滚动窗口”复盘（推荐用于 07:00 定时报）：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/run_daily_recap.sh \
+  --rolling-hours 24 \
+  --with-bills \
+  --with-exchange-history \
+  --with-equity \
+  --telegram
+```
+
+附带账单对账（含手续费/资金费）：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/run_daily_recap.sh --with-bills
+```
+
+附带交易所已平仓历史口径（用于核对“连亏笔数”）：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/run_daily_recap.sh --with-exchange-history
+```
+
+附带当前账户权益（用于“本金还有多少”）：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/run_daily_recap.sh --with-equity
+```
+
+默认输出位置：
+- `logs/daily_recap/YYYY-MM-DD.md`（日报）
+- `logs/daily_recap/YYYY-MM-DD.json`（结构化结果）
+- `logs/daily_recap/index.log`（每日一行滚动摘要）
+
+安装每天定时任务（默认每天 `00:10`）：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/setup_daily_recap_cron.sh --time 00:10
+```
+
+安装“每天 07:00 推送过去 24h 汇总到 Telegram”（含账单净值、交易所口径和权益）：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/setup_daily_recap_cron.sh \
+  --time 07:00 \
+  --rolling-hours 24 \
+  --with-bills \
+  --with-exchange-history \
+  --with-equity \
+  --telegram
+```
+
+如你只想保留“日报 TG”，关闭“开仓执行 TG”，在 `okx_auto_trader.env` 设置：
+
+```env
+ALERT_TG_ENABLED=1
+ALERT_TG_TRADE_EXEC_ENABLED=0
+```
+
+安装后可检查：
+
+```bash
+crontab -l | grep OKX_DAILY_RECAP
+```
+
+如只想先看要写入的 cron 行，不立即安装：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/setup_daily_recap_cron.sh --print-only
+```
+
+## 10. 重大更新记录（持续维护）
 
 > 约定：每次“影响实盘行为、风控、仓位或回测口径”的更新，都要在这里追加一条。
 
@@ -281,6 +407,22 @@ tail -f /home/dandan/Workspace/test/okx_trade_suite/trade_journal.csv
   - `--save-tag`：自动保存本次回测日志、交易CSV并写入 `logs/backtest_snapshots/index.csv`。
   - `--save-dir`：可自定义快照目录。
   - `index.csv` 自动记录关键摘要和 `payoff_r` / `profit_factor_r`，便于横向比较经典结果。
+- 复盘链路增强：
+  - 新增 `trade_journal_order_links.csv`，按 `trade_id` 记录开平仓事件关联的 `ordId/clOrdId`。
+  - 执行层平仓事件补写订单回执，便于后续按订单ID做净值核算。
+  - `reconcile_okx_bills.py` 新增 `--trade-filter-mode`（`prefix/order-link/merge/none`）与 `--order-link-path`，对账可直接结合订单关联台账。
+- 新增每日复盘工具链：
+  - `daily_recap.py`：按日期/滚动窗口汇总 `trade_journal.csv` + `runtime.log`，输出胜负统计、原因分布、连亏/连赢与运行健康指标。
+  - `run_daily_recap.sh`：一键生成日报（支持 `--rolling-hours` / `--with-bills` / `--with-exchange-history` / `--with-equity` / `--telegram`）。
+  - `setup_daily_recap_cron.sh`：一键安装 cron 定时任务。
+- Telegram 通道拆分：
+  - 新增 `ALERT_TG_TRADE_EXEC_ENABLED`，可只关闭“开仓执行”消息，不影响日报 Telegram 推送。
+- 日报增强：
+  - 支持 `--rolling-hours`（如 24h 滚动窗口）和 `--with-equity`（带当前账户权益）。
+  - `--telegram` 内容升级为 24h 汇总（开仓次数、胜负、净收益、当前权益/基准本金）。
+- 修复拆分双腿场景的外部平仓台账：
+  - 以“未结清仓位(open_size-realized_size)”计算最终 EXTERNAL_CLOSE 尺寸，避免“只记录半仓/漏记”。
+  - 平仓时引入 `positions-history` 对齐（同币种/方向/时间窗），优先使用交易所实际 `closeAvgPx/realizedPnl` 兜底。
 
 ### 2026-02-21
 
@@ -301,7 +443,7 @@ tail -f /home/dandan/Workspace/test/okx_trade_suite/trade_journal.csv
 - 配置层新增“策略分组写法”：`STRAT_PROFILE_INST_GROUPS` 与 `STRAT_PROFILE_VOTE_INST_GROUPS`（并保持旧 `..._MAP` 兼容，且旧写法优先）。
 - 新增 `check_recent_signals_strict.py`：严格最近 N 小时信号检查（共同终点窗口、`raw` vs `decision` 分层统计、可选实时拉取）。
 
-## 10. 后续更新模板（复制追加）
+## 11. 后续更新模板（复制追加）
 
 ```md
 ### YYYY-MM-DD

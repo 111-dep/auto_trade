@@ -5,10 +5,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRADER="${ROOT_DIR}/okx_auto_trader.py"
 ENV_FILE="${ROOT_DIR}/okx_auto_trader.env"
 LOG_FILE="${ROOT_DIR}/runtime.log"
+RECAP_CRON_SETUP="${ROOT_DIR}/setup_daily_recap_cron.sh"
 
 ACTION="restart"   # restart | start | stop | status
 TAIL_LOG=1
 WAIT_SEC=8
+TG_TRADE_EXEC_OVERRIDE=""   # "", "0", "1"
+SETUP_DAILY_RECAP_7AM=0
+DAILY_RECAP_TZ="+08:00"
 
 usage() {
   cat <<'EOF'
@@ -26,6 +30,11 @@ Options:
   --status         Show process status only
   --no-tail        Do not tail log after start/restart
   --wait-sec N     Wait seconds after TERM before KILL (default: 8)
+  --no-open-tg     Start with ALERT_TG_TRADE_EXEC_ENABLED=0（不发开仓TG）
+  --setup-daily-recap-7am
+                   Install/update 07:00 daily recap telegram cron (rolling 24h)
+  --daily-recap-tz +08:00
+                   Timezone for daily recap cron (default: +08:00)
   -h, --help       Show this help
 
 Examples:
@@ -33,6 +42,8 @@ Examples:
   ./restart_live_trader.sh --no-tail
   ./restart_live_trader.sh --stop
   ./restart_live_trader.sh --start --env /path/to/okx_auto_trader.env
+  ./restart_live_trader.sh --start --no-open-tg
+  ./restart_live_trader.sh --start --no-open-tg --setup-daily-recap-7am
 EOF
 }
 
@@ -66,6 +77,18 @@ while [[ $# -gt 0 ]]; do
       WAIT_SEC="${2:-8}"
       shift 2
       ;;
+    --no-open-tg)
+      TG_TRADE_EXEC_OVERRIDE="0"
+      shift
+      ;;
+    --setup-daily-recap-7am)
+      SETUP_DAILY_RECAP_7AM=1
+      shift
+      ;;
+    --daily-recap-tz)
+      DAILY_RECAP_TZ="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -85,6 +108,11 @@ fi
 
 if ! [[ "${WAIT_SEC}" =~ ^[0-9]+$ ]]; then
   echo "--wait-sec must be integer, got: ${WAIT_SEC}" >&2
+  exit 1
+fi
+
+if [[ -n "${TG_TRADE_EXEC_OVERRIDE}" ]] && [[ "${TG_TRADE_EXEC_OVERRIDE}" != "0" && "${TG_TRADE_EXEC_OVERRIDE}" != "1" ]]; then
+  echo "Invalid TG trade exec override: ${TG_TRADE_EXEC_OVERRIDE}" >&2
   exit 1
 fi
 
@@ -163,7 +191,13 @@ start_trader() {
 
   mkdir -p "$(dirname "${LOG_FILE}")"
   echo "Starting trader..."
-  nohup python3 -u "${TRADER}" --env "${ENV_FILE}" > "${LOG_FILE}" 2>&1 &
+  if [[ -n "${TG_TRADE_EXEC_OVERRIDE}" ]]; then
+    echo "Start override: ALERT_TG_TRADE_EXEC_ENABLED=${TG_TRADE_EXEC_OVERRIDE}"
+    nohup env "ALERT_TG_TRADE_EXEC_ENABLED=${TG_TRADE_EXEC_OVERRIDE}" \
+      python3 -u "${TRADER}" --env "${ENV_FILE}" > "${LOG_FILE}" 2>&1 &
+  else
+    nohup python3 -u "${TRADER}" --env "${ENV_FILE}" > "${LOG_FILE}" 2>&1 &
+  fi
   local new_pid=$!
   sleep 1
 
@@ -179,6 +213,23 @@ start_trader() {
     echo "Tailing log (Ctrl+C to exit tail only):"
     tail -f "${LOG_FILE}"
   fi
+}
+
+setup_daily_recap_7am() {
+  if [[ ! -x "${RECAP_CRON_SETUP}" ]]; then
+    echo "Daily recap cron setup script not found or not executable: ${RECAP_CRON_SETUP}" >&2
+    return 1
+  fi
+  echo "Installing daily recap cron (07:00, rolling 24h, telegram)..."
+  "${RECAP_CRON_SETUP}" \
+    --time 07:00 \
+    --env "${ENV_FILE}" \
+    --tz-offset "${DAILY_RECAP_TZ}" \
+    --rolling-hours 24 \
+    --with-bills \
+    --with-exchange-history \
+    --with-equity \
+    --telegram
 }
 
 case "${ACTION}" in
@@ -201,3 +252,6 @@ case "${ACTION}" in
     ;;
 esac
 
+if [[ "${SETUP_DAILY_RECAP_7AM}" == "1" ]]; then
+  setup_daily_recap_7am
+fi

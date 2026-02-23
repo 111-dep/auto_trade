@@ -37,6 +37,25 @@ _JOURNAL_FIELDS = [
     "vote_winner_level",
 ]
 
+_ORDER_LINK_FIELDS = [
+    "event_ts_ms",
+    "event_ts_utc",
+    "signal_ts_ms",
+    "signal_ts_utc",
+    "event_type",
+    "trade_id",
+    "inst_id",
+    "side",
+    "size",
+    "reason",
+    "entry_ord_id",
+    "entry_cl_ord_id",
+    "event_ord_id",
+    "event_cl_ord_id",
+    "profile_id",
+    "strategy_variant",
+]
+
 
 def _fmt_ts_ms(ts_ms: Any) -> str:
     try:
@@ -45,18 +64,14 @@ def _fmt_ts_ms(ts_ms: Any) -> str:
         return ""
 
 
-def append_trade_journal(cfg: Config, row_data: Dict[str, Any]) -> bool:
-    if not bool(getattr(cfg, "trade_journal_enabled", False)):
-        return False
-    path = str(getattr(cfg, "trade_journal_path", "") or "").strip()
-    if not path:
+def _append_csv_row(path: str, fieldnames: list[str], row_data: Dict[str, Any]) -> bool:
+    if not str(path or "").strip():
         return False
 
     row: Dict[str, Any] = {}
-    for k in _JOURNAL_FIELDS:
+    for k in fieldnames:
         row[k] = row_data.get(k, "")
 
-    # Best-effort UTC helpers.
     if not row.get("event_ts_utc"):
         row["event_ts_utc"] = _fmt_ts_ms(row.get("event_ts_ms"))
     if not row.get("signal_ts_utc"):
@@ -69,7 +84,7 @@ def append_trade_journal(cfg: Config, row_data: Dict[str, Any]) -> bool:
     file_exists = os.path.exists(path)
     try:
         with open(path, "a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=_JOURNAL_FIELDS)
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             if (not file_exists) or os.path.getsize(path) <= 0:
                 writer.writeheader()
             writer.writerow(row)
@@ -77,3 +92,37 @@ def append_trade_journal(cfg: Config, row_data: Dict[str, Any]) -> bool:
     except Exception as e:
         log(f"[Journal] write failed: {e}", level="WARN")
         return False
+
+
+def append_trade_journal(cfg: Config, row_data: Dict[str, Any]) -> bool:
+    if not bool(getattr(cfg, "trade_journal_enabled", False)):
+        return False
+    path = str(getattr(cfg, "trade_journal_path", "") or "").strip()
+    if not path:
+        return False
+
+    return _append_csv_row(path, _JOURNAL_FIELDS, row_data)
+
+
+def _resolve_trade_order_link_path(cfg: Config) -> str:
+    custom_path = str(getattr(cfg, "trade_order_link_path", "") or "").strip()
+    if custom_path:
+        return custom_path
+    journal_path = str(getattr(cfg, "trade_journal_path", "") or "").strip()
+    if not journal_path:
+        return ""
+    base, ext = os.path.splitext(journal_path)
+    if ext.lower() == ".csv":
+        return f"{base}_order_links.csv"
+    return f"{journal_path}.order_links.csv"
+
+
+def append_trade_order_link(cfg: Config, row_data: Dict[str, Any]) -> bool:
+    if not bool(getattr(cfg, "trade_order_link_enabled", True)):
+        return False
+    if not bool(getattr(cfg, "trade_journal_enabled", False)):
+        return False
+    path = _resolve_trade_order_link_path(cfg)
+    if not path:
+        return False
+    return _append_csv_row(path, _ORDER_LINK_FIELDS, row_data)

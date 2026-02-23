@@ -517,7 +517,11 @@ def notify_trade_execution(
     )
 
     email_sent = send_email(cfg, subject, body) if cfg.alert_email_enabled else False
-    telegram_sent = send_telegram(cfg, tg_text)
+    telegram_sent = False
+    if cfg.alert_tg_trade_exec_enabled:
+        telegram_sent = send_telegram(cfg, tg_text)
+    else:
+        log(f"[{inst_id}] Trade notify telegram skipped by ALERT_TG_TRADE_EXEC_ENABLED=0")
     file_written = emit_local_alert(cfg, subject, body)
     log(
         f"[{inst_id}] Trade notify: OPEN {side_u} size={round_size(float(size))} "
