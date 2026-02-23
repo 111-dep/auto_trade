@@ -199,6 +199,28 @@ python3 -u /home/dandan/Workspace/test/okx_trade_suite/run_interleaved_backtest_
   --title "2Y ManagedExit 中等悲观"
 ```
 
+保存“经典回测快照”（避免每次重跑后找不到历史结果）：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/run_backtest_2y_cached.sh \
+  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
+  --bars 70080 \
+  --risk-frac 0.005 \
+  --title "2Y ManagedExit 实盘拟合(中严之间)" \
+  --save-tag classic_livefit
+```
+
+快照产物默认落在：
+- `logs/backtest_snapshots/<timestamp>_<tag>.log`（完整结果日志）
+- `logs/backtest_snapshots/<timestamp>_<tag>_trades.csv`（交易明细）
+- `logs/backtest_snapshots/index.csv`（汇总索引，含 `avg_r`/`payoff_r`/`profit_factor_r`）
+
+查看最近快照：
+
+```bash
+tail -n 5 /home/dandan/Workspace/test/okx_trade_suite/logs/backtest_snapshots/index.csv
+```
+
 如果你明确允许脚本在线补拉缺失历史：
 
 ```bash
@@ -252,6 +274,13 @@ tail -f /home/dandan/Workspace/test/okx_trade_suite/trade_journal.csv
   - 不再仅依赖“亏损发生后”才熔断，避免同一时刻过多风险暴露。
 - 2Y 组合回测同步同口径风控（projected loss guard），减少实盘/回测偏差。
 - 新增最小回归测试：`tests/test_ws_tp1_be.py`、`tests/test_projected_open_risk.py`。
+
+### 2026-02-23
+
+- `run_backtest_2y_cached.sh` 新增回测快照功能：
+  - `--save-tag`：自动保存本次回测日志、交易CSV并写入 `logs/backtest_snapshots/index.csv`。
+  - `--save-dir`：可自定义快照目录。
+  - `index.csv` 自动记录关键摘要和 `payoff_r` / `profit_factor_r`，便于横向比较经典结果。
 
 ### 2026-02-21
 

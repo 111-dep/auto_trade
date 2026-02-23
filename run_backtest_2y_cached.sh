@@ -7,12 +7,12 @@ RUNNER="${ROOT_DIR}/run_interleaved_backtest_2y.py"
 ENV_FILE="${ROOT_DIR}/okx_auto_trader.env"
 BARS=70080
 RISK_FRAC="0.005"
-FEE_RATE="0.0008"
-SLIPPAGE_BPS="1.5"
-STOP_EXTRA_R="0.03"
-TP_HAIRCUT_R="0.02"
-MISS_PROB="0.03"
-TITLE="2Y ManagedExit 中等悲观"
+FEE_RATE="0.0010"
+SLIPPAGE_BPS="3.0"
+STOP_EXTRA_R="0.05"
+TP_HAIRCUT_R="0.04"
+MISS_PROB="0.06"
+TITLE="2Y ManagedExit 实盘拟合(中严之间)"
 INST_IDS=""
 TRADES_CSV=""
 SEND_TG=0
@@ -20,6 +20,8 @@ MANAGED_EXIT=1
 PESSIMISTIC=0
 CACHE_ONLY=1
 CACHE_TTL_SECONDS=315360000
+SAVE_TAG=""
+SAVE_DIR="${ROOT_DIR}/logs/backtest_snapshots"
 
 usage() {
   cat <<'EOF'
@@ -31,11 +33,11 @@ Options:
   --inst-ids CSV             Override instruments (default: use env OKX_INST_IDS)
   --bars N                   LTF bars (default: 70080)
   --risk-frac X              Risk fraction (default: 0.005)
-  --fee-rate X               Fee rate (default: 0.0008)
-  --slippage-bps X           Slippage bps (default: 1.5)
-  --stop-extra-r X           Stop extra R (default: 0.03)
-  --tp-haircut-r X           TP haircut R (default: 0.02)
-  --miss-prob X              Miss probability (default: 0.03)
+  --fee-rate X               Fee rate (default: 0.0010)
+  --slippage-bps X           Slippage bps (default: 3.0)
+  --stop-extra-r X           Stop extra R (default: 0.05)
+  --tp-haircut-r X           TP haircut R (default: 0.04)
+  --miss-prob X              Miss probability (default: 0.06)
   --title TEXT               Result title
   --dump-trades-csv PATH     Dump accepted trades to CSV (for Monte Carlo)
   --send-telegram            Enable telegram send (default: off)
@@ -44,6 +46,8 @@ Options:
   --pessimistic              Use runner built-in pessimistic fallback
   --allow-fetch              Skip cache sufficiency precheck (may fetch from network)
   --cache-ttl-seconds N      Cache TTL override (default: 315360000)
+  --save-tag NAME            Save this run as a snapshot (log+trades+summary index)
+  --save-dir PATH            Snapshot output directory (default: ./logs/backtest_snapshots)
   -h, --help                 Show help
 
 Notes:
@@ -122,6 +126,14 @@ while [[ $# -gt 0 ]]; do
       CACHE_TTL_SECONDS="${2:-}"
       shift 2
       ;;
+    --save-tag)
+      SAVE_TAG="${2:-}"
+      shift 2
+      ;;
+    --save-dir)
+      SAVE_DIR="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -148,6 +160,10 @@ if ! [[ "${BARS}" =~ ^[0-9]+$ ]]; then
 fi
 if ! [[ "${CACHE_TTL_SECONDS}" =~ ^[0-9]+$ ]]; then
   echo "--cache-ttl-seconds must be integer, got: ${CACHE_TTL_SECONDS}" >&2
+  exit 1
+fi
+if [[ -n "${SAVE_TAG}" && -z "${SAVE_DIR}" ]]; then
+  echo "--save-dir cannot be empty when --save-tag is set" >&2
   exit 1
 fi
 
@@ -236,6 +252,22 @@ print(
 PY
 fi
 
+RESULT_LOG=""
+INDEX_CSV=""
+if [[ -n "${SAVE_TAG}" ]]; then
+  mkdir -p "${SAVE_DIR}"
+  TS_UTC="$(date -u +%Y%m%d_%H%M%S)"
+  SAFE_TAG="$(echo "${SAVE_TAG}" | sed 's/[^A-Za-z0-9._-]/_/g')"
+  RESULT_LOG="${SAVE_DIR}/${TS_UTC}_${SAFE_TAG}.log"
+  if [[ -z "${TRADES_CSV}" ]]; then
+    TRADES_CSV="${SAVE_DIR}/${TS_UTC}_${SAFE_TAG}_trades.csv"
+  fi
+  INDEX_CSV="${SAVE_DIR}/index.csv"
+  echo "[Snapshot] tag=${SAFE_TAG}"
+  echo "[Snapshot] log=${RESULT_LOG}"
+  echo "[Snapshot] trades=${TRADES_CSV}"
+fi
+
 CMD=(python3 -u "${RUNNER}" --env "${ENV_FILE}" --bars "${BARS}" --risk-frac "${RISK_FRAC}" --fee-rate "${FEE_RATE}" --slippage-bps "${SLIPPAGE_BPS}" --stop-extra-r "${STOP_EXTRA_R}" --tp-haircut-r "${TP_HAIRCUT_R}" --miss-prob "${MISS_PROB}" --title "${TITLE}")
 if [[ "${MANAGED_EXIT}" -eq 1 ]]; then
   CMD+=(--managed-exit)
@@ -248,4 +280,137 @@ if [[ -n "${TRADES_CSV}" ]]; then
 fi
 
 echo "[Run] ${CMD[*]}"
-"${CMD[@]}"
+if [[ -n "${RESULT_LOG}" ]]; then
+  "${CMD[@]}" | tee "${RESULT_LOG}"
+else
+  "${CMD[@]}"
+fi
+
+if [[ -n "${RESULT_LOG}" ]]; then
+  SNAP_INST_IDS="${INST_IDS}"
+  if [[ -z "${SNAP_INST_IDS}" ]]; then
+    SNAP_INST_IDS="$(awk -F= '/^OKX_INST_IDS=/{print $2}' "${ENV_FILE}" | tail -n1 | tr -d '"' || true)"
+  fi
+  python3 - "${INDEX_CSV}" "${RESULT_LOG}" "${TRADES_CSV}" "${SAVE_TAG}" "${TITLE}" "${BARS}" "${RISK_FRAC}" "${FEE_RATE}" "${SLIPPAGE_BPS}" "${STOP_EXTRA_R}" "${TP_HAIRCUT_R}" "${MISS_PROB}" "${MANAGED_EXIT}" "${PESSIMISTIC}" "${SNAP_INST_IDS}" <<'PY'
+import csv
+import os
+import re
+import sys
+from datetime import datetime, timezone
+
+(
+    index_csv,
+    result_log,
+    trades_csv,
+    save_tag,
+    title,
+    bars,
+    risk_frac,
+    fee_rate,
+    slippage_bps,
+    stop_extra_r,
+    tp_haircut_r,
+    miss_prob,
+    managed_exit,
+    pessimistic,
+    inst_ids,
+) = sys.argv[1:]
+
+with open(result_log, "r", encoding="utf-8", errors="ignore") as f:
+    text = f.read()
+
+def _find(pat: str):
+    m = re.search(pat, text, flags=re.MULTILINE)
+    return m.groups() if m else None
+
+start_equity = ""
+final_equity = ""
+return_pct = ""
+maxdd_pct = ""
+signals = ""
+wins = ""
+stops = ""
+win_rate_pct = ""
+avg_r = ""
+
+compound = _find(r"复利：risk=[^\n]*start=([0-9.]+)\s+final=([0-9.]+)\s+return=([+-]?[0-9.]+)%\s+maxDD=([0-9.]+)%")
+if compound:
+    start_equity, final_equity, return_pct, maxdd_pct = compound
+res = _find(r"结果：signals=(\d+)\s+wins=(\d+)\s+stops=(\d+)\s+win_rate=([0-9.]+)%\s+avgR=([+-]?[0-9.]+)")
+if res:
+    signals, wins, stops, win_rate_pct, avg_r = res
+
+rows = []
+if os.path.exists(trades_csv):
+    with open(trades_csv, "r", newline="", encoding="utf-8") as f:
+        dr = csv.DictReader(f)
+        for row in dr:
+            try:
+                row["r"] = float(row["r"])
+            except Exception:
+                continue
+            rows.append(row)
+
+payoff_r = ""
+profit_factor_r = ""
+if rows:
+    wr = [x["r"] for x in rows if x["r"] > 0]
+    lr = [x["r"] for x in rows if x["r"] < 0]
+    if not avg_r:
+        avg_r = f"{(sum(x['r'] for x in rows) / len(rows)):.6f}"
+    if not signals:
+        signals = str(len(rows))
+    if not wins:
+        wins = str(len(wr))
+    if not stops:
+        stops = str(len(lr))
+    if wr and lr:
+        avg_win = sum(wr) / len(wr)
+        avg_loss = sum(lr) / len(lr)
+        payoff_r = f"{(avg_win / abs(avg_loss)):.6f}" if avg_loss != 0 else ""
+        gross_profit = sum(wr)
+        gross_loss = abs(sum(lr))
+        profit_factor_r = f"{(gross_profit / gross_loss):.6f}" if gross_loss != 0 else ""
+        if not win_rate_pct:
+            win_rate_pct = f"{(len(wr) / len(rows) * 100):.4f}"
+
+row = {
+    "saved_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+    "tag": save_tag,
+    "title": title,
+    "bars": bars,
+    "inst_ids": inst_ids,
+    "managed_exit": managed_exit,
+    "pessimistic": pessimistic,
+    "risk_frac": risk_frac,
+    "fee_rate": fee_rate,
+    "slippage_bps": slippage_bps,
+    "stop_extra_r": stop_extra_r,
+    "tp_haircut_r": tp_haircut_r,
+    "miss_prob": miss_prob,
+    "start_equity": start_equity,
+    "final_equity": final_equity,
+    "return_pct": return_pct,
+    "maxdd_pct": maxdd_pct,
+    "signals": signals,
+    "wins": wins,
+    "stops": stops,
+    "win_rate_pct": win_rate_pct,
+    "avg_r": avg_r,
+    "payoff_r": payoff_r,
+    "profit_factor_r": profit_factor_r,
+    "result_log": result_log,
+    "trades_csv": trades_csv,
+}
+
+fieldnames = list(row.keys())
+need_header = (not os.path.exists(index_csv)) or os.path.getsize(index_csv) == 0
+with open(index_csv, "a", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=fieldnames)
+    if need_header:
+        w.writeheader()
+    w.writerow(row)
+
+print(f"[Snapshot] indexed: {index_csv}")
+PY
+fi
