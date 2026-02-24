@@ -28,7 +28,14 @@
 - `okx_auto_trader.env`: 实盘配置（含密钥，勿外传）。
 - `okx_auto_trader.env.example`: 配置模板。
 - `run_interleaved_backtest_2y.py`: 2Y 组合回测主脚本。
-- `run_backtest_batch_levels.sh`: L2/L3 批量回测脚本。
+- `scripts/`: 脚本分层目录（不影响旧命令）。
+  - `scripts/live/`: 实盘启停类脚本。
+  - `scripts/ops/`: 日报与 cron 安装脚本。
+  - `scripts/backtest/`: 回测批处理脚本。
+  - `scripts/utils/`: 工具脚本。
+- `run_backtest_batch_levels.sh`: L2/L3 批量回测脚本（兼容入口，内部转发到 `scripts/backtest/`）。
+- `run_backtest_2y_cached.sh`: 2Y 缓存回测脚本（兼容入口，内部转发到 `scripts/backtest/`）。
+- `run_daily_recap.sh` / `setup_daily_recap_cron.sh` / `restart_live_trader.sh`: 兼容入口（内部转发到 `scripts/`）。
 - `okx_trader/`: 核心包（信号、执行、风控、回测、状态、告警）。
   - `runtime.py`: 运行循环与心跳/状态汇总。
   - `runtime_run_once_for_inst.py`: 单币种轮询主流程（取数/投票/持仓检查）。
