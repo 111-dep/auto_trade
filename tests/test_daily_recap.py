@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from daily_recap import (
+    _build_bills_mapping_quality,
     _resolve_net_pnl,
     _summarize_equity_delta,
     summarize_runtime_log,
@@ -136,6 +137,33 @@ class DailyRecapTests(unittest.TestCase):
         self.assertEqual(str(net), "88.88")
         self.assertEqual(src, "bills")
         self.assertEqual(note, "ok")
+
+    def test_build_bills_mapping_quality_hard_alert_when_unmapped_too_high(self) -> None:
+        report = {
+            "bills": {
+                "selected_trade_rows": 100,
+                "mapped_rows": 20,
+                "unmapped_rows": 80,
+                "ambiguous_rows": 0,
+            }
+        }
+        q = _build_bills_mapping_quality(report)
+        self.assertEqual(str(q.get("status")), "alert")
+        self.assertTrue(bool(q.get("hard_alert")))
+        self.assertIn("bills_unmapped_ratio_high", str(q.get("net_note")))
+
+    def test_build_bills_mapping_quality_warn_when_sample_too_small_for_alert(self) -> None:
+        report = {
+            "bills": {
+                "selected_trade_rows": 10,
+                "mapped_rows": 4,
+                "unmapped_rows": 6,
+                "ambiguous_rows": 0,
+            }
+        }
+        q = _build_bills_mapping_quality(report)
+        self.assertEqual(str(q.get("status")), "warn")
+        self.assertFalse(bool(q.get("hard_alert")))
 
     def test_summarize_equity_delta_uses_snapshot_and_appends_current(self) -> None:
         with tempfile.TemporaryDirectory() as td:

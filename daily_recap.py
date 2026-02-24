@@ -37,6 +37,9 @@ _CLOSE_TYPES = {"CLOSE", "EXTERNAL_CLOSE", "PARTIAL_CLOSE"}
 _LOG_LINE_RE = re.compile(
     r"^\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*(?:\[(?P<level>DEBUG|INFO|WARN|ERROR)\]\s*)?(?P<msg>.*)$"
 )
+_BILLS_UNMAPPED_MAX_RATIO_DEFAULT = 0.35
+_BILLS_UNMAPPED_ALERT_RATIO_DEFAULT = 0.50
+_BILLS_ALERT_MIN_SELECTED_DEFAULT = 20
 
 
 @dataclass
@@ -518,29 +521,93 @@ def _summarize_equity(cfg: Any) -> Dict[str, Any]:
     return out
 
 
+def _build_bills_mapping_quality(
+    report: Dict[str, Any],
+    *,
+    max_unmapped_ratio: float = _BILLS_UNMAPPED_MAX_RATIO_DEFAULT,
+    alert_unmapped_ratio: float = _BILLS_UNMAPPED_ALERT_RATIO_DEFAULT,
+    alert_min_selected_rows: int = _BILLS_ALERT_MIN_SELECTED_DEFAULT,
+) -> Dict[str, Any]:
+    bills = report.get("bills")
+    if not bills:
+        return {
+            "enabled": False,
+            "ok": True,
+            "status": "disabled",
+            "hard_alert": False,
+            "selected_rows": 0,
+            "mapped_rows": 0,
+            "unmapped_rows": 0,
+            "ambiguous_rows": 0,
+            "mapped_ratio": 0.0,
+            "unmapped_ratio": 0.0,
+            "max_unmapped_ratio": float(max_unmapped_ratio),
+            "alert_unmapped_ratio": float(alert_unmapped_ratio),
+            "alert_min_selected_rows": max(0, int(alert_min_selected_rows)),
+            "net_note": "bills_not_enabled",
+        }
+
+    selected = max(0, int(bills.get("selected_trade_rows", 0) or 0))
+    mapped = max(0, int(bills.get("mapped_rows", 0) or 0))
+    unmapped = max(0, int(bills.get("unmapped_rows", 0) or 0))
+    ambiguous = max(0, int(bills.get("ambiguous_rows", 0) or 0))
+    max_unmapped_ratio = max(0.0, min(1.0, float(max_unmapped_ratio)))
+    alert_unmapped_ratio = max(0.0, min(1.0, float(alert_unmapped_ratio)))
+    alert_min_selected_rows = max(0, int(alert_min_selected_rows))
+
+    ratio_base = float(max(1, selected))
+    mapped_ratio = float(mapped) / ratio_base
+    unmapped_ratio = float(unmapped) / ratio_base
+
+    net_note = "ok"
+    if selected <= 0:
+        net_note = "bills_no_selected_rows"
+    elif unmapped_ratio > max_unmapped_ratio:
+        net_note = f"bills_unmapped_ratio_high({unmapped_ratio:.2%})"
+    elif mapped <= 0:
+        net_note = "bills_no_mapped_rows"
+    elif ambiguous > 0:
+        net_note = f"bills_ambiguous_rows({ambiguous})"
+
+    ok = net_note == "ok"
+    hard_alert = False
+    if selected >= alert_min_selected_rows:
+        if unmapped_ratio >= alert_unmapped_ratio or mapped <= 0 or ambiguous > 0:
+            hard_alert = True
+
+    status = "ok"
+    if not ok:
+        status = "alert" if hard_alert else "warn"
+
+    return {
+        "enabled": True,
+        "ok": ok,
+        "status": status,
+        "hard_alert": hard_alert,
+        "selected_rows": selected,
+        "mapped_rows": mapped,
+        "unmapped_rows": unmapped,
+        "ambiguous_rows": ambiguous,
+        "mapped_ratio": mapped_ratio,
+        "unmapped_ratio": unmapped_ratio,
+        "max_unmapped_ratio": max_unmapped_ratio,
+        "alert_unmapped_ratio": alert_unmapped_ratio,
+        "alert_min_selected_rows": alert_min_selected_rows,
+        "net_note": net_note,
+    }
+
+
 def _resolve_net_pnl(report: Dict[str, Any]) -> Tuple[Decimal, str, str]:
     journal_val = _to_decimal(report["journal"].get("realized_pnl"))
     bills = report.get("bills")
     if not bills:
         return journal_val, "journal", "bills_not_enabled"
 
-    selected = max(0, int(bills.get("selected_trade_rows", 0) or 0))
-    mapped = max(0, int(bills.get("mapped_rows", 0) or 0))
-    unmapped = max(0, int(bills.get("unmapped_rows", 0) or 0))
-    ambiguous = max(0, int(bills.get("ambiguous_rows", 0) or 0))
-
-    # Bills mapping quality guard:
-    # if unmapped share is high, bills net can become misleading for daily PnL.
-    if selected <= 0:
-        return journal_val, "journal", "bills_no_selected_rows"
-    unmapped_ratio = float(unmapped) / float(max(1, selected))
-    if unmapped_ratio > 0.35:
-        return journal_val, "journal", f"bills_unmapped_ratio_high({unmapped_ratio:.2%})"
-    if mapped <= 0:
-        return journal_val, "journal", "bills_no_mapped_rows"
-    if ambiguous > 0:
-        return journal_val, "journal", f"bills_ambiguous_rows({ambiguous})"
-
+    quality = report.get("bills_quality")
+    if not isinstance(quality, dict):
+        quality = _build_bills_mapping_quality(report)
+    if not bool(quality.get("ok", False)):
+        return journal_val, "journal", str(quality.get("net_note") or "bills_mapping_quality_bad")
     return _to_decimal(bills.get("recommended_net")), "bills", "ok"
 
 
@@ -675,6 +742,7 @@ def _build_md_report(report: Dict[str, Any]) -> str:
     losers: List[TradeSummary] = report["losers"]
     open_count = int(journal["event_counter"].get("OPEN", 0))
     net_pnl, net_src, net_note = _resolve_net_pnl(report)
+    bills_quality = report.get("bills_quality") or _build_bills_mapping_quality(report)
 
     lines: List[str] = []
     lines.append(f"# Daily Recap | {report['date_local']}")
@@ -692,6 +760,21 @@ def _build_md_report(report: Dict[str, Any]) -> str:
     lines.append(f"- 净收益口径: {_fmt_decimal(net_pnl)} USDT ({net_src})")
     if net_note and net_note != "ok":
         lines.append(f"- 净收益口径说明: {net_note}")
+    if bills_quality.get("enabled"):
+        status = str(bills_quality.get("status", "ok")).upper()
+        lines.append(
+            f"- 对账质量: {status} | mapped={int(bills_quality.get('mapped_rows', 0))}/"
+            f"{int(bills_quality.get('selected_rows', 0))} ({float(bills_quality.get('mapped_ratio', 0.0)):.2%}) "
+            f"| unmapped={float(bills_quality.get('unmapped_ratio', 0.0)):.2%} "
+            f"| ambiguous={int(bills_quality.get('ambiguous_rows', 0))}"
+        )
+        lines.append(
+            f"- 对账阈值: max_unmapped={float(bills_quality.get('max_unmapped_ratio', 0.0)):.2%} "
+            f"| alert_unmapped={float(bills_quality.get('alert_unmapped_ratio', 0.0)):.2%} "
+            f"| alert_min_selected={int(bills_quality.get('alert_min_selected_rows', 0))}"
+        )
+        if bool(bills_quality.get("hard_alert", False)):
+            lines.append(f"- 对账告警: {bills_quality.get('net_note', 'bills_mapping_quality_alert')}")
     lines.append(
         f"- 当前连亏={journal['current_loss_streak']} | 当前连赢={journal['current_win_streak']} | 当前连续stop-like={journal['current_stop_like_streak']}"
     )
@@ -792,6 +875,7 @@ def _build_rollup_line(report: Dict[str, Any]) -> str:
     outcomes = report["outcomes"]
     open_count = int(journal["event_counter"].get("OPEN", 0))
     net_pnl, _, _ = _resolve_net_pnl(report)
+    bills_quality = report.get("bills_quality") or _build_bills_mapping_quality(report)
     parts = [
         report["date_local"],
         f"mode={report.get('window_mode', 'day')}",
@@ -807,6 +891,9 @@ def _build_rollup_line(report: Dict[str, Any]) -> str:
     exch = report.get("exchange_positions")
     if exch:
         parts.append(f"ex_loss_streak={int(exch.get('current_loss_streak', 0))}")
+    if bills_quality.get("enabled"):
+        parts.append(f"bills_q={str(bills_quality.get('status', 'ok'))}")
+        parts.append(f"bills_unmapped={float(bills_quality.get('unmapped_ratio', 0.0)):.2%}")
     return " | ".join(parts)
 
 
@@ -815,6 +902,7 @@ def _build_telegram_summary(report: Dict[str, Any]) -> str:
     outcomes = report["outcomes"]
     open_count = int(journal["event_counter"].get("OPEN", 0))
     net_pnl, net_src, net_note = _resolve_net_pnl(report)
+    bills_quality = report.get("bills_quality") or _build_bills_mapping_quality(report)
     equity = report.get("equity") or {}
     exch = report.get("exchange_positions") or {}
     equity_delta = report.get("equity_delta") or {}
@@ -845,6 +933,15 @@ def _build_telegram_summary(report: Dict[str, Any]) -> str:
     if exch_loss is not None:
         lines.append(f"当前连亏(交易所): {exch_loss}")
     lines.append(f"当前连亏/连赢(台账): {journal_loss}/{journal_win}")
+    if bills_quality.get("enabled"):
+        lines.append(
+            f"对账质量: {str(bills_quality.get('status', 'ok')).upper()} | "
+            f"mapped={int(bills_quality.get('mapped_rows', 0))}/{int(bills_quality.get('selected_rows', 0))} "
+            f"({float(bills_quality.get('mapped_ratio', 0.0)):.2%}) | "
+            f"unmapped={float(bills_quality.get('unmapped_ratio', 0.0)):.2%}"
+        )
+        if bool(bills_quality.get("hard_alert", False)):
+            lines.append(f"对账告警: {bills_quality.get('net_note', 'bills_mapping_quality_alert')}")
     if net_note and net_note not in {"ok", "bills_not_enabled"}:
         lines.append(f"净收益说明: {net_note}")
     return "\n".join(lines)
@@ -888,6 +985,24 @@ def main() -> int:
     parser.add_argument("--with-equity", action="store_true", help="Fetch current account equity and include in recap.")
     parser.add_argument("--trade-clord-prefix", default="AT")
     parser.add_argument("--bills-max-pages", type=int, default=120)
+    parser.add_argument(
+        "--bills-unmapped-max-ratio",
+        type=float,
+        default=_BILLS_UNMAPPED_MAX_RATIO_DEFAULT,
+        help="Bills mapping guard threshold; above this ratio fallback to journal net.",
+    )
+    parser.add_argument(
+        "--bills-alert-unmapped-ratio",
+        type=float,
+        default=_BILLS_UNMAPPED_ALERT_RATIO_DEFAULT,
+        help="Hard alert threshold for unmapped ratio in recap summary.",
+    )
+    parser.add_argument(
+        "--bills-alert-min-selected",
+        type=int,
+        default=_BILLS_ALERT_MIN_SELECTED_DEFAULT,
+        help="Require at least this many selected trade rows before hard alert is raised.",
+    )
     parser.add_argument("--equity-snapshot-path", default="", help="CSV path for equity snapshots used in window delta.")
     parser.add_argument("--out-md", default="", help="Write markdown report.")
     parser.add_argument("--out-json", default="", help="Write json report.")
@@ -962,6 +1077,12 @@ def main() -> int:
             current_equity=eq_val,
             snapshot_path=snapshot_path,
         )
+    report["bills_quality"] = _build_bills_mapping_quality(
+        report,
+        max_unmapped_ratio=max(0.0, min(1.0, float(args.bills_unmapped_max_ratio))),
+        alert_unmapped_ratio=max(0.0, min(1.0, float(args.bills_alert_unmapped_ratio))),
+        alert_min_selected_rows=max(0, int(args.bills_alert_min_selected)),
+    )
 
     md_text = _build_md_report(report)
     rollup_line = _build_rollup_line(report)

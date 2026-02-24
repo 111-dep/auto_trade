@@ -24,17 +24,16 @@ resolve_root_dir() {
 }
 
 ROOT_DIR="$(resolve_root_dir)"
+RUNNER="${ROOT_DIR}/scripts/ops/run_daily_recap.sh"
 ENV_FILE="${ROOT_DIR}/okx_auto_trader.env"
 TZ_OFFSET="+08:00"
-DATE_ARG=""
-ROLLING_HOURS=""
+ROLLING_HOURS="168"
 WITH_BILLS=0
 WITH_EXCHANGE_HISTORY=0
 WITH_EQUITY=0
 TELEGRAM=0
-TOP_N=5
-OUT_DIR="${ROOT_DIR}/logs/daily_recap"
-APPEND_SUMMARY=""
+TOP_N=8
+OUT_DIR="${ROOT_DIR}/logs/weekly_recap"
 PRINT_STDOUT=1
 BILLS_UNMAPPED_MAX_RATIO="0.35"
 BILLS_ALERT_UNMAPPED_RATIO="0.50"
@@ -43,28 +42,26 @@ BILLS_ALERT_MIN_SELECTED="20"
 usage() {
   cat <<'EOF'
 Usage:
-  run_daily_recap.sh [options]
+  run_weekly_recap.sh [options]
+
+Default:
+  Generate weekly recap using rolling 168h window.
 
 Options:
-  --env PATH             Env file path (default: ./okx_auto_trader.env)
-  --date YYYY-MM-DD      Local date to recap (default: today by --tz-offset)
-  --rolling-hours N      Rolling window hours (e.g. 24). If set, overrides --date window
-  --tz-offset +08:00     Local timezone offset (default: +08:00)
-  --with-bills           Include bills reconcile (requires API connectivity)
-  --with-exchange-history
-                        Include exchange positions-history stats (requires API)
-  --with-equity          Include current account equity (requires API connectivity)
-  --bills-unmapped-max-ratio X
-                        Fallback threshold for bills unmapped ratio (default: 0.35)
-  --bills-alert-unmapped-ratio X
-                        Hard-alert threshold for bills unmapped ratio (default: 0.50)
-  --bills-alert-min-selected N
-                        Min selected trade rows before hard alert (default: 20)
-  --telegram             Push short summary to telegram
-  --top-n N              Top winners/losers count (default: 5)
-  --out-dir PATH         Output folder (default: ./logs/daily_recap)
-  --no-print             Do not print full markdown to stdout
-  -h, --help             Show help
+  --env PATH                      Env file path (default: ./okx_auto_trader.env)
+  --rolling-hours N               Rolling window hours (default: 168)
+  --tz-offset +08:00              Local timezone offset (default: +08:00)
+  --with-bills                    Include bills reconcile (requires API connectivity)
+  --with-exchange-history         Include exchange positions-history stats (requires API)
+  --with-equity                   Include current account equity (requires API connectivity)
+  --bills-unmapped-max-ratio X    Fallback threshold (default: 0.35)
+  --bills-alert-unmapped-ratio X  Hard-alert threshold (default: 0.50)
+  --bills-alert-min-selected N    Min selected rows before hard alert (default: 20)
+  --telegram                      Push short summary to telegram
+  --top-n N                       Top winners/losers count (default: 8)
+  --out-dir PATH                  Output folder (default: ./logs/weekly_recap)
+  --no-print                      Do not print full markdown to stdout
+  -h, --help                      Show help
 EOF
 }
 
@@ -72,10 +69,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --env)
       ENV_FILE="${2:-}"
-      shift 2
-      ;;
-    --date)
-      DATE_ARG="${2:-}"
       shift 2
       ;;
     --rolling-hours)
@@ -115,7 +108,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --top-n)
-      TOP_N="${2:-5}"
+      TOP_N="${2:-8}"
       shift 2
       ;;
     --out-dir)
@@ -138,37 +131,22 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-mkdir -p "${OUT_DIR}"
-APPEND_SUMMARY="${OUT_DIR}/index.log"
-
-if [[ -n "${DATE_ARG}" ]]; then
-  REPORT_DATE="${DATE_ARG}"
-else
-  # Keep output filename stable with local machine date; recap logic itself still uses --tz-offset.
-  REPORT_DATE="$(date +%F)"
+if [[ ! -x "${RUNNER}" ]]; then
+  echo "Daily recap runner missing or not executable: ${RUNNER}" >&2
+  exit 1
 fi
 
-OUT_MD="${OUT_DIR}/${REPORT_DATE}.md"
-OUT_JSON="${OUT_DIR}/${REPORT_DATE}.json"
-
-CMD=(python3 -u "${ROOT_DIR}/daily_recap.py"
+CMD=("${RUNNER}"
   --env "${ENV_FILE}"
+  --rolling-hours "${ROLLING_HOURS}"
   --tz-offset "${TZ_OFFSET}"
   --top-n "${TOP_N}"
-  --out-md "${OUT_MD}"
-  --out-json "${OUT_JSON}"
-  --append-summary "${APPEND_SUMMARY}"
+  --out-dir "${OUT_DIR}"
   --bills-unmapped-max-ratio "${BILLS_UNMAPPED_MAX_RATIO}"
   --bills-alert-unmapped-ratio "${BILLS_ALERT_UNMAPPED_RATIO}"
   --bills-alert-min-selected "${BILLS_ALERT_MIN_SELECTED}"
 )
 
-if [[ -n "${DATE_ARG}" ]]; then
-  CMD+=(--date "${DATE_ARG}")
-fi
-if [[ -n "${ROLLING_HOURS}" ]]; then
-  CMD+=(--rolling-hours "${ROLLING_HOURS}")
-fi
 if [[ "${WITH_BILLS}" == "1" ]]; then
   CMD+=(--with-bills)
 fi
@@ -181,14 +159,8 @@ fi
 if [[ "${TELEGRAM}" == "1" ]]; then
   CMD+=(--telegram)
 fi
-if [[ "${PRINT_STDOUT}" == "1" ]]; then
-  CMD+=(--print)
+if [[ "${PRINT_STDOUT}" == "0" ]]; then
+  CMD+=(--no-print)
 fi
 
 "${CMD[@]}"
-
-echo "Recap files:"
-echo "  ${OUT_MD}"
-echo "  ${OUT_JSON}"
-echo "Rollup:"
-echo "  ${APPEND_SUMMARY}"

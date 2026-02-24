@@ -10,6 +10,8 @@ root-level command compatibility.
 - `scripts/ops/`
   - `run_daily_recap.sh`
   - `setup_daily_recap_cron.sh`
+  - `run_weekly_recap.sh`
+  - `setup_weekly_recap_cron.sh`
 - `scripts/backtest/`
   - `run_backtest_2y_cached.sh`
   - `run_backtest_batch_levels.sh`

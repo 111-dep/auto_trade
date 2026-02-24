@@ -353,6 +353,19 @@ python3 reconcile_okx_bills.py \
 /home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh --with-bills
 ```
 
+对账质量硬指标（默认已启用）：
+- `unmapped_ratio > 35%`：净收益口径自动回退到 `journal`（避免账单映射不完整时误判）。
+- `selected_trade_rows >= 20` 且 `unmapped_ratio >= 50%`：标记 `ALERT`，在日报/TG/rollup 明确提示。
+- 可通过参数覆盖：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh \
+  --with-bills \
+  --bills-unmapped-max-ratio 0.35 \
+  --bills-alert-unmapped-ratio 0.50 \
+  --bills-alert-min-selected 20
+```
+
 附带交易所已平仓历史口径（用于核对“连亏笔数”）：
 
 ```bash
@@ -407,7 +420,51 @@ crontab -l | grep OKX_DAILY_RECAP
 /home/dandan/Workspace/test/okx_trade_suite/scripts/ops/setup_daily_recap_cron.sh --print-only
 ```
 
-## 10. 重大更新记录（持续维护）
+## 10. 每周复盘（自动化）
+
+手动生成过去 7 天周报（滚动 168h）：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_weekly_recap.sh \
+  --with-bills \
+  --with-exchange-history \
+  --with-equity
+```
+
+周报推送到 Telegram：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_weekly_recap.sh \
+  --with-bills \
+  --with-exchange-history \
+  --with-equity \
+  --telegram
+```
+
+安装每周定时任务（默认每周一 07:05）：
+
+```bash
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/setup_weekly_recap_cron.sh \
+  --time 07:05 \
+  --dow 1 \
+  --with-bills \
+  --with-exchange-history \
+  --with-equity \
+  --telegram
+```
+
+周报输出位置：
+- `logs/weekly_recap/YYYY-MM-DD.md`
+- `logs/weekly_recap/YYYY-MM-DD.json`
+- `logs/weekly_recap/index.log`
+
+检查安装结果：
+
+```bash
+crontab -l | grep OKX_WEEKLY_RECAP
+```
+
+## 11. 重大更新记录（持续维护）
 
 > 约定：每次“影响实盘行为、风控、仓位或回测口径”的更新，都要在这里追加一条。
 
@@ -428,7 +485,22 @@ crontab -l | grep OKX_DAILY_RECAP
 - `scripts/backtest/run_backtest_2y_cached.sh` 新增回测快照功能：
   - `--save-tag`：自动保存本次回测日志、交易CSV并写入 `logs/backtest_snapshots/index.csv`。
   - `--save-dir`：可自定义快照目录。
-  - `index.csv` 自动记录关键摘要和 `payoff_r` / `profit_factor_r`，便于横向比较经典结果。
+
+### 2026-02-24
+
+- 新增周报自动化脚本：
+  - `scripts/ops/run_weekly_recap.sh`（默认 168h 滚动窗口）
+  - `scripts/ops/setup_weekly_recap_cron.sh`（默认周一 07:05）
+- 周报输出与日报分离到 `logs/weekly_recap/`。
+- `daily_recap.py` 新增“账单映射质量硬指标”：
+  - 输出 `bills_quality`（`ok/warn/alert`）到日报、rollup、TG 摘要；
+  - `unmapped_ratio > 35%` 时自动回退 `journal` 口径；
+  - 样本量足够且 `unmapped_ratio >= 50%` 时触发 `ALERT` 提示。
+- `scripts/ops/run_daily_recap.sh` 新增参数：
+  - `--bills-unmapped-max-ratio`
+  - `--bills-alert-unmapped-ratio`
+  - `--bills-alert-min-selected`
+- `logs/backtest_snapshots/index.csv` 自动记录关键摘要和 `payoff_r` / `profit_factor_r`，便于横向比较经典结果。
 - 复盘链路增强：
   - 新增 `trade_journal_order_links.csv`，按 `trade_id` 记录开平仓事件关联的 `ordId/clOrdId`。
   - 执行层平仓事件补写订单回执，便于后续按订单ID做净值核算。
