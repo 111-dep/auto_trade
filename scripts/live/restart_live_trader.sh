@@ -60,12 +60,12 @@ Options:
   -h, --help       Show this help
 
 Examples:
-  ./restart_live_trader.sh
-  ./restart_live_trader.sh --no-tail
-  ./restart_live_trader.sh --stop
-  ./restart_live_trader.sh --start --env /path/to/okx_auto_trader.env
-  ./restart_live_trader.sh --start --no-open-tg
-  ./restart_live_trader.sh --start --no-open-tg --setup-daily-recap-7am
+  ./scripts/live/restart_live_trader.sh
+  ./scripts/live/restart_live_trader.sh --no-tail
+  ./scripts/live/restart_live_trader.sh --stop
+  ./scripts/live/restart_live_trader.sh --start --env /path/to/okx_auto_trader.env
+  ./scripts/live/restart_live_trader.sh --start --no-open-tg
+  ./scripts/live/restart_live_trader.sh --start --no-open-tg --setup-daily-recap-7am
 EOF
 }
 

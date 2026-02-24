@@ -28,14 +28,14 @@
 - `okx_auto_trader.env`: 实盘配置（含密钥，勿外传）。
 - `okx_auto_trader.env.example`: 配置模板。
 - `run_interleaved_backtest_2y.py`: 2Y 组合回测主脚本。
-- `scripts/`: 脚本分层目录（不影响旧命令）。
+- `scripts/`: 脚本分层目录（统一入口）。
   - `scripts/live/`: 实盘启停类脚本。
   - `scripts/ops/`: 日报与 cron 安装脚本。
   - `scripts/backtest/`: 回测批处理脚本。
   - `scripts/utils/`: 工具脚本。
-- `run_backtest_batch_levels.sh`: L2/L3 批量回测脚本（兼容入口，内部转发到 `scripts/backtest/`）。
-- `run_backtest_2y_cached.sh`: 2Y 缓存回测脚本（兼容入口，内部转发到 `scripts/backtest/`）。
-- `run_daily_recap.sh` / `setup_daily_recap_cron.sh` / `restart_live_trader.sh`: 兼容入口（内部转发到 `scripts/`）。
+- `scripts/backtest/run_backtest_batch_levels.sh`: L2/L3 批量回测脚本。
+- `scripts/backtest/run_backtest_2y_cached.sh`: 2Y 缓存回测脚本。
+- `scripts/ops/run_daily_recap.sh` / `scripts/ops/setup_daily_recap_cron.sh` / `scripts/live/restart_live_trader.sh`: 实盘运维脚本。
 - `okx_trader/`: 核心包（信号、执行、风控、回测、状态、告警）。
   - `runtime.py`: 运行循环与心跳/状态汇总。
   - `runtime_run_once_for_inst.py`: 单币种轮询主流程（取数/投票/持仓检查）。
@@ -85,23 +85,23 @@ pkill -TERM -f "python3 -u /home/dandan/Workspace/test/okx_trade_suite/okx_auto_
 
 ```bash
 # 一键重启（默认会 tail 日志）
-/home/dandan/Workspace/test/okx_trade_suite/restart_live_trader.sh
+/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh
 
 # 仅查看状态
-/home/dandan/Workspace/test/okx_trade_suite/restart_live_trader.sh --status
+/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh --status
 
 # 只重启不 tail
-/home/dandan/Workspace/test/okx_trade_suite/restart_live_trader.sh --no-tail
+/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh --no-tail
 
 # 仅停止 / 仅启动
-/home/dandan/Workspace/test/okx_trade_suite/restart_live_trader.sh --stop
-/home/dandan/Workspace/test/okx_trade_suite/restart_live_trader.sh --start
+/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh --stop
+/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh --start
 
 # 启动时关闭“开仓执行TG消息”（仅本次进程）
-/home/dandan/Workspace/test/okx_trade_suite/restart_live_trader.sh --start --no-open-tg
+/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh --start --no-open-tg
 
 # 启动 + 一键安装每天07:00的24h日报TG（含净收益/权益）
-/home/dandan/Workspace/test/okx_trade_suite/restart_live_trader.sh \
+/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh \
   --start --no-open-tg --setup-daily-recap-7am
 ```
 
@@ -207,7 +207,7 @@ python3 -u /home/dandan/Workspace/test/okx_trade_suite/run_interleaved_backtest_
 推荐脚本（默认只用本地缓存，缓存不足直接退出）：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/run_backtest_2y_cached.sh \
+/home/dandan/Workspace/test/okx_trade_suite/scripts/backtest/run_backtest_2y_cached.sh \
   --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
   --inst-ids BTC-USDT-SWAP,SOL-USDT-SWAP,DOGE-USDT-SWAP,SUI-USDT-SWAP,BCH-USDT-SWAP,LTC-USDT-SWAP,NEAR-USDT-SWAP,FIL-USDT-SWAP,UNI-USDT-SWAP \
   --bars 70080 \
@@ -218,7 +218,7 @@ python3 -u /home/dandan/Workspace/test/okx_trade_suite/run_interleaved_backtest_
 保存“经典回测快照”（避免每次重跑后找不到历史结果）：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/run_backtest_2y_cached.sh \
+/home/dandan/Workspace/test/okx_trade_suite/scripts/backtest/run_backtest_2y_cached.sh \
   --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
   --bars 70080 \
   --risk-frac 0.005 \
@@ -240,7 +240,7 @@ tail -n 5 /home/dandan/Workspace/test/okx_trade_suite/logs/backtest_snapshots/in
 如果你明确允许脚本在线补拉缺失历史：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/run_backtest_2y_cached.sh --allow-fetch ...
+/home/dandan/Workspace/test/okx_trade_suite/scripts/backtest/run_backtest_2y_cached.sh --allow-fetch ...
 ```
 
 严格检查“最近20小时到底有没有信号”（同一共同终点窗口，口径对齐当前策略+投票）：
@@ -310,13 +310,13 @@ python3 reconcile_okx_bills.py \
 手动生成今日复盘（默认 `+08:00`）：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/run_daily_recap.sh
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh
 ```
 
 指定日期复盘：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/run_daily_recap.sh \
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh \
   --date 2026-02-23 \
   --tz-offset +08:00
 ```
@@ -324,7 +324,7 @@ python3 reconcile_okx_bills.py \
 按“过去 24 小时滚动窗口”复盘（推荐用于 07:00 定时报）：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/run_daily_recap.sh \
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh \
   --rolling-hours 24 \
   --with-bills \
   --with-exchange-history \
@@ -335,19 +335,19 @@ python3 reconcile_okx_bills.py \
 附带账单对账（含手续费/资金费）：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/run_daily_recap.sh --with-bills
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh --with-bills
 ```
 
 附带交易所已平仓历史口径（用于核对“连亏笔数”）：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/run_daily_recap.sh --with-exchange-history
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh --with-exchange-history
 ```
 
 附带当前账户权益（用于“本金还有多少”）：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/run_daily_recap.sh --with-equity
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh --with-equity
 ```
 
 默认输出位置：
@@ -358,13 +358,13 @@ python3 reconcile_okx_bills.py \
 安装每天定时任务（默认每天 `00:10`）：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/setup_daily_recap_cron.sh --time 00:10
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/setup_daily_recap_cron.sh --time 00:10
 ```
 
 安装“每天 07:00 推送过去 24h 汇总到 Telegram”（含账单净值、交易所口径和权益）：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/setup_daily_recap_cron.sh \
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/setup_daily_recap_cron.sh \
   --time 07:00 \
   --rolling-hours 24 \
   --with-bills \
@@ -389,7 +389,7 @@ crontab -l | grep OKX_DAILY_RECAP
 如只想先看要写入的 cron 行，不立即安装：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/setup_daily_recap_cron.sh --print-only
+/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/setup_daily_recap_cron.sh --print-only
 ```
 
 ## 10. 重大更新记录（持续维护）
@@ -410,7 +410,7 @@ crontab -l | grep OKX_DAILY_RECAP
 
 ### 2026-02-23
 
-- `run_backtest_2y_cached.sh` 新增回测快照功能：
+- `scripts/backtest/run_backtest_2y_cached.sh` 新增回测快照功能：
   - `--save-tag`：自动保存本次回测日志、交易CSV并写入 `logs/backtest_snapshots/index.csv`。
   - `--save-dir`：可自定义快照目录。
   - `index.csv` 自动记录关键摘要和 `payoff_r` / `profit_factor_r`，便于横向比较经典结果。
@@ -420,8 +420,8 @@ crontab -l | grep OKX_DAILY_RECAP
   - `reconcile_okx_bills.py` 新增 `--trade-filter-mode`（`prefix/order-link/merge/none`）与 `--order-link-path`，对账可直接结合订单关联台账。
 - 新增每日复盘工具链：
   - `daily_recap.py`：按日期/滚动窗口汇总 `trade_journal.csv` + `runtime.log`，输出胜负统计、原因分布、连亏/连赢与运行健康指标。
-  - `run_daily_recap.sh`：一键生成日报（支持 `--rolling-hours` / `--with-bills` / `--with-exchange-history` / `--with-equity` / `--telegram`）。
-  - `setup_daily_recap_cron.sh`：一键安装 cron 定时任务。
+  - `scripts/ops/run_daily_recap.sh`：一键生成日报（支持 `--rolling-hours` / `--with-bills` / `--with-exchange-history` / `--with-equity` / `--telegram`）。
+  - `scripts/ops/setup_daily_recap_cron.sh`：一键安装 cron 定时任务。
 - Telegram 通道拆分：
   - 新增 `ALERT_TG_TRADE_EXEC_ENABLED`，可只关闭“开仓执行”消息，不影响日报 Telegram 推送。
 - 日报增强：

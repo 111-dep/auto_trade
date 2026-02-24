@@ -16,7 +16,7 @@ root-level command compatibility.
 - `scripts/utils/`
   - `sync_windows_screenshots.sh`
 
-## Compatibility
+## Entry Point
 
-Root-level script names are still valid and are now thin wrappers to the files
-in this folder. Existing commands, cron jobs, and habits do not need to change.
+Use scripts in this folder directly. Root-level compatibility wrappers are not
+kept to avoid dual command paths.
