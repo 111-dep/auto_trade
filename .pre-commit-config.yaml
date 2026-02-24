@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: secret-scan
+        name: secret-scan (local)
+        entry: python3 scripts/devhooks/scan_secrets.py
+        language: system
+        pass_filenames: true
+        types: [text]
+      - id: py-compile-staged
+        name: py-compile-staged (local)
+        entry: python3 scripts/devhooks/py_compile_staged.py
+        language: system
+        files: \.py$
+        pass_filenames: true

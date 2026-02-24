@@ -112,6 +112,21 @@ cd /home/dandan/Workspace/test/okx_trade_suite
 python3 -m unittest discover -s tests -p "test_*.py"
 ```
 
+8. 提交前安全检查（推荐）
+
+```bash
+cd /home/dandan/Workspace/test/okx_trade_suite
+python3 -m pip install --user pre-commit
+pre-commit install
+
+# 首次可全量跑一遍
+pre-commit run --all-files
+```
+
+当前配置的 pre-commit 检查：
+- `secret-scan (local)`：扫描疑似密钥（含 `OKX_API_KEY/OKX_SECRET_KEY/OKX_PASSPHRASE` 等）。
+- `py-compile-staged (local)`：对变更的 `*.py` 做语法编译检查。
+
 ## 4. 仓位计算优先级（非常重要）
 
 - `OKX_SIZING_MODE=margin` 且 `OKX_MARGIN_USDT>0`：
