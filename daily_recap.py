@@ -518,11 +518,153 @@ def _summarize_equity(cfg: Any) -> Dict[str, Any]:
     return out
 
 
-def _resolve_net_pnl(report: Dict[str, Any]) -> Tuple[Decimal, str]:
+def _resolve_net_pnl(report: Dict[str, Any]) -> Tuple[Decimal, str, str]:
+    journal_val = _to_decimal(report["journal"].get("realized_pnl"))
     bills = report.get("bills")
-    if bills:
-        return _to_decimal(bills.get("recommended_net")), "bills"
-    return _to_decimal(report["journal"].get("realized_pnl")), "journal"
+    if not bills:
+        return journal_val, "journal", "bills_not_enabled"
+
+    selected = max(0, int(bills.get("selected_trade_rows", 0) or 0))
+    mapped = max(0, int(bills.get("mapped_rows", 0) or 0))
+    unmapped = max(0, int(bills.get("unmapped_rows", 0) or 0))
+    ambiguous = max(0, int(bills.get("ambiguous_rows", 0) or 0))
+
+    # Bills mapping quality guard:
+    # if unmapped share is high, bills net can become misleading for daily PnL.
+    if selected <= 0:
+        return journal_val, "journal", "bills_no_selected_rows"
+    unmapped_ratio = float(unmapped) / float(max(1, selected))
+    if unmapped_ratio > 0.35:
+        return journal_val, "journal", f"bills_unmapped_ratio_high({unmapped_ratio:.2%})"
+    if mapped <= 0:
+        return journal_val, "journal", "bills_no_mapped_rows"
+    if ambiguous > 0:
+        return journal_val, "journal", f"bills_ambiguous_rows({ambiguous})"
+
+    return _to_decimal(bills.get("recommended_net")), "bills", "ok"
+
+
+def _load_equity_snapshots(path: Path) -> List[Tuple[int, Decimal]]:
+    out: List[Tuple[int, Decimal]] = []
+    if not path.exists():
+        return out
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ts = _to_int(row.get("ts_ms"))
+                eq = _to_decimal(row.get("equity"))
+                if ts > 0 and eq > 0:
+                    out.append((ts, eq))
+    except Exception:
+        return []
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _load_equity_snapshots_from_reports(dir_path: Path) -> List[Tuple[int, Decimal]]:
+    out: List[Tuple[int, Decimal]] = []
+    if not dir_path.exists() or not dir_path.is_dir():
+        return out
+    for p in sorted(dir_path.glob("*.json")):
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            eq_obj = obj.get("equity") if isinstance(obj, dict) else None
+            if not isinstance(eq_obj, dict):
+                continue
+            eq = _to_decimal(eq_obj.get("equity"))
+            if eq <= 0:
+                continue
+            end_utc = str(obj.get("window_end_utc", "") or "").strip()
+            if not end_utc.endswith("UTC"):
+                continue
+            ts_text = end_utc.replace(" UTC", "")
+            dt_utc = datetime.strptime(ts_text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+            ts_ms = int(dt_utc.timestamp() * 1000)
+            if ts_ms > 0:
+                out.append((ts_ms, eq))
+        except Exception:
+            continue
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def _append_equity_snapshot(path: Path, *, ts_ms: int, equity: Decimal) -> None:
+    if ts_ms <= 0 or equity <= 0:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists()
+    with path.open("a", encoding="utf-8", newline="") as f:
+        fieldnames = ["ts_ms", "equity"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow({"ts_ms": int(ts_ms), "equity": str(equity)})
+
+
+def _summarize_equity_delta(
+    *,
+    start_ms: int,
+    end_ms: int,
+    current_equity: Decimal,
+    snapshot_path: Path,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "available": False,
+        "snapshot_path": str(snapshot_path),
+    }
+    if current_equity <= 0:
+        out["reason"] = "current_equity_unavailable"
+        return out
+
+    snap_map: Dict[int, Decimal] = {}
+    for ts, eq in _load_equity_snapshots(snapshot_path):
+        snap_map[int(ts)] = eq
+    for ts, eq in _load_equity_snapshots_from_reports(snapshot_path.parent):
+        snap_map[int(ts)] = eq
+    snaps = sorted(snap_map.items(), key=lambda x: x[0])
+    start_snap: Optional[Tuple[int, Decimal]] = None
+
+    le = [x for x in snaps if x[0] <= start_ms]
+    if le:
+        start_snap = le[-1]
+        out["start_source"] = "snapshot_le_start"
+    else:
+        ge = [x for x in snaps if x[0] >= start_ms]
+        if ge:
+            start_snap = ge[0]
+            out["start_source"] = "snapshot_ge_start"
+
+    if start_snap is None:
+        out["reason"] = "no_start_snapshot"
+        _append_equity_snapshot(snapshot_path, ts_ms=end_ms, equity=current_equity)
+        return out
+
+    start_ts, start_eq = start_snap
+    window_ms = max(1, int(end_ms - start_ms))
+    max_gap_ms = max(6 * 60 * 60 * 1000, int(window_ms * 0.6))
+    if abs(int(start_ts) - int(start_ms)) > max_gap_ms:
+        out["reason"] = "start_snapshot_too_far"
+        out["start_ts_ms"] = int(start_ts)
+        out["start_equity"] = start_eq
+        _append_equity_snapshot(snapshot_path, ts_ms=end_ms, equity=current_equity)
+        return out
+
+    delta = current_equity - start_eq
+    delta_pct = (delta / start_eq * Decimal("100")) if start_eq > 0 else Decimal("0")
+    out.update(
+        {
+            "available": True,
+            "start_ts_ms": int(start_ts),
+            "start_equity": start_eq,
+            "end_ts_ms": int(end_ms),
+            "end_equity": current_equity,
+            "delta_usdt": delta,
+            "delta_pct": delta_pct,
+        }
+    )
+    _append_equity_snapshot(snapshot_path, ts_ms=end_ms, equity=current_equity)
+    return out
 
 
 def _build_md_report(report: Dict[str, Any]) -> str:
@@ -532,7 +674,7 @@ def _build_md_report(report: Dict[str, Any]) -> str:
     winners: List[TradeSummary] = report["winners"]
     losers: List[TradeSummary] = report["losers"]
     open_count = int(journal["event_counter"].get("OPEN", 0))
-    net_pnl, net_src = _resolve_net_pnl(report)
+    net_pnl, net_src, net_note = _resolve_net_pnl(report)
 
     lines: List[str] = []
     lines.append(f"# Daily Recap | {report['date_local']}")
@@ -548,6 +690,8 @@ def _build_md_report(report: Dict[str, Any]) -> str:
         f"- 已实现PnL(journal close): {_fmt_decimal(journal['realized_pnl'])} USDT | close_rows={journal['close_row_count']}"
     )
     lines.append(f"- 净收益口径: {_fmt_decimal(net_pnl)} USDT ({net_src})")
+    if net_note and net_note != "ok":
+        lines.append(f"- 净收益口径说明: {net_note}")
     lines.append(
         f"- 当前连亏={journal['current_loss_streak']} | 当前连赢={journal['current_win_streak']} | 当前连续stop-like={journal['current_stop_like_streak']}"
     )
@@ -559,6 +703,15 @@ def _build_md_report(report: Dict[str, Any]) -> str:
         lines.append(
             f"- 账户权益: {eq_text} USDT | 基准本金(compound_base_equity): {_fmt_decimal(_to_decimal(equity.get('base_equity')))} USDT"
         )
+    equity_delta = report.get("equity_delta")
+    if equity_delta:
+        if bool(equity_delta.get("available", False)):
+            lines.append(
+                f"- 窗口权益变化: {_fmt_decimal(_to_decimal(equity_delta.get('delta_usdt')))} USDT "
+                f"({_fmt_decimal(_to_decimal(equity_delta.get('delta_pct')))}%)"
+            )
+        else:
+            lines.append(f"- 窗口权益变化: N/A ({equity_delta.get('reason', 'unavailable')})")
     lines.append("")
 
     lines.append("## 平仓原因分布")
@@ -638,7 +791,7 @@ def _build_rollup_line(report: Dict[str, Any]) -> str:
     runtime = report["runtime"]
     outcomes = report["outcomes"]
     open_count = int(journal["event_counter"].get("OPEN", 0))
-    net_pnl, _ = _resolve_net_pnl(report)
+    net_pnl, _, _ = _resolve_net_pnl(report)
     parts = [
         report["date_local"],
         f"mode={report.get('window_mode', 'day')}",
@@ -661,9 +814,10 @@ def _build_telegram_summary(report: Dict[str, Any]) -> str:
     journal = report["journal"]
     outcomes = report["outcomes"]
     open_count = int(journal["event_counter"].get("OPEN", 0))
-    net_pnl, net_src = _resolve_net_pnl(report)
+    net_pnl, net_src, net_note = _resolve_net_pnl(report)
     equity = report.get("equity") or {}
     exch = report.get("exchange_positions") or {}
+    equity_delta = report.get("equity_delta") or {}
 
     eq_val = equity.get("equity")
     eq_text = f"{_fmt_decimal(_to_decimal(eq_val))} USDT" if eq_val is not None else "N/A"
@@ -681,9 +835,18 @@ def _build_telegram_summary(report: Dict[str, Any]) -> str:
         f"当前权益: {eq_text}",
         f"基准本金: {base_text}",
     ]
+    if bool(equity_delta.get("available", False)):
+        lines.append(
+            f"窗口权益变化: {_fmt_decimal(_to_decimal(equity_delta.get('delta_usdt')))} USDT "
+            f"({_fmt_decimal(_to_decimal(equity_delta.get('delta_pct')))}%)"
+        )
+    elif equity_delta:
+        lines.append(f"窗口权益变化: N/A ({equity_delta.get('reason', 'unavailable')})")
     if exch_loss is not None:
         lines.append(f"当前连亏(交易所): {exch_loss}")
     lines.append(f"当前连亏/连赢(台账): {journal_loss}/{journal_win}")
+    if net_note and net_note not in {"ok", "bills_not_enabled"}:
+        lines.append(f"净收益说明: {net_note}")
     return "\n".join(lines)
 
 
@@ -725,6 +888,7 @@ def main() -> int:
     parser.add_argument("--with-equity", action="store_true", help="Fetch current account equity and include in recap.")
     parser.add_argument("--trade-clord-prefix", default="AT")
     parser.add_argument("--bills-max-pages", type=int, default=120)
+    parser.add_argument("--equity-snapshot-path", default="", help="CSV path for equity snapshots used in window delta.")
     parser.add_argument("--out-md", default="", help="Write markdown report.")
     parser.add_argument("--out-json", default="", help="Write json report.")
     parser.add_argument("--append-summary", default="", help="Append one-line summary to file.")
@@ -785,6 +949,19 @@ def main() -> int:
         )
     if args.with_equity:
         report["equity"] = _summarize_equity(cfg)
+        eq_val = _to_decimal((report.get("equity") or {}).get("equity"))
+        if args.equity_snapshot_path:
+            snapshot_path = Path(args.equity_snapshot_path).expanduser()
+        elif args.append_summary:
+            snapshot_path = Path(args.append_summary).expanduser().parent / "equity_snapshots.csv"
+        else:
+            snapshot_path = Path(env_path).parent / "logs" / "daily_recap" / "equity_snapshots.csv"
+        report["equity_delta"] = _summarize_equity_delta(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            current_equity=eq_val,
+            snapshot_path=snapshot_path,
+        )
 
     md_text = _build_md_report(report)
     rollup_line = _build_rollup_line(report)

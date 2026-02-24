@@ -6,7 +6,12 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from daily_recap import summarize_runtime_log, summarize_trade_journal
+from daily_recap import (
+    _resolve_net_pnl,
+    _summarize_equity_delta,
+    summarize_runtime_log,
+    summarize_trade_journal,
+)
 
 
 class DailyRecapTests(unittest.TestCase):
@@ -99,6 +104,67 @@ class DailyRecapTests(unittest.TestCase):
             self.assertEqual(int(out["sl_sync_failed"]), 1)
             self.assertEqual(int(out["instrument_loop_error"]), 1)
             self.assertEqual(int(out["heartbeat_totals"]["processed"]), 2)
+
+    def test_resolve_net_pnl_fallback_to_journal_when_bills_unmapped_high(self) -> None:
+        report = {
+            "journal": {"realized_pnl": "123.45"},
+            "bills": {
+                "recommended_net": "-9.99",
+                "selected_trade_rows": 100,
+                "mapped_rows": 30,
+                "unmapped_rows": 70,
+                "ambiguous_rows": 0,
+            },
+        }
+        net, src, note = _resolve_net_pnl(report)
+        self.assertEqual(str(net), "123.45")
+        self.assertEqual(src, "journal")
+        self.assertIn("bills_unmapped_ratio_high", note)
+
+    def test_resolve_net_pnl_uses_bills_when_mapping_quality_ok(self) -> None:
+        report = {
+            "journal": {"realized_pnl": "123.45"},
+            "bills": {
+                "recommended_net": "88.88",
+                "selected_trade_rows": 100,
+                "mapped_rows": 80,
+                "unmapped_rows": 20,
+                "ambiguous_rows": 0,
+            },
+        }
+        net, src, note = _resolve_net_pnl(report)
+        self.assertEqual(str(net), "88.88")
+        self.assertEqual(src, "bills")
+        self.assertEqual(note, "ok")
+
+    def test_summarize_equity_delta_uses_snapshot_and_appends_current(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            snap = Path(td) / "equity_snapshots.csv"
+            snap.write_text("ts_ms,equity\n1000,1000\n4000,1200\n", encoding="utf-8")
+            out = _summarize_equity_delta(
+                start_ms=4500,
+                end_ms=9000,
+                current_equity=1300,
+                snapshot_path=snap,
+            )
+            self.assertTrue(bool(out.get("available")))
+            self.assertEqual(str(out.get("start_equity")), "1200")
+            self.assertEqual(str(out.get("delta_usdt")), "100")
+            self.assertIn("snapshot_le_start", str(out.get("start_source")))
+            txt = snap.read_text(encoding="utf-8")
+            self.assertIn("9000,1300", txt.replace(".0", ""))
+
+    def test_summarize_equity_delta_handles_missing_start_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            snap = Path(td) / "equity_snapshots.csv"
+            out = _summarize_equity_delta(
+                start_ms=4500,
+                end_ms=9000,
+                current_equity=1300,
+                snapshot_path=snap,
+            )
+            self.assertFalse(bool(out.get("available")))
+            self.assertEqual(str(out.get("reason")), "no_start_snapshot")
 
 
 if __name__ == "__main__":
