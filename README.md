@@ -201,7 +201,21 @@ STRAT_PROFILE_VOTE_LEVEL_WEIGHT=0.01
 
 ## 7. 回测常用命令
 
-2Y 组合回测（中等悲观口径示例）：
+统一场景命名（建议以后都用这个）：
+
+| 标准名 | 旧习惯叫法 | fee_rate | slippage_bps | stop_extra_r | tp_haircut_r | miss_prob |
+|---|---|---:|---:|---:|---:|---:|
+| `S1-OPTIMISTIC` | 乐观 | 0.0006 | 1.0 | 0.02 | 0.01 | 0.01 |
+| `S2-MID_PESS` | 中等悲观 | 0.0008 | 1.5 | 0.03 | 0.02 | 0.03 |
+| `S3-LIVE_FIT` | 贴近实盘/实盘拟合 | 0.0010 | 3.0 | 0.05 | 0.04 | 0.06 |
+| `S4-STRICT_PESS` | 严格悲观 | 0.0012 | 5.0 | 0.08 | 0.06 | 0.10 |
+| `S5-EXTREME_STRESS` | 极端压力 | 0.0016 | 8.0 | 0.12 | 0.10 | 0.15 |
+
+说明：
+- `S2/S3/S4` 参数来自你实际常用/已验证口径。
+- `S1/S5` 是边界参考，不建议直接拿来做实盘收益预期。
+
+2Y 组合回测（以 `S2-MID_PESS` 为例）：
 
 ```bash
 ENV="/home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env"
@@ -216,7 +230,7 @@ python3 -u /home/dandan/Workspace/test/okx_trade_suite/run_interleaved_backtest_
   --stop-extra-r 0.03 \
   --tp-haircut-r 0.02 \
   --miss-prob 0.03 \
-  --title "2Y ManagedExit 中等悲观"
+  --title "2Y ManagedExit S2-MID_PESS"
 ```
 
 推荐脚本（默认只用本地缓存，缓存不足直接退出）：
@@ -227,7 +241,7 @@ python3 -u /home/dandan/Workspace/test/okx_trade_suite/run_interleaved_backtest_
   --inst-ids BTC-USDT-SWAP,SOL-USDT-SWAP,DOGE-USDT-SWAP,SUI-USDT-SWAP,BCH-USDT-SWAP,LTC-USDT-SWAP,NEAR-USDT-SWAP,FIL-USDT-SWAP,UNI-USDT-SWAP \
   --bars 70080 \
   --risk-frac 0.005 \
-  --title "2Y ManagedExit 中等悲观"
+  --scenario s2
 ```
 
 保存“经典回测快照”（避免每次重跑后找不到历史结果）：
@@ -237,7 +251,7 @@ python3 -u /home/dandan/Workspace/test/okx_trade_suite/run_interleaved_backtest_
   --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
   --bars 70080 \
   --risk-frac 0.005 \
-  --title "2Y ManagedExit 实盘拟合(中严之间)" \
+  --scenario s3 \
   --save-tag classic_livefit
 ```
 

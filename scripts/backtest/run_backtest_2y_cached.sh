@@ -26,15 +26,97 @@ resolve_root_dir() {
 ROOT_DIR="$(resolve_root_dir)"
 RUNNER="${ROOT_DIR}/run_interleaved_backtest_2y.py"
 
+normalize_scenario() {
+  local raw
+  raw="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr '-' '_')"
+  case "${raw}" in
+    s1|opt|optimistic|optimistic_v1)
+      printf '%s\n' "s1_optimistic"
+      ;;
+    s2|mid|mid_pess|mid_pessimistic|medium_pess|moderate_pess)
+      printf '%s\n' "s2_mid_pess"
+      ;;
+    s3|live|live_fit|live_like|realistic)
+      printf '%s\n' "s3_live_fit"
+      ;;
+    s4|strict|strict_pess|strict_pessimistic)
+      printf '%s\n' "s4_strict_pess"
+      ;;
+    s5|extreme|extreme_stress|stress)
+      printf '%s\n' "s5_extreme_stress"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+apply_scenario_defaults() {
+  local scenario="$1"
+  case "${scenario}" in
+    s1_optimistic)
+      FEE_RATE="0.0006"
+      SLIPPAGE_BPS="1.0"
+      STOP_EXTRA_R="0.02"
+      TP_HAIRCUT_R="0.01"
+      MISS_PROB="0.01"
+      TITLE="2Y ManagedExit S1-OPTIMISTIC"
+      ;;
+    s2_mid_pess)
+      FEE_RATE="0.0008"
+      SLIPPAGE_BPS="1.5"
+      STOP_EXTRA_R="0.03"
+      TP_HAIRCUT_R="0.02"
+      MISS_PROB="0.03"
+      TITLE="2Y ManagedExit S2-MID_PESS"
+      ;;
+    s3_live_fit)
+      FEE_RATE="0.0010"
+      SLIPPAGE_BPS="3.0"
+      STOP_EXTRA_R="0.05"
+      TP_HAIRCUT_R="0.04"
+      MISS_PROB="0.06"
+      TITLE="2Y ManagedExit S3-LIVE_FIT"
+      ;;
+    s4_strict_pess)
+      FEE_RATE="0.0012"
+      SLIPPAGE_BPS="5.0"
+      STOP_EXTRA_R="0.08"
+      TP_HAIRCUT_R="0.06"
+      MISS_PROB="0.10"
+      TITLE="2Y ManagedExit S4-STRICT_PESS"
+      ;;
+    s5_extreme_stress)
+      FEE_RATE="0.0016"
+      SLIPPAGE_BPS="8.0"
+      STOP_EXTRA_R="0.12"
+      TP_HAIRCUT_R="0.10"
+      MISS_PROB="0.15"
+      TITLE="2Y ManagedExit S5-EXTREME_STRESS"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 ENV_FILE="${ROOT_DIR}/okx_auto_trader.env"
 BARS=70080
 RISK_FRAC="0.005"
-FEE_RATE="0.0010"
-SLIPPAGE_BPS="3.0"
-STOP_EXTRA_R="0.05"
-TP_HAIRCUT_R="0.04"
-MISS_PROB="0.06"
-TITLE="2Y ManagedExit 实盘拟合(中严之间)"
+SCENARIO_RAW="s3"
+SCENARIO=""
+FEE_RATE_OVERRIDE=""
+SLIPPAGE_BPS_OVERRIDE=""
+STOP_EXTRA_R_OVERRIDE=""
+TP_HAIRCUT_R_OVERRIDE=""
+MISS_PROB_OVERRIDE=""
+TITLE_OVERRIDE=""
+FEE_RATE=""
+SLIPPAGE_BPS=""
+STOP_EXTRA_R=""
+TP_HAIRCUT_R=""
+MISS_PROB=""
+TITLE=""
 INST_IDS=""
 TRADES_CSV=""
 SEND_TG=0
@@ -55,12 +137,15 @@ Options:
   --inst-ids CSV             Override instruments (default: use env OKX_INST_IDS)
   --bars N                   LTF bars (default: 70080)
   --risk-frac X              Risk fraction (default: 0.005)
-  --fee-rate X               Fee rate (default: 0.0010)
-  --slippage-bps X           Slippage bps (default: 3.0)
-  --stop-extra-r X           Stop extra R (default: 0.05)
-  --tp-haircut-r X           TP haircut R (default: 0.04)
-  --miss-prob X              Miss probability (default: 0.06)
-  --title TEXT               Result title
+  --scenario NAME            Scenario preset (default: s3)
+                            s1=optimistic, s2=mid_pess, s3=live_fit,
+                            s4=strict_pess, s5=extreme_stress
+  --fee-rate X               Override scenario fee rate
+  --slippage-bps X           Override scenario slippage bps
+  --stop-extra-r X           Override scenario stop extra R
+  --tp-haircut-r X           Override scenario TP haircut R
+  --miss-prob X              Override scenario miss probability
+  --title TEXT               Override auto title
   --dump-trades-csv PATH     Dump accepted trades to CSV (for Monte Carlo)
   --send-telegram            Enable telegram send (default: off)
   --tp1-only                 Disable managed exit (TP1 only)
@@ -96,28 +181,32 @@ while [[ $# -gt 0 ]]; do
       RISK_FRAC="${2:-}"
       shift 2
       ;;
+    --scenario)
+      SCENARIO_RAW="${2:-}"
+      shift 2
+      ;;
     --fee-rate)
-      FEE_RATE="${2:-}"
+      FEE_RATE_OVERRIDE="${2:-}"
       shift 2
       ;;
     --slippage-bps)
-      SLIPPAGE_BPS="${2:-}"
+      SLIPPAGE_BPS_OVERRIDE="${2:-}"
       shift 2
       ;;
     --stop-extra-r)
-      STOP_EXTRA_R="${2:-}"
+      STOP_EXTRA_R_OVERRIDE="${2:-}"
       shift 2
       ;;
     --tp-haircut-r)
-      TP_HAIRCUT_R="${2:-}"
+      TP_HAIRCUT_R_OVERRIDE="${2:-}"
       shift 2
       ;;
     --miss-prob)
-      MISS_PROB="${2:-}"
+      MISS_PROB_OVERRIDE="${2:-}"
       shift 2
       ;;
     --title)
-      TITLE="${2:-}"
+      TITLE_OVERRIDE="${2:-}"
       shift 2
       ;;
     --dump-trades-csv)
@@ -167,6 +256,31 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if ! SCENARIO="$(normalize_scenario "${SCENARIO_RAW}")"; then
+  echo "Unknown scenario: ${SCENARIO_RAW}" >&2
+  echo "Allowed: s1|s2|s3|s4|s5 (or optimistic/mid_pess/live_fit/strict_pess/extreme_stress)" >&2
+  exit 2
+fi
+apply_scenario_defaults "${SCENARIO}"
+if [[ -n "${FEE_RATE_OVERRIDE}" ]]; then
+  FEE_RATE="${FEE_RATE_OVERRIDE}"
+fi
+if [[ -n "${SLIPPAGE_BPS_OVERRIDE}" ]]; then
+  SLIPPAGE_BPS="${SLIPPAGE_BPS_OVERRIDE}"
+fi
+if [[ -n "${STOP_EXTRA_R_OVERRIDE}" ]]; then
+  STOP_EXTRA_R="${STOP_EXTRA_R_OVERRIDE}"
+fi
+if [[ -n "${TP_HAIRCUT_R_OVERRIDE}" ]]; then
+  TP_HAIRCUT_R="${TP_HAIRCUT_R_OVERRIDE}"
+fi
+if [[ -n "${MISS_PROB_OVERRIDE}" ]]; then
+  MISS_PROB="${MISS_PROB_OVERRIDE}"
+fi
+if [[ -n "${TITLE_OVERRIDE}" ]]; then
+  TITLE="${TITLE_OVERRIDE}"
+fi
 
 if [[ ! -f "${RUNNER}" ]]; then
   echo "Runner not found: ${RUNNER}" >&2
@@ -301,6 +415,7 @@ if [[ -n "${TRADES_CSV}" ]]; then
   CMD+=(--dump-trades-csv "${TRADES_CSV}")
 fi
 
+echo "[Scenario] ${SCENARIO} | fee=${FEE_RATE} slip=${SLIPPAGE_BPS} stop_extra_r=${STOP_EXTRA_R} tp_haircut_r=${TP_HAIRCUT_R} miss_prob=${MISS_PROB}"
 echo "[Run] ${CMD[*]}"
 if [[ -n "${RESULT_LOG}" ]]; then
   "${CMD[@]}" | tee "${RESULT_LOG}"
