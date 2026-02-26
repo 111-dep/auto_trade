@@ -106,6 +106,79 @@ class DailyRecapTests(unittest.TestCase):
             self.assertEqual(int(out["instrument_loop_error"]), 1)
             self.assertEqual(int(out["heartbeat_totals"]["processed"]), 2)
 
+    def test_summarize_trade_journal_batch_stats_and_side_concurrency(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "trade_journal.csv"
+            fieldnames = [
+                "event_ts_ms",
+                "signal_ts_ms",
+                "event_type",
+                "trade_id",
+                "inst_id",
+                "side",
+                "reason",
+                "pnl_usdt",
+                "entry_ord_id",
+            ]
+            rows = [
+                {"event_ts_ms": "1000", "signal_ts_ms": "1000", "event_type": "OPEN", "trade_id": "T1", "inst_id": "BTC-USDT-SWAP", "side": "short", "reason": "open_short", "pnl_usdt": "", "entry_ord_id": "E1"},
+                {"event_ts_ms": "1010", "signal_ts_ms": "1000", "event_type": "OPEN", "trade_id": "T2", "inst_id": "ETH-USDT-SWAP", "side": "short", "reason": "open_short", "pnl_usdt": "", "entry_ord_id": "E2"},
+                {"event_ts_ms": "2000", "signal_ts_ms": "", "event_type": "CLOSE", "trade_id": "T1", "inst_id": "BTC-USDT-SWAP", "side": "short", "reason": "short_stop", "pnl_usdt": "-1.0", "entry_ord_id": "E1"},
+                {"event_ts_ms": "2100", "signal_ts_ms": "", "event_type": "CLOSE", "trade_id": "T2", "inst_id": "ETH-USDT-SWAP", "side": "short", "reason": "short_stop", "pnl_usdt": "-2.0", "entry_ord_id": "E2"},
+                {"event_ts_ms": "3000", "signal_ts_ms": "3000", "event_type": "OPEN", "trade_id": "T3", "inst_id": "SOL-USDT-SWAP", "side": "short", "reason": "open_short", "pnl_usdt": "", "entry_ord_id": "E3"},
+                {"event_ts_ms": "3500", "signal_ts_ms": "", "event_type": "CLOSE", "trade_id": "T3", "inst_id": "SOL-USDT-SWAP", "side": "short", "reason": "short_stop", "pnl_usdt": "-0.5", "entry_ord_id": "E3"},
+                {"event_ts_ms": "4000", "signal_ts_ms": "4000", "event_type": "OPEN", "trade_id": "T4", "inst_id": "BCH-USDT-SWAP", "side": "long", "reason": "open_long", "pnl_usdt": "", "entry_ord_id": "E4"},
+                {"event_ts_ms": "4500", "signal_ts_ms": "", "event_type": "CLOSE", "trade_id": "T4", "inst_id": "BCH-USDT-SWAP", "side": "long", "reason": "long_exit", "pnl_usdt": "2.0", "entry_ord_id": "E4"},
+            ]
+            with path.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+
+            out = summarize_trade_journal(path, start_ms=0, end_ms=10_000)
+            batch = out.get("batch_stats") or {}
+            conc = out.get("side_concurrency") or {}
+            self.assertEqual(int(batch.get("batch_count", 0)), 3)
+            self.assertEqual(int(batch.get("closed_batch_count", 0)), 3)
+            self.assertEqual(int(batch.get("loss_batch_count", 0)), 2)
+            self.assertEqual(int(batch.get("win_batch_count", 0)), 1)
+            self.assertEqual(int(batch.get("max_loss_streak", 0)), 2)
+            self.assertEqual(int(batch.get("current_win_streak", 0)), 1)
+            self.assertEqual(int(conc.get("max_short", 0)), 2)
+            self.assertEqual(int(conc.get("max_same_side", 0)), 2)
+
+    def test_side_concurrency_counts_positions_opened_before_window(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "trade_journal.csv"
+            fieldnames = [
+                "event_ts_ms",
+                "signal_ts_ms",
+                "event_type",
+                "trade_id",
+                "inst_id",
+                "side",
+                "reason",
+                "pnl_usdt",
+                "entry_ord_id",
+            ]
+            rows = [
+                {"event_ts_ms": "500", "signal_ts_ms": "500", "event_type": "OPEN", "trade_id": "P0", "inst_id": "BTC-USDT-SWAP", "side": "short", "reason": "open_short", "pnl_usdt": "", "entry_ord_id": "EP0"},
+                {"event_ts_ms": "1200", "signal_ts_ms": "1200", "event_type": "OPEN", "trade_id": "P1", "inst_id": "ETH-USDT-SWAP", "side": "short", "reason": "open_short", "pnl_usdt": "", "entry_ord_id": "EP1"},
+                {"event_ts_ms": "1300", "signal_ts_ms": "", "event_type": "CLOSE", "trade_id": "P0", "inst_id": "BTC-USDT-SWAP", "side": "short", "reason": "short_stop", "pnl_usdt": "-1.0", "entry_ord_id": "EP0"},
+                {"event_ts_ms": "1400", "signal_ts_ms": "", "event_type": "CLOSE", "trade_id": "P1", "inst_id": "ETH-USDT-SWAP", "side": "short", "reason": "short_stop", "pnl_usdt": "-1.0", "entry_ord_id": "EP1"},
+            ]
+            with path.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+
+            out = summarize_trade_journal(path, start_ms=1000, end_ms=2000)
+            conc = out.get("side_concurrency") or {}
+            self.assertEqual(int(conc.get("window_start_active_short", 0)), 1)
+            self.assertEqual(int(conc.get("max_short", 0)), 2)
+
     def test_resolve_net_pnl_fallback_to_journal_when_bills_unmapped_high(self) -> None:
         report = {
             "journal": {"realized_pnl": "123.45"},

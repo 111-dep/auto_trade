@@ -397,6 +397,11 @@ python3 reconcile_okx_bills.py \
 - `logs/daily_recap/YYYY-MM-DD.json`（结构化结果）
 - `logs/daily_recap/index.log`（每日一行滚动摘要）
 
+日报新增“批次/并发风险”统计：
+- 批次按 `signal_ts + side` 聚合（用于观察“同一批开仓”的连胜/连败），并输出批次级当前/最大连亏。
+- 同向并发输出 `max_long/max_short/max_same_side`（用于观察相关币同时同向持仓拥挤度）。
+- `batch_pnl` 仅统计“窗口内 OPEN 的批次”最终平仓结果；与 `journal close` 口径不同属正常。
+
 安装每天定时任务（默认每天 `00:10`）：
 
 ```bash
@@ -531,6 +536,14 @@ crontab -l | grep OKX_WEEKLY_RECAP
 - 修复拆分双腿场景的外部平仓台账：
   - 以“未结清仓位(open_size-realized_size)”计算最终 EXTERNAL_CLOSE 尺寸，避免“只记录半仓/漏记”。
   - 平仓时引入 `positions-history` 对齐（同币种/方向/时间窗），优先使用交易所实际 `closeAvgPx/realizedPnl` 兜底。
+
+### 2026-02-26
+
+- `daily_recap.py` 新增“批次级风控画像”：
+  - 按 `signal_ts + side` 聚合开仓批次，输出批次胜负、批次连亏/连赢、最大批次亏损/盈利。
+  - 追加同向并发统计（`max_long/max_short/max_same_side/max_total`）及峰值时刻币种清单。
+- 日报 Markdown / Telegram / rollup 一并输出批次连亏与同向并发峰值，便于快速判断“连败是否批次相关”。
+- 单测新增覆盖：批次统计与“窗口前已开仓”并发计数，避免回归。
 
 ### 2026-02-21
 

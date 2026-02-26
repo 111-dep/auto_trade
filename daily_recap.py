@@ -124,6 +124,230 @@ def _is_stop_like_reason(reason: str) -> bool:
     return False
 
 
+def _ts_ms_to_utc_text(ts_ms: int) -> str:
+    if int(ts_ms) <= 0:
+        return ""
+    return datetime.fromtimestamp(int(ts_ms) / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _summarize_side_concurrency(
+    events: List[Tuple[int, int, str, str, str, str]],
+    *,
+    start_ms: int,
+    end_ms: int,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "max_long": 0,
+        "max_short": 0,
+        "max_same_side": 0,
+        "max_total": 0,
+        "max_long_ts_ms": 0,
+        "max_short_ts_ms": 0,
+        "max_total_ts_ms": 0,
+        "max_long_insts": [],
+        "max_short_insts": [],
+        "max_total_insts": [],
+        "window_start_active_long": 0,
+        "window_start_active_short": 0,
+        "window_start_active_total": 0,
+        "events_in_window": 0,
+    }
+    if not events:
+        return out
+
+    active: Dict[str, Tuple[str, str]] = {}
+    active_long = 0
+    active_short = 0
+
+    def _apply_event(event_type: str, trade_id: str, side: str, inst_id: str) -> None:
+        nonlocal active_long, active_short
+        side_n = str(side or "").strip().lower()
+        if event_type == "OPEN":
+            old = active.get(trade_id)
+            if old is not None:
+                old_side = old[0]
+                if old_side == "long":
+                    active_long = max(0, active_long - 1)
+                elif old_side == "short":
+                    active_short = max(0, active_short - 1)
+            active[trade_id] = (side_n, str(inst_id or "").strip().upper())
+            if side_n == "long":
+                active_long += 1
+            elif side_n == "short":
+                active_short += 1
+            return
+
+        old = active.pop(trade_id, None)
+        if old is None:
+            return
+        old_side = old[0]
+        if old_side == "long":
+            active_long = max(0, active_long - 1)
+        elif old_side == "short":
+            active_short = max(0, active_short - 1)
+
+    def _snapshot(ts_ms: int) -> None:
+        total = active_long + active_short
+        if active_long > int(out["max_long"]):
+            out["max_long"] = int(active_long)
+            out["max_long_ts_ms"] = int(ts_ms)
+            out["max_long_insts"] = sorted({inst for side, inst in active.values() if side == "long" and inst})
+        if active_short > int(out["max_short"]):
+            out["max_short"] = int(active_short)
+            out["max_short_ts_ms"] = int(ts_ms)
+            out["max_short_insts"] = sorted({inst for side, inst in active.values() if side == "short" and inst})
+        if total > int(out["max_total"]):
+            out["max_total"] = int(total)
+            out["max_total_ts_ms"] = int(ts_ms)
+            out["max_total_insts"] = sorted({inst for _, inst in active.values() if inst})
+        out["max_same_side"] = max(int(out["max_long"]), int(out["max_short"]))
+
+    ev_sorted = sorted(events, key=lambda x: (x[0], x[1]))
+    idx = 0
+    n = len(ev_sorted)
+    while idx < n and int(ev_sorted[idx][0]) < int(start_ms):
+        ts, _, et, tid, side, inst = ev_sorted[idx]
+        _apply_event(str(et), str(tid), str(side), str(inst))
+        idx += 1
+
+    out["window_start_active_long"] = int(active_long)
+    out["window_start_active_short"] = int(active_short)
+    out["window_start_active_total"] = int(active_long + active_short)
+    _snapshot(int(start_ms))
+
+    while idx < n:
+        ts, _, et, tid, side, inst = ev_sorted[idx]
+        if int(ts) >= int(end_ms):
+            break
+        out["events_in_window"] = int(out["events_in_window"]) + 1
+        _apply_event(str(et), str(tid), str(side), str(inst))
+        _snapshot(int(ts))
+        idx += 1
+
+    return out
+
+
+def _build_batch_stats(
+    batch_map: Dict[str, Dict[str, Any]],
+    per_trade: Dict[str, TradeSummary],
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "batch_count": 0,
+        "closed_batch_count": 0,
+        "unresolved_batch_count": 0,
+        "win_batch_count": 0,
+        "loss_batch_count": 0,
+        "breakeven_batch_count": 0,
+        "batch_realized_pnl": Decimal("0"),
+        "max_loss_streak": 0,
+        "max_win_streak": 0,
+        "current_loss_streak": 0,
+        "current_win_streak": 0,
+        "max_open_count_in_batch": 0,
+        "largest_win_batch": None,
+        "largest_loss_batch": None,
+    }
+    if not batch_map:
+        return out
+
+    batches: List[Dict[str, Any]] = []
+    for key, b in batch_map.items():
+        trade_ids = sorted(list(b.get("trade_ids", set()) or set()))
+        if not trade_ids:
+            continue
+        closed = [per_trade[tid] for tid in trade_ids if tid in per_trade]
+        pnl = sum((t.pnl for t in closed), Decimal("0"))
+        closed_count = len(closed)
+        unresolved_count = max(0, len(trade_ids) - closed_count)
+        row: Dict[str, Any] = {
+            "batch_key": key,
+            "signal_ts_ms": int(b.get("signal_ts_ms") or 0),
+            "signal_ts_utc": _ts_ms_to_utc_text(int(b.get("signal_ts_ms") or 0)),
+            "side": str(b.get("side") or ""),
+            "open_count": int(b.get("open_count") or len(trade_ids)),
+            "closed_count": int(closed_count),
+            "unresolved_count": int(unresolved_count),
+            "pnl": pnl,
+            "inst_ids": sorted(list(b.get("inst_ids", set()) or set())),
+            "last_close_ts_ms": max((int(t.last_ts_ms) for t in closed), default=0),
+        }
+        batches.append(row)
+
+    if not batches:
+        return out
+
+    out["batch_count"] = len(batches)
+    out["closed_batch_count"] = sum(1 for b in batches if int(b["closed_count"]) > 0)
+    out["unresolved_batch_count"] = sum(1 for b in batches if int(b["closed_count"]) == 0)
+    out["max_open_count_in_batch"] = max(int(b["open_count"]) for b in batches)
+
+    closed_batches = [b for b in batches if int(b["closed_count"]) > 0]
+    if not closed_batches:
+        return out
+
+    out["batch_realized_pnl"] = sum((b["pnl"] for b in closed_batches), Decimal("0"))
+    out["win_batch_count"] = sum(1 for b in closed_batches if b["pnl"] > 0)
+    out["loss_batch_count"] = sum(1 for b in closed_batches if b["pnl"] < 0)
+    out["breakeven_batch_count"] = sum(1 for b in closed_batches if b["pnl"] == 0)
+
+    sorted_closed = sorted(closed_batches, key=lambda x: (int(x["last_close_ts_ms"]), int(x["signal_ts_ms"])))
+    max_loss = 0
+    max_win = 0
+    cur_loss = 0
+    cur_win = 0
+    for b in sorted_closed:
+        pnl = b["pnl"]
+        if pnl < 0:
+            cur_loss += 1
+            cur_win = 0
+        elif pnl > 0:
+            cur_win += 1
+            cur_loss = 0
+        else:
+            cur_loss = 0
+            cur_win = 0
+        max_loss = max(max_loss, cur_loss)
+        max_win = max(max_win, cur_win)
+    out["max_loss_streak"] = int(max_loss)
+    out["max_win_streak"] = int(max_win)
+
+    loss_streak = 0
+    for b in reversed(sorted_closed):
+        if b["pnl"] < 0:
+            loss_streak += 1
+        else:
+            break
+    out["current_loss_streak"] = int(loss_streak)
+
+    win_streak = 0
+    for b in reversed(sorted_closed):
+        if b["pnl"] > 0:
+            win_streak += 1
+        else:
+            break
+    out["current_win_streak"] = int(win_streak)
+
+    best = max(closed_batches, key=lambda x: x["pnl"])
+    worst = min(closed_batches, key=lambda x: x["pnl"])
+    out["largest_win_batch"] = {
+        "signal_ts_utc": str(best["signal_ts_utc"]),
+        "side": str(best["side"]),
+        "pnl": best["pnl"],
+        "open_count": int(best["open_count"]),
+        "closed_count": int(best["closed_count"]),
+        "inst_ids": list(best["inst_ids"]),
+    }
+    out["largest_loss_batch"] = {
+        "signal_ts_utc": str(worst["signal_ts_utc"]),
+        "side": str(worst["side"]),
+        "pnl": worst["pnl"],
+        "open_count": int(worst["open_count"]),
+        "closed_count": int(worst["closed_count"]),
+        "inst_ids": list(worst["inst_ids"]),
+    }
+    return out
+
+
 def summarize_trade_journal(
     path: Path,
     *,
@@ -145,31 +369,66 @@ def summarize_trade_journal(
         "current_stop_like_streak": 0,
         "max_loss_streak": 0,
         "max_win_streak": 0,
+        "batch_stats": _build_batch_stats({}, {}),
+        "side_concurrency": _summarize_side_concurrency([], start_ms=start_ms, end_ms=end_ms),
     }
     if not path.exists():
         return out
 
     per_trade: Dict[str, TradeSummary] = {}
     close_events: List[Tuple[int, Decimal, str, str]] = []
+    batch_map: Dict[str, Dict[str, Any]] = {}
+    concurrency_events: List[Tuple[int, int, str, str, str, str]] = []
 
     with path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             ts = _to_int(row.get("event_ts_ms"))
-            if ts <= 0 or ts < start_ms or ts >= end_ms:
+            if ts <= 0:
                 continue
-            out["row_count"] += 1
             event_type = str(row.get("event_type", "")).strip().upper()
+            trade_id = str(row.get("trade_id", "")).strip() or str(row.get("entry_ord_id", "")).strip()
+            inst_id = str(row.get("inst_id", "")).strip().upper()
+            side = str(row.get("side", "")).strip().lower()
+
+            if trade_id and ts < end_ms and event_type in {"OPEN", "CLOSE", "EXTERNAL_CLOSE"}:
+                # Close first at same ts to avoid transient over-count in same-bar close+open sequences.
+                order = 0 if event_type in {"CLOSE", "EXTERNAL_CLOSE"} else 1
+                concurrency_events.append((int(ts), int(order), event_type, trade_id, side, inst_id))
+
+            if ts < start_ms or ts >= end_ms:
+                continue
+
+            out["row_count"] += 1
             out["event_counter"][event_type] += 1
+
+            if event_type == "OPEN" and trade_id:
+                signal_ts = _to_int(row.get("signal_ts_ms"), default=0)
+                if signal_ts <= 0:
+                    signal_ts = int(ts)
+                key_side = side or "unknown"
+                batch_key = f"{int(signal_ts)}|{key_side}"
+                b = batch_map.get(batch_key)
+                if b is None:
+                    b = {
+                        "signal_ts_ms": int(signal_ts),
+                        "side": key_side,
+                        "open_count": 0,
+                        "trade_ids": set(),
+                        "inst_ids": set(),
+                    }
+                    batch_map[batch_key] = b
+                b["open_count"] = int(b["open_count"]) + 1
+                b["trade_ids"].add(trade_id)
+                if inst_id:
+                    b["inst_ids"].add(inst_id)
+
             if event_type not in _CLOSE_TYPES:
                 continue
 
             out["close_row_count"] += 1
             reason = str(row.get("reason", "") or "unknown").strip() or "unknown"
             pnl = _to_decimal(row.get("pnl_usdt"))
-            inst_id = str(row.get("inst_id", "")).strip().upper()
-            side = str(row.get("side", "")).strip().lower()
-            trade_id = str(row.get("trade_id", "")).strip() or str(row.get("entry_ord_id", "")).strip()
 
             out["realized_pnl"] += pnl
             out["reason_counter"][reason] += 1
@@ -251,6 +510,8 @@ def summarize_trade_journal(
         else:
             break
     out["current_stop_like_streak"] = stop_streak
+    out["batch_stats"] = _build_batch_stats(batch_map, per_trade)
+    out["side_concurrency"] = _summarize_side_concurrency(concurrency_events, start_ms=start_ms, end_ms=end_ms)
     return out
 
 
@@ -779,6 +1040,17 @@ def _build_md_report(report: Dict[str, Any]) -> str:
         f"- 当前连亏={journal['current_loss_streak']} | 当前连赢={journal['current_win_streak']} | 当前连续stop-like={journal['current_stop_like_streak']}"
     )
     lines.append(f"- 当日最大连亏(窗口内): {journal['max_loss_streak']} | 当日最大连赢(窗口内): {journal['max_win_streak']}")
+    batch_stats = journal.get("batch_stats") or {}
+    side_conc = journal.get("side_concurrency") or {}
+    lines.append(
+        f"- 批次连亏/连赢(当前): {int(batch_stats.get('current_loss_streak', 0))}/{int(batch_stats.get('current_win_streak', 0))}"
+    )
+    lines.append(
+        f"- 批次连亏/连赢(最大): {int(batch_stats.get('max_loss_streak', 0))}/{int(batch_stats.get('max_win_streak', 0))}"
+    )
+    lines.append(
+        f"- 同向并发峰值(long/short/same/total): {int(side_conc.get('max_long', 0))}/{int(side_conc.get('max_short', 0))}/{int(side_conc.get('max_same_side', 0))}/{int(side_conc.get('max_total', 0))}"
+    )
     equity = report.get("equity")
     if equity:
         eq_val = equity.get("equity")
@@ -795,6 +1067,49 @@ def _build_md_report(report: Dict[str, Any]) -> str:
             )
         else:
             lines.append(f"- 窗口权益变化: N/A ({equity_delta.get('reason', 'unavailable')})")
+    lines.append("")
+
+    lines.append("## 批次与并发风险")
+    lines.append(
+        f"- 批次统计(signal_ts+side): total={int(batch_stats.get('batch_count', 0))} "
+        f"closed={int(batch_stats.get('closed_batch_count', 0))} unresolved={int(batch_stats.get('unresolved_batch_count', 0))}"
+    )
+    lines.append(
+        f"- 批次胜负平: {int(batch_stats.get('win_batch_count', 0))}/"
+        f"{int(batch_stats.get('loss_batch_count', 0))}/"
+        f"{int(batch_stats.get('breakeven_batch_count', 0))} "
+        f"| batch_pnl={_fmt_decimal(_to_decimal(batch_stats.get('batch_realized_pnl')))} USDT"
+    )
+    lines.append(
+        f"- 最大同向并发(long/short/same): {int(side_conc.get('max_long', 0))}/"
+        f"{int(side_conc.get('max_short', 0))}/{int(side_conc.get('max_same_side', 0))}"
+    )
+    lines.append(
+        f"- 窗口起始活跃仓位(long/short/total): {int(side_conc.get('window_start_active_long', 0))}/"
+        f"{int(side_conc.get('window_start_active_short', 0))}/{int(side_conc.get('window_start_active_total', 0))}"
+    )
+    lines.append(
+        f"- short并发峰值时间: {_ts_ms_to_utc_text(int(side_conc.get('max_short_ts_ms', 0)))} | insts="
+        f"{','.join(side_conc.get('max_short_insts', []) or []) or '-'}"
+    )
+    lines.append(
+        f"- long并发峰值时间: {_ts_ms_to_utc_text(int(side_conc.get('max_long_ts_ms', 0)))} | insts="
+        f"{','.join(side_conc.get('max_long_insts', []) or []) or '-'}"
+    )
+    lw = batch_stats.get("largest_win_batch")
+    ll = batch_stats.get("largest_loss_batch")
+    if lw:
+        lines.append(
+            f"- 最佳批次: {str(lw.get('signal_ts_utc') or '-')} {str(lw.get('side') or '-')} "
+            f"pnl={_fmt_decimal(_to_decimal(lw.get('pnl')))} open={int(lw.get('open_count', 0))} "
+            f"insts={','.join(lw.get('inst_ids') or []) or '-'}"
+        )
+    if ll:
+        lines.append(
+            f"- 最差批次: {str(ll.get('signal_ts_utc') or '-')} {str(ll.get('side') or '-')} "
+            f"pnl={_fmt_decimal(_to_decimal(ll.get('pnl')))} open={int(ll.get('open_count', 0))} "
+            f"insts={','.join(ll.get('inst_ids') or []) or '-'}"
+        )
     lines.append("")
 
     lines.append("## 平仓原因分布")
@@ -874,6 +1189,8 @@ def _build_rollup_line(report: Dict[str, Any]) -> str:
     runtime = report["runtime"]
     outcomes = report["outcomes"]
     open_count = int(journal["event_counter"].get("OPEN", 0))
+    batch_stats = journal.get("batch_stats") or {}
+    side_conc = journal.get("side_concurrency") or {}
     net_pnl, _, _ = _resolve_net_pnl(report)
     bills_quality = report.get("bills_quality") or _build_bills_mapping_quality(report)
     parts = [
@@ -884,6 +1201,8 @@ def _build_rollup_line(report: Dict[str, Any]) -> str:
         f"trades={outcomes['total']}",
         f"w/l/b={outcomes['win']}/{outcomes['loss']}/{outcomes['breakeven']}",
         f"loss_streak={journal['current_loss_streak']}",
+        f"batch_loss_streak={int(batch_stats.get('current_loss_streak', 0))}",
+        f"side_peak={int(side_conc.get('max_same_side', 0))}",
         f"stop_streak={journal['current_stop_like_streak']}",
         f"warn={runtime['warn']}",
         f"err={runtime['error']}",
@@ -899,6 +1218,8 @@ def _build_rollup_line(report: Dict[str, Any]) -> str:
 
 def _build_telegram_summary(report: Dict[str, Any]) -> str:
     journal = report["journal"]
+    batch_stats = journal.get("batch_stats") or {}
+    side_conc = journal.get("side_concurrency") or {}
     outcomes = report["outcomes"]
     open_count = int(journal["event_counter"].get("OPEN", 0))
     net_pnl, net_src, net_note = _resolve_net_pnl(report)
@@ -933,6 +1254,12 @@ def _build_telegram_summary(report: Dict[str, Any]) -> str:
     if exch_loss is not None:
         lines.append(f"当前连亏(交易所): {exch_loss}")
     lines.append(f"当前连亏/连赢(台账): {journal_loss}/{journal_win}")
+    lines.append(
+        f"批次连亏/连赢(台账): {int(batch_stats.get('current_loss_streak', 0))}/{int(batch_stats.get('current_win_streak', 0))}"
+    )
+    lines.append(
+        f"同向并发峰值(long/short/same): {int(side_conc.get('max_long', 0))}/{int(side_conc.get('max_short', 0))}/{int(side_conc.get('max_same_side', 0))}"
+    )
     if bills_quality.get("enabled"):
         lines.append(
             f"对账质量: {str(bills_quality.get('status', 'ok')).upper()} | "
