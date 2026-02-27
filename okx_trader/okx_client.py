@@ -663,6 +663,9 @@ class OKXClient:
         reduce_only: bool = False,
         attach_algo_ords: Optional[List[Dict[str, Any]]] = None,
         cl_ord_id: str = "",
+        ord_type: str = "market",
+        px: float = 0.0,
+        post_only: bool = False,
     ) -> Dict[str, Any]:
         effective_pos_side = pos_side
         if not effective_pos_side and self.use_pos_side(inst_id):
@@ -674,13 +677,24 @@ class OKXClient:
             log(
                 f"[{inst_id}] Size normalized by lot/min rule: raw={round_size(float(sz))} -> final={normalized_sz_txt}"
             )
+        ord_type_norm = str(ord_type or "market").strip().lower()
+        if ord_type_norm not in {"market", "limit", "post_only"}:
+            ord_type_norm = "market"
+        if post_only and ord_type_norm == "limit":
+            ord_type_norm = "post_only"
+
         body: Dict[str, Any] = {
             "instId": inst_id,
             "tdMode": self.cfg.td_mode,
             "side": side,
-            "ordType": "market",
+            "ordType": ord_type_norm,
             "sz": normalized_sz_txt,
         }
+        if ord_type_norm in {"limit", "post_only"}:
+            px_v = float(px)
+            if px_v <= 0:
+                raise RuntimeError("limit order requires px > 0")
+            body["px"] = self._fmt_price(px_v)
         if effective_pos_side:
             body["posSide"] = effective_pos_side
         if reduce_only:
@@ -726,7 +740,6 @@ class OKXClient:
                 return recovered
             if effective_pos_side or not self._is_pos_side_error(e):
                 raise
-
             inferred_pos_side = self._infer_pos_side(side, reduce_only)
             self.mark_force_pos_side(inst_id)
             log(
@@ -750,6 +763,13 @@ class OKXClient:
                 if recovered is not None:
                     return recovered
                 raise
+
+    def get_ticker(self, inst_id: str) -> Dict[str, Any]:
+        data = self._request("GET", "/api/v5/market/ticker", params={"instId": inst_id}, private=False)
+        rows = data.get("data", [])
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            return rows[0]
+        return {}
 
     def build_attach_tpsl_ords(
         self,
@@ -785,6 +805,21 @@ class OKXClient:
         if isinstance(rows, list) and rows and isinstance(rows[0], dict):
             return rows[0]
         return {}
+
+    def cancel_order(self, inst_id: str, ord_id: str = "", cl_ord_id: str = "") -> Dict[str, Any]:
+        ord_id_txt = str(ord_id or "").strip()
+        cl_ord_id_txt = str(cl_ord_id or "").strip()
+        if not ord_id_txt and not cl_ord_id_txt:
+            raise RuntimeError("ord_id or cl_ord_id is required for cancel_order")
+        body: Dict[str, str] = {"instId": str(inst_id)}
+        if ord_id_txt:
+            body["ordId"] = ord_id_txt
+        if cl_ord_id_txt:
+            body["clOrdId"] = cl_ord_id_txt
+        if self.cfg.dry_run:
+            log(f"[DRY-RUN] cancel_order payload={json.dumps(body, ensure_ascii=False)}")
+            return {"data": [{"sCode": "0", "sMsg": "", "ordId": ord_id_txt or "DRY_RUN", "clOrdId": cl_ord_id_txt}]}
+        return self._request("POST", "/api/v5/trade/cancel-order", body=body, private=True)
 
     @staticmethod
     def _extract_first_attach_algo(order_row: Dict[str, Any]) -> Dict[str, Any]:

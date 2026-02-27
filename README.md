@@ -147,6 +147,12 @@ pre-commit run --all-files
 - `STRAT_ENABLE_CLOSE`: 是否允许脚本主动平仓（止盈/止损/反手）。
 - `STRAT_SIGNAL_EXIT_ENABLED`: 是否启用信号失效提前平仓（默认建议 `0`，更贴近当前回测口径）。
 - `STRAT_SPLIT_TP_ON_ENTRY`: 是否拆分 TP1/TP2 双腿下单（建议 `1`）。
+- `STRAT_ENTRY_EXEC_MODE`: 入场执行模式（`market` / `limit` / `auto`）。
+- `STRAT_ENTRY_AUTO_MARKET_LEVEL_MIN`: `auto` 下等级阈值（>= 阈值走市价）。
+- `STRAT_ENTRY_LIMIT_OFFSET_BPS`: 限价偏移基点（越大越容易成交，价格通常更差）。
+- `STRAT_ENTRY_LIMIT_TTL_SEC`: 限价等待秒数（超时后按 fallback 处理）。
+- `STRAT_ENTRY_LIMIT_REPRICE_MAX`: 限价超时后重挂次数（建议先 `0`）。
+- `STRAT_ENTRY_LIMIT_FALLBACK_MODE`: 限价未成交回退（`market` / `skip`）。
 - `STRAT_SKIP_ON_FOREIGN_MGNMODE_POS`: 是否因异保证金模式仓位而跳过该币种。
 - `OKX_SINGLE_INSTANCE_LOCK`: 是否启用单实例锁（默认 `1`）。
 - `OKX_INSTANCE_LOCK_FILE`: 单实例锁文件路径（默认 `${OKX_STATE_FILE}.lock`）。
@@ -242,6 +248,30 @@ python3 -u /home/dandan/Workspace/test/okx_trade_suite/run_interleaved_backtest_
   --bars 70080 \
   --risk-frac 0.005 \
   --scenario s2
+```
+
+入场执行模式对比（market vs auto）：
+
+```bash
+# 基线：全 market
+/home/dandan/Workspace/test/okx_trade_suite/scripts/backtest/run_backtest_2y_cached.sh \
+  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
+  --bars 70080 \
+  --risk-frac 0.005 \
+  --scenario s3 \
+  --entry-exec-mode market \
+  --title "2Y ManagedExit S3-LIVE_FIT MKT"
+
+# 自动：L3 走 market，L1/L2 优先 limit，未成交回退 market
+/home/dandan/Workspace/test/okx_trade_suite/scripts/backtest/run_backtest_2y_cached.sh \
+  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
+  --bars 70080 \
+  --risk-frac 0.005 \
+  --scenario s3 \
+  --entry-exec-mode auto \
+  --entry-auto-market-level-min 3 \
+  --entry-limit-fallback-mode market \
+  --title "2Y ManagedExit S3-LIVE_FIT AUTO"
 ```
 
 保存“经典回测快照”（避免每次重跑后找不到历史结果）：
@@ -487,6 +517,25 @@ crontab -l | grep OKX_WEEKLY_RECAP
 
 > 约定：每次“影响实盘行为、风控、仓位或回测口径”的更新，都要在这里追加一条。
 
+### 2026-02-21
+
+- 新增 `range_reversion_v1` 策略插件（区间支撑阻力均值回归，含 L1/L2/L3 分级）。
+- 新增同币多策略投票执行（含 `any/majority/unanimous`）。
+- 新增投票加权机制（`STRAT_PROFILE_VOTE_SCORE_MAP` + `STRAT_PROFILE_VOTE_LEVEL_WEIGHT`）。
+- 新增交易台账 `trade_journal.csv`（开仓/部分平仓/平仓/外部平仓事件）。
+- 新增“连续无开仓超时提醒”（`ALERT_NO_OPEN_HOURS` / `ALERT_NO_OPEN_COOLDOWN_HOURS`，支持 Telegram）。
+- 启动日志新增投票配置与台账配置展示，便于排查运行参数。
+- 重构策略变体层：`okx_trader/strategy_variant.py` 改为“注册/分发层”，原实现迁移至 `okx_trader/strategy_variant_legacy.py`，实盘逻辑不变（已做回归验证）。
+- 策略调用入口统一为 `VariantSignalInputs` 上下文对象（`strategy_contract.py`），`signals/backtest` 已接入，便于后续扩展多策略且不改行为。
+- 新增下单 `clOrdId` 生成与幂等恢复（遇到重复 `clOrdId` 自动查询并复用已有订单）。
+- 新增主进程单实例锁（防止重复启动多个实盘脚本）。
+- 新增最小回归测试集（策略分发、投票逻辑、单实例锁、订单号规则）。
+- 扩展最小回归测试集（Managed Exit 行为、OKX API 重试与 `clOrdId` 幂等恢复）。
+- 新增策略插件目录 `okx_trader/strategies/`（自动发现并注册，便于后续批量扩展策略）。
+- 运行时拆层：`runtime.py` 保留调度，`run_once_for_inst` 已迁移到独立模块，后续新增策略与风控逻辑更易维护。
+- 配置层新增“策略分组写法”：`STRAT_PROFILE_INST_GROUPS` 与 `STRAT_PROFILE_VOTE_INST_GROUPS`（并保持旧 `..._MAP` 兼容，且旧写法优先）。
+- 新增 `check_recent_signals_strict.py`：严格最近 N 小时信号检查（共同终点窗口、`raw` vs `decision` 分层统计、可选实时拉取）。
+
 ### 2026-02-22
 
 - 实盘管理新增“私有 WS 快速通道”：订阅 `positions` 后，TP1 成交可不等 15m 收线，尽快推进剩余仓位保本止损。
@@ -545,26 +594,23 @@ crontab -l | grep OKX_WEEKLY_RECAP
 - 日报 Markdown / Telegram / rollup 一并输出批次连亏与同向并发峰值，便于快速判断“连败是否批次相关”。
 - 单测新增覆盖：批次统计与“窗口前已开仓”并发计数，避免回归。
 
-### 2026-02-21
+### 2026-02-27
 
-- 新增 `range_reversion_v1` 策略插件（区间支撑阻力均值回归，含 L1/L2/L3 分级）。
-- 新增同币多策略投票执行（含 `any/majority/unanimous`）。
-- 新增投票加权机制（`STRAT_PROFILE_VOTE_SCORE_MAP` + `STRAT_PROFILE_VOTE_LEVEL_WEIGHT`）。
-- 新增交易台账 `trade_journal.csv`（开仓/部分平仓/平仓/外部平仓事件）。
-- 新增“连续无开仓超时提醒”（`ALERT_NO_OPEN_HOURS` / `ALERT_NO_OPEN_COOLDOWN_HOURS`，支持 Telegram）。
-- 启动日志新增投票配置与台账配置展示，便于排查运行参数。
-- 重构策略变体层：`okx_trader/strategy_variant.py` 改为“注册/分发层”，原实现迁移至 `okx_trader/strategy_variant_legacy.py`，实盘逻辑不变（已做回归验证）。
-- 策略调用入口统一为 `VariantSignalInputs` 上下文对象（`strategy_contract.py`），`signals/backtest` 已接入，便于后续扩展多策略且不改行为。
-- 新增下单 `clOrdId` 生成与幂等恢复（遇到重复 `clOrdId` 自动查询并复用已有订单）。
-- 新增主进程单实例锁（防止重复启动多个实盘脚本）。
-- 新增最小回归测试集（策略分发、投票逻辑、单实例锁、订单号规则）。
-- 扩展最小回归测试集（Managed Exit 行为、OKX API 重试与 `clOrdId` 幂等恢复）。
-- 新增策略插件目录 `okx_trader/strategies/`（自动发现并注册，便于后续批量扩展策略）。
-- 运行时拆层：`runtime.py` 保留调度，`run_once_for_inst` 已迁移到独立模块，后续新增策略与风控逻辑更易维护。
-- 配置层新增“策略分组写法”：`STRAT_PROFILE_INST_GROUPS` 与 `STRAT_PROFILE_VOTE_INST_GROUPS`（并保持旧 `..._MAP` 兼容，且旧写法优先）。
-- 新增 `check_recent_signals_strict.py`：严格最近 N 小时信号检查（共同终点窗口、`raw` vs `decision` 分层统计、可选实时拉取）。
+- 新增“入场执行模式”：
+  - 实盘支持 `market / limit / auto`（`STRAT_ENTRY_EXEC_MODE`）。
+  - `auto` 可按等级阈值切分：低等级优先限价，高等级直接市价（`STRAT_ENTRY_AUTO_MARKET_LEVEL_MIN`）。
+  - 新增限价行为参数：`STRAT_ENTRY_LIMIT_OFFSET_BPS`、`STRAT_ENTRY_LIMIT_TTL_SEC`、`STRAT_ENTRY_LIMIT_POLL_MS`、`STRAT_ENTRY_LIMIT_REPRICE_MAX`、`STRAT_ENTRY_LIMIT_FALLBACK_MODE`。
+- 新增“限价取消后状态复核”安全保护：
+  - 若取消未确认且订单仍 `live/partially_filled`，阻断 fallback 市价，避免重复补单导致过量开仓。
+- 2Y 组合回测同步新增入场执行口径：
+  - 支持 `--entry-exec-mode` 及相关参数；
+  - 输出 `entry_modes`（market/limit/fallback）分布，便于对比与参数调优。
+- 日报增强：
+  - 从 runtime 日志解析 `entry_exec=`，新增入场执行统计（market/limit/fallback 比例）。
+- 近期实盘推荐默认（当前 env）：
+  - `auto + L3市价`，`limit_ttl=5s`，`reprice=0`，`fallback=market`。
 
-## 11. 后续更新模板（复制追加）
+## 12. 后续更新模板（复制追加）
 
 ```md
 ### YYYY-MM-DD

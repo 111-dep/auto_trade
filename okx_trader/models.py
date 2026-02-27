@@ -80,6 +80,13 @@ class StrategyParams:
     signal_exit_enabled: bool
     split_tp_on_entry: bool
     allow_reverse: bool
+    entry_exec_mode: str
+    entry_auto_market_level_min: int
+    entry_limit_offset_bps: float
+    entry_limit_ttl_sec: int
+    entry_limit_poll_ms: int
+    entry_limit_reprice_max: int
+    entry_limit_fallback_mode: str
     manage_only_script_positions: bool
     skip_on_foreign_mgnmode_pos: bool
 

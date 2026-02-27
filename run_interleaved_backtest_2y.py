@@ -59,6 +59,28 @@ def clamp01(x: float) -> float:
     return v
 
 
+def normalize_entry_exec_mode(mode: str) -> str:
+    m = str(mode or "").strip().lower()
+    if m not in {"market", "limit", "auto"}:
+        return "market"
+    return m
+
+
+def normalize_entry_limit_fallback_mode(mode: str) -> str:
+    m = str(mode or "").strip().lower()
+    if m not in {"market", "skip"}:
+        return "market"
+    return m
+
+
+def resolve_entry_exec_mode(mode: str, level: int, auto_market_level_min: int) -> str:
+    norm = normalize_entry_exec_mode(mode)
+    if norm != "auto":
+        return norm
+    threshold = max(1, min(3, int(auto_market_level_min)))
+    return "market" if int(level) >= threshold else "limit"
+
+
 def stable_u01(key: str) -> float:
     h = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
     n = int.from_bytes(h, byteorder="big", signed=False)
@@ -105,6 +127,7 @@ def dump_trades_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         "side",
         "level",
         "outcome",
+        "entry_exec_mode",
         "r",
         "r_raw",
         "friction_r",
@@ -122,6 +145,7 @@ def dump_trades_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                     "side": str(t.get("side", "")),
                     "level": int(t.get("level", 0) or 0),
                     "outcome": str(t.get("outcome", "")),
+                    "entry_exec_mode": str(t.get("entry_exec_mode", "market") or "market"),
                     "r": float(t.get("r", 0.0) or 0.0),
                     "r_raw": float(t.get("r_raw", 0.0) or 0.0),
                     "friction_r": float(t.get("friction_r", 0.0) or 0.0),
@@ -483,6 +507,34 @@ def main() -> int:
     parser.add_argument("--tp-haircut-r", type=float, default=0.0, help="R haircut for TP1/TP2 outcome")
     parser.add_argument("--miss-prob", type=float, default=0.0, help="Signal miss probability (0~1)")
     parser.add_argument(
+        "--entry-exec-mode",
+        default="",
+        help="Entry execution mode: market|limit|auto (default: read from env STRAT_ENTRY_EXEC_MODE)",
+    )
+    parser.add_argument(
+        "--entry-auto-market-level-min",
+        type=int,
+        default=None,
+        help="When entry-exec-mode=auto, levels >= this use market (default: env STRAT_ENTRY_AUTO_MARKET_LEVEL_MIN)",
+    )
+    parser.add_argument(
+        "--entry-limit-fallback-mode",
+        default="",
+        help="When entry-exec-mode resolves to limit: market|skip (default: env STRAT_ENTRY_LIMIT_FALLBACK_MODE)",
+    )
+    parser.add_argument(
+        "--entry-limit-slippage-bps",
+        type=float,
+        default=None,
+        help="One-way slippage for limit-filled entries in bps (default: market_slippage*0.25)",
+    )
+    parser.add_argument(
+        "--entry-limit-fee-rate",
+        type=float,
+        default=None,
+        help="Round-trip fee rate for limit-filled entries (default: same as --fee-rate)",
+    )
+    parser.add_argument(
         "--managed-exit",
         action="store_true",
         help="Use managed exit path: TP1 partial + remaining TP2 + BE/fee-buffer stop",
@@ -539,6 +591,28 @@ def main() -> int:
             tp_haircut_r = 0.05
         if miss_prob <= 0:
             miss_prob = 0.08
+    entry_exec_mode = normalize_entry_exec_mode(
+        str(args.entry_exec_mode).strip().lower() if str(args.entry_exec_mode or "").strip() else str(getattr(cfg.params, "entry_exec_mode", "market"))
+    )
+    if args.entry_auto_market_level_min is None:
+        entry_auto_market_level_min = int(getattr(cfg.params, "entry_auto_market_level_min", 3) or 3)
+    else:
+        entry_auto_market_level_min = int(args.entry_auto_market_level_min)
+    entry_auto_market_level_min = max(1, min(3, entry_auto_market_level_min))
+
+    entry_limit_fallback_mode = normalize_entry_limit_fallback_mode(
+        str(args.entry_limit_fallback_mode).strip().lower()
+        if str(args.entry_limit_fallback_mode or "").strip()
+        else str(getattr(cfg.params, "entry_limit_fallback_mode", "market"))
+    )
+    if args.entry_limit_slippage_bps is None:
+        entry_limit_slippage_bps = max(0.0, float(slippage_bps) * 0.25)
+    else:
+        entry_limit_slippage_bps = max(0.0, float(args.entry_limit_slippage_bps))
+    if args.entry_limit_fee_rate is None:
+        entry_limit_fee_rate = max(0.0, float(fee_rate))
+    else:
+        entry_limit_fee_rate = max(0.0, float(args.entry_limit_fee_rate))
 
     horizon_bars = 0
     min_level = 1
@@ -621,6 +695,12 @@ def main() -> int:
         f"execution_model: pessimistic={bool(args.pessimistic)} fee_rate={fee_rate:.5f} "
         f"slippage_bps={slippage_bps:.2f} stop_extra_r={stop_extra_r:.3f} "
         f"tp_haircut_r={tp_haircut_r:.3f} miss_prob={miss_prob:.3f}",
+        flush=True,
+    )
+    print(
+        f"entry_exec_model: mode={entry_exec_mode} auto_market_level_min={entry_auto_market_level_min} "
+        f"limit_fallback={entry_limit_fallback_mode} "
+        f"limit_fee_rate={entry_limit_fee_rate:.5f} limit_slippage_bps={entry_limit_slippage_bps:.2f}",
         flush=True,
     )
     print(f"signal_exit_enabled={use_signal_exit}", flush=True)
@@ -736,8 +816,10 @@ def main() -> int:
     stop_count = 0
     none_count = 0
     skip_miss = 0
+    skip_limit_unfilled = 0
     total_raw_r = 0.0
     total_friction_r = 0.0
+    by_entry_exec_mode = defaultdict(int)
     by_inst_stats: Dict[str, Dict[str, float]] = defaultdict(
         lambda: {
             "n": 0.0,
@@ -829,14 +911,17 @@ def main() -> int:
         side = str(pos.get("side", "") or "").upper()
         risk_amt = float(pos.get("risk_amt", 0.0) or 0.0)
         entry_ts = int(pos.get("entry_ts", exit_ts) or exit_ts)
+        entry_exec_mode_used = str(pos.get("entry_exec_mode", "market") or "market")
+        fee_rate_used = max(0.0, float(pos.get("fee_rate", fee_rate) or fee_rate))
+        slippage_bps_used = max(0.0, float(pos.get("slippage_bps", slippage_bps) or slippage_bps))
 
         r_adj, friction_r = apply_execution_penalty_r(
             r_raw=float(r_raw),
             outcome=outcome_k,
             entry=entry,
             stop=stop,
-            fee_rate=fee_rate,
-            slippage_bps=slippage_bps,
+            fee_rate=fee_rate_used,
+            slippage_bps=slippage_bps_used,
             stop_extra_r=stop_extra_r,
             tp_haircut_r=tp_haircut_r,
         )
@@ -857,6 +942,7 @@ def main() -> int:
                 "outcome": str(outcome_k),
                 "level": int(level),
                 "side": str(side),
+                "entry_exec_mode": entry_exec_mode_used,
             }
         )
 
@@ -868,6 +954,7 @@ def main() -> int:
         total_raw_r += float(r_raw)
         total_friction_r += float(friction_r)
         by_side[str(side)] += 1
+        by_entry_exec_mode[entry_exec_mode_used] += 1
         update_level_perf(level_perf, int(level), str(outcome_k), float(r_adj))
 
         if outcome_k in {"TP1", "TP2"}:
@@ -930,7 +1017,7 @@ def main() -> int:
         return True
 
     def _try_open(inst: str, row: Dict[str, Any], ts: int, i: int, decision: Optional[Any], *, is_reverse: bool) -> bool:
-        nonlocal open_positions_total, max_concurrent, skip_miss
+        nonlocal open_positions_total, max_concurrent, skip_miss, skip_limit_unfilled
         if decision is None:
             return False
         side = str(decision.side)
@@ -946,12 +1033,38 @@ def main() -> int:
                 skip_miss += 1
                 return False
 
+        intended_exec_mode = resolve_entry_exec_mode(entry_exec_mode, int(level), entry_auto_market_level_min)
+        effective_exec_mode = intended_exec_mode
+        fee_rate_used = fee_rate
+        slippage_bps_used = slippage_bps
+
+        if intended_exec_mode == "limit":
+            no_fill = False
+            if miss_prob > 0:
+                no_fill_key = f"{inst}|{int(ts)}|{side}|{int(level)}|limit_nofill|{'rev' if is_reverse else 'std'}"
+                no_fill = stable_u01(no_fill_key) < miss_prob
+            if no_fill:
+                if entry_limit_fallback_mode == "skip":
+                    skip_limit_unfilled += 1
+                    return False
+                effective_exec_mode = "limit_fallback_market"
+                fee_rate_used = fee_rate
+                slippage_bps_used = slippage_bps
+            else:
+                effective_exec_mode = "limit"
+                fee_rate_used = entry_limit_fee_rate
+                slippage_bps_used = entry_limit_slippage_bps
+
         pos = _new_sim_position(
             decision=decision,
             entry_ts=int(ts),
             entry_i=int(i),
             risk_amt=float(risk_amt),
         )
+        pos["entry_exec_mode"] = str(effective_exec_mode)
+        pos["entry_exec_mode_intended"] = str(intended_exec_mode)
+        pos["fee_rate"] = float(fee_rate_used)
+        pos["slippage_bps"] = float(slippage_bps_used)
         open_positions[inst] = pos
         open_positions_total += 1
 
@@ -1211,6 +1324,11 @@ def main() -> int:
     summary.append(
         f"R分解：raw_avgR={avg_raw_r:.3f} friction_avgR={avg_friction_r:.3f} adj_avgR={avg_r:.3f}"
     )
+    summary.append(
+        f"入场执行：mode={entry_exec_mode} auto_market_level_min={entry_auto_market_level_min} "
+        f"limit_fallback={entry_limit_fallback_mode} "
+        f"limit_fee_rate={entry_limit_fee_rate:.5f} limit_slippage_bps={entry_limit_slippage_bps:.2f}"
+    )
     summary.append(f"标准汇总：{format_backtest_result_line(std_result)}")
     if str(args.dump_trades_csv or "").strip():
         summary.append(f"trades_csv={args.dump_trades_csv}")
@@ -1219,6 +1337,12 @@ def main() -> int:
         f"skip_gap={skip_gap} skip_inst_cap={skip_inst_cap} skip_global_cap={skip_global_cap} "
         f"skip_loss_guard={skip_loss_guard} skip_stop_guard={skip_stop_guard} "
         f"skip_miss={skip_miss} skip_unresolved={skip_unresolved}"
+    )
+    summary.append(
+        f"entry_modes：market={by_entry_exec_mode.get('market',0)} "
+        f"limit={by_entry_exec_mode.get('limit',0)} "
+        f"limit_fallback_market={by_entry_exec_mode.get('limit_fallback_market',0)} "
+        f"skip_limit_unfilled={skip_limit_unfilled}"
     )
     for inst in inst_ids:
         st = by_inst_stats.get(inst)

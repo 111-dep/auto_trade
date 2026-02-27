@@ -1126,15 +1126,104 @@ def execute_decision(
             extra=str(sig.get("strategy_variant", "") or ""),
         )
 
+    def _to_float(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    def _resolve_entry_exec_mode(planned_level: int) -> str:
+        mode = str(getattr(cfg.params, "entry_exec_mode", "market") or "market").strip().lower()
+        if mode not in {"market", "limit", "auto"}:
+            mode = "market"
+        if mode == "auto":
+            threshold = int(getattr(cfg.params, "entry_auto_market_level_min", 3) or 3)
+            threshold = max(1, min(3, threshold))
+            return "market" if int(planned_level) >= threshold else "limit"
+        return mode
+
+    def _parse_filled_size(order_row: Dict[str, Any], fallback: float = 0.0) -> float:
+        if not isinstance(order_row, dict):
+            return max(0.0, float(fallback))
+        for k in ("accFillSz", "fillSz", "fill_size", "filledSize"):
+            val = str(order_row.get(k, "") or "").strip()
+            if not val:
+                continue
+            try:
+                return max(0.0, float(val))
+            except Exception:
+                continue
+        return max(0.0, float(fallback))
+
+    def _get_best_bid_ask() -> tuple[float, float]:
+        try:
+            row = client.get_ticker(inst_id)
+            bid = _to_float(row.get("bidPx"), 0.0)
+            ask = _to_float(row.get("askPx"), 0.0)
+            return bid, ask
+        except Exception:
+            return 0.0, 0.0
+
+    def _build_limit_px(entry_side: str, reprice_idx: int = 0) -> float:
+        base_bps = float(getattr(cfg.params, "entry_limit_offset_bps", 1.0) or 1.0)
+        bps = max(0.0, base_bps) * max(0.20, (1.0 - 0.25 * max(0, int(reprice_idx))))
+        bid, ask = _get_best_bid_ask()
+        close_px = _to_float(sig.get("close"), 0.0)
+        if entry_side == "long":
+            ref = ask if ask > 0 else close_px
+            if ref <= 0 and bid > 0:
+                ref = bid
+            px = ref * (1.0 - bps / 10000.0)
+        else:
+            ref = bid if bid > 0 else close_px
+            if ref <= 0 and ask > 0:
+                ref = ask
+            px = ref * (1.0 + bps / 10000.0)
+        return max(px, 1e-10)
+
+    def _wait_limit_fill(
+        *,
+        ord_id: str,
+        cl_ord_id: str,
+        requested_sz: float,
+    ) -> tuple[float, Dict[str, Any], str]:
+        if cfg.dry_run:
+            return float(requested_sz), {}, "filled"
+        ttl_sec = max(0, int(getattr(cfg.params, "entry_limit_ttl_sec", 10) or 10))
+        poll_ms = max(100, int(getattr(cfg.params, "entry_limit_poll_ms", 500) or 500))
+        if ttl_sec <= 0:
+            return 0.0, {}, "timeout"
+        started = time.monotonic()
+        last_row: Dict[str, Any] = {}
+        while (time.monotonic() - started) < float(ttl_sec):
+            try:
+                row = client.get_order(inst_id=inst_id, ord_id=ord_id, cl_ord_id=cl_ord_id)
+            except Exception:
+                time.sleep(poll_ms / 1000.0)
+                continue
+            if isinstance(row, dict):
+                last_row = row
+            state = str(last_row.get("state", "") or "").strip().lower()
+            filled_sz = _parse_filled_size(last_row, fallback=0.0)
+            if state == "filled":
+                return min(float(requested_sz), float(filled_sz) if filled_sz > 0 else float(requested_sz)), last_row, "filled"
+            if state in {"canceled", "mmp_canceled", "order_failed"}:
+                return min(float(requested_sz), float(filled_sz)), last_row, "closed"
+            time.sleep(poll_ms / 1000.0)
+        filled_sz = _parse_filled_size(last_row, fallback=0.0)
+        return min(float(requested_sz), float(filled_sz)), last_row, "timeout"
+
     def place_open_leg(
         *,
         entry_side: str,
         size: float,
         planned_stop: float,
+        planned_level: int,
         action_tag: str,
         tp_r_override: Optional[float] = None,
     ) -> tuple[float, Dict[str, Any], Dict[str, Any], str]:
-        norm_size, _ = client.normalize_order_size(inst_id, size, reduce_only=False)
+        req_size = float(size)
+        norm_size, _ = client.normalize_order_size(inst_id, req_size, reduce_only=False)
         cl_ord_id = build_cl_ord_id(entry_side, action_tag)
         attach_algo_cl_ord_id = build_cl_ord_id(entry_side, f"{action_tag}_algo")
         attach_algo_ords = build_entry_attach_ords(
@@ -1149,32 +1238,151 @@ def execute_decision(
         else:
             side = "sell"
             pos_side = "short"
-        if cfg.pos_mode == "net":
-            resp = client.place_order(
-                inst_id,
-                side,
-                norm_size,
-                pos_side=None,
-                reduce_only=False,
-                attach_algo_ords=attach_algo_ords,
-                cl_ord_id=cl_ord_id,
+        resolved_mode = _resolve_entry_exec_mode(int(planned_level))
+
+        def _place_market_leg(*, open_size: float, tag: str) -> tuple[float, Dict[str, Any], Dict[str, Any], str]:
+            use_cl_ord_id = build_cl_ord_id(entry_side, tag)
+            if cfg.pos_mode == "net":
+                resp_m = client.place_order(
+                    inst_id,
+                    side,
+                    open_size,
+                    pos_side=None,
+                    reduce_only=False,
+                    attach_algo_ords=attach_algo_ords,
+                    cl_ord_id=use_cl_ord_id,
+                    ord_type="market",
+                )
+            else:
+                resp_m = client.place_order(
+                    inst_id,
+                    side,
+                    open_size,
+                    pos_side=pos_side,
+                    reduce_only=False,
+                    attach_algo_ords=attach_algo_ords,
+                    cl_ord_id=use_cl_ord_id,
+                    ord_type="market",
+                )
+            meta_m = extract_order_meta(resp_m)
+            if attach_algo_ords and attach_algo_cl_ord_id and ("attach_algo_cl_ord_id" not in meta_m):
+                meta_m["attach_algo_cl_ord_id"] = attach_algo_cl_ord_id
+            if use_cl_ord_id and "entry_cl_ord_id" not in meta_m:
+                meta_m["entry_cl_ord_id"] = use_cl_ord_id
+            meta_m["entry_exec_mode"] = "market"
+            return float(open_size), resp_m, meta_m, use_cl_ord_id
+
+        if resolved_mode == "market":
+            return _place_market_leg(open_size=float(norm_size), tag=action_tag)
+
+        # limit mode: wait for fill, optional reprice, then fallback market/skip.
+        fallback_mode = str(getattr(cfg.params, "entry_limit_fallback_mode", "market") or "market").strip().lower()
+        max_reprice = max(0, int(getattr(cfg.params, "entry_limit_reprice_max", 0) or 0))
+        remaining = float(norm_size)
+        opened_total = 0.0
+        first_resp: Dict[str, Any] = {}
+        merged_meta: Dict[str, Any] = {}
+        first_cl_ord_id = cl_ord_id
+        used_fallback_market = False
+
+        for reprice_idx in range(max_reprice + 1):
+            if remaining <= 0:
+                break
+            leg_tag = action_tag if reprice_idx == 0 else f"{action_tag}_rp{reprice_idx}"
+            leg_cl_ord_id = build_cl_ord_id(entry_side, leg_tag)
+            if reprice_idx == 0:
+                first_cl_ord_id = leg_cl_ord_id
+            limit_px = _build_limit_px(entry_side, reprice_idx)
+            if cfg.pos_mode == "net":
+                resp_l = client.place_order(
+                    inst_id,
+                    side,
+                    remaining,
+                    pos_side=None,
+                    reduce_only=False,
+                    attach_algo_ords=attach_algo_ords,
+                    cl_ord_id=leg_cl_ord_id,
+                    ord_type="limit",
+                    px=limit_px,
+                )
+            else:
+                resp_l = client.place_order(
+                    inst_id,
+                    side,
+                    remaining,
+                    pos_side=pos_side,
+                    reduce_only=False,
+                    attach_algo_ords=attach_algo_ords,
+                    cl_ord_id=leg_cl_ord_id,
+                    ord_type="limit",
+                    px=limit_px,
+                )
+            if not first_resp:
+                first_resp = resp_l if isinstance(resp_l, dict) else {}
+            meta_l = extract_order_meta(resp_l)
+            ord_id = str(meta_l.get("entry_ord_id", "") or "").strip()
+            if not ord_id:
+                ord_id = str((resp_l.get("data", [{}])[0] if isinstance(resp_l, dict) else {}).get("ordId", "") or "").strip()
+            filled_sz, _, _ = _wait_limit_fill(ord_id=ord_id, cl_ord_id=leg_cl_ord_id, requested_sz=remaining)
+            if filled_sz < remaining - 1e-12:
+                cancel_ok = False
+                try:
+                    client.cancel_order(inst_id=inst_id, ord_id=ord_id, cl_ord_id=leg_cl_ord_id)
+                    cancel_ok = True
+                except Exception as e:
+                    log(f"[{inst_id}] Limit entry cancel warning clOrdId={leg_cl_ord_id}: {e}", level="WARN")
+                # Safety reconciliation:
+                # If cancel status is uncertain and order might still be live, do not fallback to market
+                # to avoid accidental overfill.
+                row_after: Dict[str, Any] = {}
+                try:
+                    row_after = client.get_order(inst_id=inst_id, ord_id=ord_id, cl_ord_id=leg_cl_ord_id)
+                except Exception as e:
+                    log(
+                        f"[{inst_id}] Limit entry post-cancel state check failed clOrdId={leg_cl_ord_id}: {e}",
+                        level="WARN",
+                    )
+                if row_after:
+                    state_after = str(row_after.get("state", "") or "").strip().lower()
+                    filled_after = _parse_filled_size(row_after, fallback=filled_sz)
+                    if filled_after > filled_sz:
+                        filled_sz = min(float(remaining), float(filled_after))
+                    if state_after in {"live", "partially_filled"}:
+                        raise RuntimeError(
+                            f"limit entry cancel not confirmed (order still {state_after}) clOrdId={leg_cl_ord_id}"
+                        )
+                elif not cancel_ok:
+                    raise RuntimeError(
+                        f"limit entry cancel not confirmed (no post-cancel snapshot) clOrdId={leg_cl_ord_id}"
+                    )
+            if filled_sz > 0:
+                opened_total += float(filled_sz)
+                remaining = max(0.0, remaining - float(filled_sz))
+                merged_meta = dict(meta_l)
+                merged_meta["entry_exec_mode"] = "limit"
+                merged_meta["entry_limit_px"] = float(limit_px)
+            if remaining <= 0:
+                break
+
+        if remaining > 0 and fallback_mode == "market":
+            opened_m, resp_m, meta_m, _ = _place_market_leg(open_size=float(remaining), tag=f"{action_tag}_mktfallback")
+            if opened_m > 0:
+                used_fallback_market = True
+                opened_total += float(opened_m)
+                if not first_resp:
+                    first_resp = resp_m if isinstance(resp_m, dict) else {}
+                merged_meta.update(meta_m)
+
+        if opened_total <= 0:
+            raise RuntimeError(
+                f"entry {entry_side} not filled in limit mode (fallback={fallback_mode}, ttl={cfg.params.entry_limit_ttl_sec}s)"
             )
-        else:
-            resp = client.place_order(
-                inst_id,
-                side,
-                norm_size,
-                pos_side=pos_side,
-                reduce_only=False,
-                attach_algo_ords=attach_algo_ords,
-                cl_ord_id=cl_ord_id,
-            )
-        meta = extract_order_meta(resp)
-        if attach_algo_ords and attach_algo_cl_ord_id and ("attach_algo_cl_ord_id" not in meta):
-            meta["attach_algo_cl_ord_id"] = attach_algo_cl_ord_id
-        if cl_ord_id and "entry_cl_ord_id" not in meta:
-            meta["entry_cl_ord_id"] = cl_ord_id
-        return float(norm_size), resp, meta, cl_ord_id
+        merged_meta["entry_exec_mode"] = "limit_fallback_market" if used_fallback_market else "limit"
+        if attach_algo_ords and attach_algo_cl_ord_id and ("attach_algo_cl_ord_id" not in merged_meta):
+            merged_meta["attach_algo_cl_ord_id"] = attach_algo_cl_ord_id
+        if first_cl_ord_id and "entry_cl_ord_id" not in merged_meta:
+            merged_meta["entry_cl_ord_id"] = first_cl_ord_id
+        return float(opened_total), first_resp, merged_meta, first_cl_ord_id
 
     def open_long() -> float:
         nonlocal entry_order_meta, entry_order_resp
@@ -1202,6 +1410,7 @@ def execute_decision(
                         entry_side="long",
                         size=tp2_size,
                         planned_stop=planned_stop,
+                        planned_level=entry_level,
                         action_tag="open_tp2",
                         tp_r_override=float(cfg.params.tp2_r_mult),
                     )
@@ -1217,6 +1426,7 @@ def execute_decision(
                             entry_side="long",
                             size=tp1_size,
                             planned_stop=planned_stop,
+                            planned_level=entry_level,
                             action_tag="open_tp1",
                             tp_r_override=float(cfg.params.tp1_r_mult),
                         )
@@ -1241,12 +1451,15 @@ def execute_decision(
                             entry_order_meta["exchange_tp2_cl_ord_id"] = str(meta_tp2.get("entry_cl_ord_id", cl_tp2) or "")
                             log(
                                 f"[{inst_id}] Action: OPEN LONG SPLIT | tp1={round_size(opened_tp1)} tp2={round_size(opened_tp2)} "
-                                f"total={round_size(opened_total)} clOrdId(tp1={cl_tp1},tp2={cl_tp2})"
+                                f"total={round_size(opened_total)} clOrdId(tp1={cl_tp1},tp2={cl_tp2}) "
+                                f"entry_exec=tp1:{str(meta_tp1.get('entry_exec_mode', 'market'))},"
+                                f"tp2:{str(meta_tp2.get('entry_exec_mode', 'market'))}"
                             )
                         else:
                             log(
                                 f"[{inst_id}] Action: OPEN LONG partial split fallback | size={round_size(opened_total)} "
-                                f"clOrdId(tp2={cl_tp2})"
+                                f"clOrdId(tp2={cl_tp2}) "
+                                f"entry_exec={str(meta_tp2.get('entry_exec_mode', 'market'))}"
                             )
                         notify_trade_execution(
                             cfg,
@@ -1269,6 +1482,7 @@ def execute_decision(
             entry_side="long",
             size=size,
             planned_stop=planned_stop,
+            planned_level=entry_level,
             action_tag="open",
             tp_r_override=None,
         )
@@ -1276,7 +1490,10 @@ def execute_decision(
         entry_order_meta = dict(meta)
         entry_order_meta["planned_stop"] = float(planned_stop)
         entry_order_resp = resp
-        log(f"[{inst_id}] Action: OPEN LONG | size={round_size(opened_size)} clOrdId={cl_ord_id}")
+        log(
+            f"[{inst_id}] Action: OPEN LONG | size={round_size(opened_size)} clOrdId={cl_ord_id} "
+            f"entry_exec={str(meta.get('entry_exec_mode', 'market'))}"
+        )
         notify_trade_execution(
             cfg,
             inst_id,
@@ -1314,6 +1531,7 @@ def execute_decision(
                         entry_side="short",
                         size=tp2_size,
                         planned_stop=planned_stop,
+                        planned_level=entry_level,
                         action_tag="open_tp2",
                         tp_r_override=float(cfg.params.tp2_r_mult),
                     )
@@ -1329,6 +1547,7 @@ def execute_decision(
                             entry_side="short",
                             size=tp1_size,
                             planned_stop=planned_stop,
+                            planned_level=entry_level,
                             action_tag="open_tp1",
                             tp_r_override=float(cfg.params.tp1_r_mult),
                         )
@@ -1353,12 +1572,15 @@ def execute_decision(
                             entry_order_meta["exchange_tp2_cl_ord_id"] = str(meta_tp2.get("entry_cl_ord_id", cl_tp2) or "")
                             log(
                                 f"[{inst_id}] Action: OPEN SHORT SPLIT | tp1={round_size(opened_tp1)} tp2={round_size(opened_tp2)} "
-                                f"total={round_size(opened_total)} clOrdId(tp1={cl_tp1},tp2={cl_tp2})"
+                                f"total={round_size(opened_total)} clOrdId(tp1={cl_tp1},tp2={cl_tp2}) "
+                                f"entry_exec=tp1:{str(meta_tp1.get('entry_exec_mode', 'market'))},"
+                                f"tp2:{str(meta_tp2.get('entry_exec_mode', 'market'))}"
                             )
                         else:
                             log(
                                 f"[{inst_id}] Action: OPEN SHORT partial split fallback | size={round_size(opened_total)} "
-                                f"clOrdId(tp2={cl_tp2})"
+                                f"clOrdId(tp2={cl_tp2}) "
+                                f"entry_exec={str(meta_tp2.get('entry_exec_mode', 'market'))}"
                             )
                         notify_trade_execution(
                             cfg,
@@ -1381,6 +1603,7 @@ def execute_decision(
             entry_side="short",
             size=size,
             planned_stop=planned_stop,
+            planned_level=entry_level,
             action_tag="open",
             tp_r_override=None,
         )
@@ -1388,7 +1611,10 @@ def execute_decision(
         entry_order_meta = dict(meta)
         entry_order_meta["planned_stop"] = float(planned_stop)
         entry_order_resp = resp
-        log(f"[{inst_id}] Action: OPEN SHORT | size={round_size(opened_size)} clOrdId={cl_ord_id}")
+        log(
+            f"[{inst_id}] Action: OPEN SHORT | size={round_size(opened_size)} clOrdId={cl_ord_id} "
+            f"entry_exec={str(meta.get('entry_exec_mode', 'market'))}"
+        )
         notify_trade_execution(
             cfg,
             inst_id,

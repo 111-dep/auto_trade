@@ -124,6 +124,26 @@ def _is_stop_like_reason(reason: str) -> bool:
     return False
 
 
+def _extract_entry_exec_modes(msg: str) -> List[str]:
+    m = re.search(r"entry_exec=([^\s]+)", str(msg or ""))
+    if not m:
+        return []
+    raw = str(m.group(1) or "").strip().lower()
+    if not raw:
+        return []
+    out: List[str] = []
+    for item in raw.split(","):
+        seg = str(item or "").strip().lower()
+        if not seg:
+            continue
+        if ":" in seg:
+            seg = seg.split(":", 1)[1].strip().lower()
+        if seg not in {"market", "limit", "limit_fallback_market"}:
+            seg = "other"
+        out.append(seg)
+    return out
+
+
 def _ts_ms_to_utc_text(ts_ms: int) -> str:
     if int(ts_ms) <= 0:
         return ""
@@ -533,6 +553,9 @@ def summarize_runtime_log(
         "sl_sync_failed": 0,
         "risk_guard_block": 0,
         "no_open_alert": 0,
+        "entry_exec_counter": Counter(),
+        "entry_exec_open_actions": 0,
+        "entry_exec_legs": 0,
         "heartbeat_totals": {"processed": 0, "no_new": 0, "stale": 0, "safety_skip": 0, "no_data": 0, "error": 0},
         "last_heartbeat": "",
     }
@@ -577,6 +600,13 @@ def summarize_runtime_log(
                 out["risk_guard_block"] += 1
             if "No-open timeout alert sent" in msg or "无开仓超时" in msg:
                 out["no_open_alert"] += 1
+            if "Action: OPEN " in msg:
+                modes = _extract_entry_exec_modes(msg)
+                if modes:
+                    out["entry_exec_open_actions"] += 1
+                    out["entry_exec_legs"] += len(modes)
+                    for mode in modes:
+                        out["entry_exec_counter"][str(mode)] += 1
     return out
 
 
@@ -1151,6 +1181,22 @@ def _build_md_report(report: Dict[str, Any]) -> str:
     lines.append(
         f"- hb_totals processed={hb['processed']} no_new={hb['no_new']} stale={hb['stale']} safety_skip={hb['safety_skip']} no_data={hb['no_data']} error={hb['error']}"
     )
+    entry_exec = runtime.get("entry_exec_counter") or {}
+    entry_exec_total = int(runtime.get("entry_exec_legs", 0) or 0)
+    if entry_exec_total > 0:
+        mkt = int(entry_exec.get("market", 0))
+        lim = int(entry_exec.get("limit", 0))
+        lim_fb = int(entry_exec.get("limit_fallback_market", 0))
+        other = int(entry_exec.get("other", 0))
+        lines.append(
+            f"- entry_exec legs={entry_exec_total} actions={int(runtime.get('entry_exec_open_actions', 0))} "
+            f"market={mkt} limit={lim} fallback_market={lim_fb} other={other}"
+        )
+        lines.append(
+            f"- entry_exec ratio: market={mkt/max(1, entry_exec_total):.1%} "
+            f"limit={lim/max(1, entry_exec_total):.1%} "
+            f"fallback_market={lim_fb/max(1, entry_exec_total):.1%}"
+        )
     if runtime.get("last_heartbeat"):
         lines.append(f"- last_heartbeat: {runtime['last_heartbeat']}")
     lines.append("")
@@ -1260,6 +1306,17 @@ def _build_telegram_summary(report: Dict[str, Any]) -> str:
     lines.append(
         f"同向并发峰值(long/short/same): {int(side_conc.get('max_long', 0))}/{int(side_conc.get('max_short', 0))}/{int(side_conc.get('max_same_side', 0))}"
     )
+    runtime = report.get("runtime") or {}
+    entry_exec = runtime.get("entry_exec_counter") or {}
+    entry_exec_total = int(runtime.get("entry_exec_legs", 0) or 0)
+    if entry_exec_total > 0:
+        mkt = int(entry_exec.get("market", 0))
+        lim = int(entry_exec.get("limit", 0))
+        lim_fb = int(entry_exec.get("limit_fallback_market", 0))
+        lines.append(
+            f"入场执行(runtime): legs={entry_exec_total} market={mkt} limit={lim} "
+            f"fallback_market={lim_fb} fb_ratio={lim_fb/max(1, entry_exec_total):.1%}"
+        )
     if bills_quality.get("enabled"):
         lines.append(
             f"对账质量: {str(bills_quality.get('status', 'ok')).upper()} | "

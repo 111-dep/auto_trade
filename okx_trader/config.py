@@ -114,6 +114,24 @@ def _normalize_strategy_params(params: StrategyParams) -> None:
     if params.exec_max_level > 3:
         params.exec_max_level = 3
     params.exec_l3_inst_ids = parse_inst_ids(",".join(params.exec_l3_inst_ids))
+    params.entry_exec_mode = str(getattr(params, "entry_exec_mode", "market") or "market").strip().lower()
+    if params.entry_exec_mode not in {"market", "limit", "auto"}:
+        params.entry_exec_mode = "market"
+    if params.entry_auto_market_level_min < 1:
+        params.entry_auto_market_level_min = 1
+    if params.entry_auto_market_level_min > 3:
+        params.entry_auto_market_level_min = 3
+    if params.entry_limit_offset_bps < 0:
+        params.entry_limit_offset_bps = 0.0
+    if params.entry_limit_ttl_sec < 0:
+        params.entry_limit_ttl_sec = 0
+    if params.entry_limit_poll_ms < 100:
+        params.entry_limit_poll_ms = 100
+    if params.entry_limit_reprice_max < 0:
+        params.entry_limit_reprice_max = 0
+    params.entry_limit_fallback_mode = str(getattr(params, "entry_limit_fallback_mode", "market") or "market").strip().lower()
+    if params.entry_limit_fallback_mode not in {"market", "skip"}:
+        params.entry_limit_fallback_mode = "market"
 
 
 def _build_base_strategy_params() -> StrategyParams:
@@ -199,6 +217,13 @@ def _build_base_strategy_params() -> StrategyParams:
         signal_exit_enabled=parse_bool(os.getenv("STRAT_SIGNAL_EXIT_ENABLED", "0"), False),
         split_tp_on_entry=parse_bool(os.getenv("STRAT_SPLIT_TP_ON_ENTRY", "0"), False),
         allow_reverse=parse_bool(os.getenv("STRAT_ALLOW_REVERSE", "1"), True),
+        entry_exec_mode=os.getenv("STRAT_ENTRY_EXEC_MODE", "market").strip().lower(),
+        entry_auto_market_level_min=int(os.getenv("STRAT_ENTRY_AUTO_MARKET_LEVEL_MIN", "3")),
+        entry_limit_offset_bps=float(os.getenv("STRAT_ENTRY_LIMIT_OFFSET_BPS", "1.0")),
+        entry_limit_ttl_sec=int(os.getenv("STRAT_ENTRY_LIMIT_TTL_SEC", "10")),
+        entry_limit_poll_ms=int(os.getenv("STRAT_ENTRY_LIMIT_POLL_MS", "500")),
+        entry_limit_reprice_max=int(os.getenv("STRAT_ENTRY_LIMIT_REPRICE_MAX", "0")),
+        entry_limit_fallback_mode=os.getenv("STRAT_ENTRY_LIMIT_FALLBACK_MODE", "market").strip().lower(),
         manage_only_script_positions=parse_bool(os.getenv("STRAT_MANAGE_ONLY_SCRIPT_POSITIONS", "1"), True),
         skip_on_foreign_mgnmode_pos=parse_bool(os.getenv("STRAT_SKIP_ON_FOREIGN_MGNMODE_POS", "1"), True),
     )

@@ -117,6 +117,11 @@ STOP_EXTRA_R=""
 TP_HAIRCUT_R=""
 MISS_PROB=""
 TITLE=""
+ENTRY_EXEC_MODE=""
+ENTRY_AUTO_MARKET_LEVEL_MIN=""
+ENTRY_LIMIT_FALLBACK_MODE=""
+ENTRY_LIMIT_SLIPPAGE_BPS=""
+ENTRY_LIMIT_FEE_RATE=""
 INST_IDS=""
 TRADES_CSV=""
 SEND_TG=0
@@ -145,6 +150,14 @@ Options:
   --stop-extra-r X           Override scenario stop extra R
   --tp-haircut-r X           Override scenario TP haircut R
   --miss-prob X              Override scenario miss probability
+  --entry-exec-mode MODE     Entry mode: market|limit|auto (runner default: env)
+  --entry-auto-market-level-min N
+                             Auto mode threshold: level>=N uses market
+  --entry-limit-fallback-mode MODE
+                             limit mode fallback when unfilled: market|skip
+  --entry-limit-slippage-bps X
+                             Slippage bps for limit-filled entries
+  --entry-limit-fee-rate X   Fee rate for limit-filled entries
   --title TEXT               Override auto title
   --dump-trades-csv PATH     Dump accepted trades to CSV (for Monte Carlo)
   --send-telegram            Enable telegram send (default: off)
@@ -203,6 +216,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --miss-prob)
       MISS_PROB_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --entry-exec-mode)
+      ENTRY_EXEC_MODE="${2:-}"
+      shift 2
+      ;;
+    --entry-auto-market-level-min)
+      ENTRY_AUTO_MARKET_LEVEL_MIN="${2:-}"
+      shift 2
+      ;;
+    --entry-limit-fallback-mode)
+      ENTRY_LIMIT_FALLBACK_MODE="${2:-}"
+      shift 2
+      ;;
+    --entry-limit-slippage-bps)
+      ENTRY_LIMIT_SLIPPAGE_BPS="${2:-}"
+      shift 2
+      ;;
+    --entry-limit-fee-rate)
+      ENTRY_LIMIT_FEE_RATE="${2:-}"
       shift 2
       ;;
     --title)
@@ -405,6 +438,21 @@ if [[ -n "${SAVE_TAG}" ]]; then
 fi
 
 CMD=(python3 -u "${RUNNER}" --env "${ENV_FILE}" --bars "${BARS}" --risk-frac "${RISK_FRAC}" --fee-rate "${FEE_RATE}" --slippage-bps "${SLIPPAGE_BPS}" --stop-extra-r "${STOP_EXTRA_R}" --tp-haircut-r "${TP_HAIRCUT_R}" --miss-prob "${MISS_PROB}" --title "${TITLE}")
+if [[ -n "${ENTRY_EXEC_MODE}" ]]; then
+  CMD+=(--entry-exec-mode "${ENTRY_EXEC_MODE}")
+fi
+if [[ -n "${ENTRY_AUTO_MARKET_LEVEL_MIN}" ]]; then
+  CMD+=(--entry-auto-market-level-min "${ENTRY_AUTO_MARKET_LEVEL_MIN}")
+fi
+if [[ -n "${ENTRY_LIMIT_FALLBACK_MODE}" ]]; then
+  CMD+=(--entry-limit-fallback-mode "${ENTRY_LIMIT_FALLBACK_MODE}")
+fi
+if [[ -n "${ENTRY_LIMIT_SLIPPAGE_BPS}" ]]; then
+  CMD+=(--entry-limit-slippage-bps "${ENTRY_LIMIT_SLIPPAGE_BPS}")
+fi
+if [[ -n "${ENTRY_LIMIT_FEE_RATE}" ]]; then
+  CMD+=(--entry-limit-fee-rate "${ENTRY_LIMIT_FEE_RATE}")
+fi
 if [[ "${MANAGED_EXIT}" -eq 1 ]]; then
   CMD+=(--managed-exit)
 fi
@@ -416,6 +464,9 @@ if [[ -n "${TRADES_CSV}" ]]; then
 fi
 
 echo "[Scenario] ${SCENARIO} | fee=${FEE_RATE} slip=${SLIPPAGE_BPS} stop_extra_r=${STOP_EXTRA_R} tp_haircut_r=${TP_HAIRCUT_R} miss_prob=${MISS_PROB}"
+if [[ -n "${ENTRY_EXEC_MODE}" || -n "${ENTRY_AUTO_MARKET_LEVEL_MIN}" || -n "${ENTRY_LIMIT_FALLBACK_MODE}" || -n "${ENTRY_LIMIT_SLIPPAGE_BPS}" || -n "${ENTRY_LIMIT_FEE_RATE}" ]]; then
+  echo "[EntryExec] mode=${ENTRY_EXEC_MODE:-env} auto_lv=${ENTRY_AUTO_MARKET_LEVEL_MIN:-env} fallback=${ENTRY_LIMIT_FALLBACK_MODE:-env} limit_slip=${ENTRY_LIMIT_SLIPPAGE_BPS:-auto} limit_fee=${ENTRY_LIMIT_FEE_RATE:-auto}"
+fi
 echo "[Run] ${CMD[*]}"
 if [[ -n "${RESULT_LOG}" ]]; then
   "${CMD[@]}" | tee "${RESULT_LOG}"
@@ -428,7 +479,7 @@ if [[ -n "${RESULT_LOG}" ]]; then
   if [[ -z "${SNAP_INST_IDS}" ]]; then
     SNAP_INST_IDS="$(awk -F= '/^OKX_INST_IDS=/{print $2}' "${ENV_FILE}" | tail -n1 | tr -d '"' || true)"
   fi
-  python3 - "${INDEX_CSV}" "${RESULT_LOG}" "${TRADES_CSV}" "${SAVE_TAG}" "${TITLE}" "${BARS}" "${RISK_FRAC}" "${FEE_RATE}" "${SLIPPAGE_BPS}" "${STOP_EXTRA_R}" "${TP_HAIRCUT_R}" "${MISS_PROB}" "${MANAGED_EXIT}" "${PESSIMISTIC}" "${SNAP_INST_IDS}" <<'PY'
+  python3 - "${INDEX_CSV}" "${RESULT_LOG}" "${TRADES_CSV}" "${SAVE_TAG}" "${TITLE}" "${BARS}" "${RISK_FRAC}" "${FEE_RATE}" "${SLIPPAGE_BPS}" "${STOP_EXTRA_R}" "${TP_HAIRCUT_R}" "${MISS_PROB}" "${MANAGED_EXIT}" "${PESSIMISTIC}" "${SNAP_INST_IDS}" "${ENTRY_EXEC_MODE}" "${ENTRY_AUTO_MARKET_LEVEL_MIN}" "${ENTRY_LIMIT_FALLBACK_MODE}" "${ENTRY_LIMIT_SLIPPAGE_BPS}" "${ENTRY_LIMIT_FEE_RATE}" <<'PY'
 import csv
 import os
 import re
@@ -451,6 +502,11 @@ from datetime import datetime, timezone
     managed_exit,
     pessimistic,
     inst_ids,
+    entry_exec_mode,
+    entry_auto_market_level_min,
+    entry_limit_fallback_mode,
+    entry_limit_slippage_bps,
+    entry_limit_fee_rate,
 ) = sys.argv[1:]
 
 with open(result_log, "r", encoding="utf-8", errors="ignore") as f:
@@ -525,6 +581,11 @@ row = {
     "stop_extra_r": stop_extra_r,
     "tp_haircut_r": tp_haircut_r,
     "miss_prob": miss_prob,
+    "entry_exec_mode": entry_exec_mode,
+    "entry_auto_market_level_min": entry_auto_market_level_min,
+    "entry_limit_fallback_mode": entry_limit_fallback_mode,
+    "entry_limit_slippage_bps": entry_limit_slippage_bps,
+    "entry_limit_fee_rate": entry_limit_fee_rate,
     "start_equity": start_equity,
     "final_equity": final_equity,
     "return_pct": return_pct,
