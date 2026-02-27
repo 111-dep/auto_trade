@@ -625,6 +625,8 @@ def _build_backtest_signal_fast(
         prev_low=float(pre["lows"][i - 1]) if i >= 1 else None,
         prev2_high=float(pre["highs"][i - 2]) if i >= 2 else None,
         prev2_low=float(pre["lows"][i - 2]) if i >= 2 else None,
+        prev3_high=float(pre["highs"][i - 3]) if i >= 3 else None,
+        prev3_low=float(pre["lows"][i - 3]) if i >= 3 else None,
         current_open=float(pre["opens"][i]) if i >= 0 else None,
         prev_open=float(pre["opens"][i - 1]) if i >= 1 else None,
         prev_close=float(pre["closes"][i - 1]) if i >= 1 else None,

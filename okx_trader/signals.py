@@ -228,6 +228,8 @@ def build_signals(
         prev_low=float(lows[idx - 1]) if idx >= 1 else None,
         prev2_high=float(highs[idx - 2]) if idx >= 2 else None,
         prev2_low=float(lows[idx - 2]) if idx >= 2 else None,
+        prev3_high=float(highs[idx - 3]) if idx >= 3 else None,
+        prev3_low=float(lows[idx - 3]) if idx >= 3 else None,
         current_open=float(opens[idx]) if idx >= 0 else None,
         prev_open=float(opens[idx - 1]) if idx >= 1 else None,
         prev_close=float(closes[idx - 1]) if idx >= 1 else None,

@@ -40,6 +40,8 @@ class VariantSignalInputs:
     prev_low: Optional[float] = None
     prev2_high: Optional[float] = None
     prev2_low: Optional[float] = None
+    prev3_high: Optional[float] = None
+    prev3_low: Optional[float] = None
     current_open: Optional[float] = None
     prev_open: Optional[float] = None
     prev_close: Optional[float] = None
@@ -89,6 +91,8 @@ class VariantSignalInputs:
             "prev_low": self.prev_low,
             "prev2_high": self.prev2_high,
             "prev2_low": self.prev2_low,
+            "prev3_high": self.prev3_high,
+            "prev3_low": self.prev3_low,
             "current_open": self.current_open,
             "prev_open": self.prev_open,
             "prev_close": self.prev_close,

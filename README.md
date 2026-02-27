@@ -609,6 +609,13 @@ crontab -l | grep OKX_WEEKLY_RECAP
   - 从 runtime 日志解析 `entry_exec=`，新增入场执行统计（market/limit/fallback 比例）。
 - 近期实盘推荐默认（当前 env）：
   - `auto + L3市价`，`limit_ttl=5s`，`reprice=0`，`fallback=market`。
+- 新增实验策略 `xau_sibi_v1`（SIBI/FVG 回踩做空，含 strict/soft 失衡区近似与 one-touch 约束）：
+  - 仅用于回测实验，未加入当前实盘配置。
+  - 关键快照（S3, risk=0.4%）：
+    - `xau_only_s3_r004_classic`: `final=1032.96`, `avgR=0.036`
+    - `xau_only_s3_r004_sibi_relax2`: `final=889.39`, `avgR=-0.364`
+    - `full_s3_r004_xau_sibi_relax2`: `final=31406.56`（基线 `baseline_s3_r004_rightrev_cmp` 为 `35962.14`）
+  - 结论：当前参数下收益劣于 `XAU classic`，暂不启用到实盘，仅保留代码与快照作为历史研究记录。
 
 ## 12. 后续更新模板（复制追加）
 

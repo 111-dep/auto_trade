@@ -38,6 +38,7 @@ class StrategyDispatchTests(unittest.TestCase):
             "r_breaker_v1",
             "range_reversion_v1",
             "right_reversal_v1",
+            "xau_sibi_v1",
         ]
         payload = dict(
             bias="long",
@@ -102,6 +103,7 @@ class StrategyDispatchTests(unittest.TestCase):
         self.assertIn("elder_tss_v1#inputs", m)
         self.assertIn("range_reversion_v1#inputs", m)
         self.assertIn("right_reversal_v1#inputs", m)
+        self.assertIn("xau_sibi_v1#inputs", m)
 
 
 if __name__ == "__main__":
