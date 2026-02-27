@@ -123,12 +123,14 @@ def run_once_for_inst(
             enforce_max_level=primary_exec_max,
             profile_score_map=cfg.strategy_profile_vote_score_map,
             level_weight=cfg.strategy_profile_vote_level_weight,
+            fallback_profile_ids=cfg.strategy_profile_vote_fallback_profiles,
         )
         if bool(vote_meta.get("enabled")):
             log(
                 f"[{inst_id}] vote mode={vote_meta.get('mode')} "
                 f"agree={vote_meta.get('required')} long={vote_meta.get('long_votes')} "
                 f"short={vote_meta.get('short_votes')} weighted={vote_meta.get('weighted')} "
+                f"fallback={vote_meta.get('fallback_mode')} "
                 f"winner={vote_meta.get('winner_side')} "
                 f"pick={vote_meta.get('winner_profile')}@L{vote_meta.get('winner_level')}"
             )

@@ -172,6 +172,7 @@ class Config:
     strategy_profile_vote_min_agree: int
     strategy_profile_vote_score_map: Dict[str, float]
     strategy_profile_vote_level_weight: float
+    strategy_profile_vote_fallback_profiles: List[str]
     strategy_profiles: Dict[str, StrategyParams]
 
 

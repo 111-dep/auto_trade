@@ -16,6 +16,7 @@ _VARIANT_BTCETH_CANDLE_MACD_V1 = "btceth_candle_macd_v1"
 _VARIANT_ELDER_TSS_V1 = "elder_tss_v1"
 _VARIANT_R_BREAKER_V1 = "r_breaker_v1"
 _VARIANT_RANGE_REVERSION_V1 = "range_reversion_v1"
+_VARIANT_RIGHT_REVERSAL_V1 = "right_reversal_v1"
 
 
 def normalize_strategy_variant(raw: str) -> str:
@@ -43,6 +44,8 @@ def normalize_strategy_variant(raw: str) -> str:
         return _VARIANT_R_BREAKER_V1
     if key in {"range_reversion_v1", "range_reversion", "range_revert", "rr"}:
         return _VARIANT_RANGE_REVERSION_V1
+    if key in {"right_reversal_v1", "right_reversal", "rightside_reversal", "rrv1"}:
+        return _VARIANT_RIGHT_REVERSAL_V1
     if key in {"btceth_smc_a2", "btc_eth_smc_a2", "smc_a2"}:
         return _VARIANT_BTCETH_SMC_A2
     if key in {"btceth_smc_a1", "btc_eth_smc_a1", "smc_a1", "smc_plus", "smc_a_plus"}:

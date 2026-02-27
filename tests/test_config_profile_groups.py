@@ -69,6 +69,18 @@ class ConfigProfileGroupsTests(unittest.TestCase):
         self.assertTrue(cfg.strategy_profiles["BTCETH"].signal_exit_enabled)
         self.assertFalse(cfg.strategy_profiles["DEFAULT"].signal_exit_enabled)
 
+    def test_vote_fallback_profiles_parse_and_normalize(self) -> None:
+        env = {
+            "OKX_INST_IDS": "BTC-USDT-SWAP,SOL-USDT-SWAP",
+            "STRAT_PROFILE_VOTE_INST_GROUPS": "DEFAULT+RIGHTREV:SOL-USDT-SWAP",
+            "STRAT_PROFILE_RIGHTREV_VARIANT": "right_reversal_v1",
+            "STRAT_PROFILE_VOTE_FALLBACK_PROFILES": "RIGHTREV",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            cfg = read_config(None)
+        self.assertEqual(cfg.strategy_profile_vote_fallback_profiles, ["RIGHTREV"])
+        self.assertIn("RIGHTREV", cfg.strategy_profiles)
+
     def test_split_tp_default_off_and_profile_override(self) -> None:
         env = {
             "OKX_INST_IDS": "BTC-USDT-SWAP,SOL-USDT-SWAP",

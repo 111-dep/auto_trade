@@ -34,6 +34,7 @@ def merge_entry_votes(
     enforce_max_level: int,
     profile_score_map: Optional[Dict[str, float]] = None,
     level_weight: float = 0.0,
+    fallback_profile_ids: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     sig = dict(base_signal)
     total_profiles = max(0, len(profile_ids))
@@ -50,6 +51,23 @@ def merge_entry_votes(
             long_votes.append((idx, profile_id, decision))
         elif decision.side == "SHORT":
             short_votes.append((idx, profile_id, decision))
+
+    fallback_set = {str(x).strip().upper() for x in (fallback_profile_ids or []) if str(x).strip()}
+    long_votes_all = list(long_votes)
+    short_votes_all = list(short_votes)
+    fallback_mode = "disabled"
+    if fallback_set:
+        long_primary = [x for x in long_votes_all if str(x[1]).strip().upper() not in fallback_set]
+        short_primary = [x for x in short_votes_all if str(x[1]).strip().upper() not in fallback_set]
+        primary_total = len(long_primary) + len(short_primary)
+        if primary_total > 0:
+            long_votes = long_primary
+            short_votes = short_primary
+            fallback_mode = "suppressed"
+        else:
+            long_votes = long_votes_all
+            short_votes = short_votes_all
+            fallback_mode = "activated" if (len(long_votes) + len(short_votes)) > 0 else "idle"
 
     lv = len(long_votes)
     sv = len(short_votes)
@@ -187,6 +205,8 @@ def merge_entry_votes(
         "total_votes": int(total_votes),
         "long_votes": int(lv),
         "short_votes": int(sv),
+        "long_votes_all": int(len(long_votes_all)),
+        "short_votes_all": int(len(short_votes_all)),
         "winner_side": winner_side or "NONE",
         "winner_profile": winner_profile,
         "winner_level": int(winner_level),
@@ -194,6 +214,8 @@ def merge_entry_votes(
         "weighted": bool(use_weighted),
         "level_weight": float(level_w),
         "score_map": dict(score_map),
+        "fallback_profiles": sorted(fallback_set),
+        "fallback_mode": fallback_mode,
         "long_side_score": float(_side_score(long_votes)) if use_weighted else 0.0,
         "short_side_score": float(_side_score(short_votes)) if use_weighted else 0.0,
     }

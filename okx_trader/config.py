@@ -380,6 +380,23 @@ def _parse_strategy_profile_vote_score_map(raw: str) -> Dict[str, float]:
     return mapping
 
 
+def _parse_strategy_profile_vote_fallback_profiles(raw: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    if not raw:
+        return out
+    for item in str(raw).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        for pid in _parse_profile_id_list(item):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            out.append(pid)
+    return out
+
+
 def _parse_profile_override_value(
     env_key: str,
     raw_value: str,
@@ -516,11 +533,15 @@ def read_config(state_file_override: Optional[str]) -> Config:
         os.getenv("STRAT_PROFILE_VOTE_SCORE_MAP", "")
     )
     strategy_profile_vote_level_weight = float(os.getenv("STRAT_PROFILE_VOTE_LEVEL_WEIGHT", "0.0"))
+    strategy_profile_vote_fallback_profiles = _parse_strategy_profile_vote_fallback_profiles(
+        os.getenv("STRAT_PROFILE_VOTE_FALLBACK_PROFILES", "")
+    )
     strategy_profiles: Dict[str, StrategyParams] = {"DEFAULT": params}
     profile_ids_needed = set(strategy_profile_map.values())
     for id_list in strategy_profile_vote_map.values():
         profile_ids_needed.update(id_list)
     profile_ids_needed.update(strategy_profile_vote_score_map.keys())
+    profile_ids_needed.update(strategy_profile_vote_fallback_profiles)
     for profile_id in sorted(profile_ids_needed):
         if profile_id == "DEFAULT":
             continue
@@ -620,6 +641,7 @@ def read_config(state_file_override: Optional[str]) -> Config:
         strategy_profile_vote_min_agree=strategy_profile_vote_min_agree,
         strategy_profile_vote_score_map=strategy_profile_vote_score_map,
         strategy_profile_vote_level_weight=strategy_profile_vote_level_weight,
+        strategy_profile_vote_fallback_profiles=strategy_profile_vote_fallback_profiles,
         strategy_profiles=strategy_profiles,
     )
     if cfg.pos_mode not in {"net", "long_short"}:
@@ -690,6 +712,17 @@ def read_config(state_file_override: Optional[str]) -> Config:
         cfg.strategy_profile_vote_min_agree = 1
     if cfg.strategy_profile_vote_level_weight < 0:
         cfg.strategy_profile_vote_level_weight = 0.0
+    normalized_fallback_profiles: list[str] = []
+    seen_fallback: set[str] = set()
+    for raw_id in cfg.strategy_profile_vote_fallback_profiles:
+        pid = _normalize_profile_id(raw_id)
+        if pid not in cfg.strategy_profiles:
+            continue
+        if pid in seen_fallback:
+            continue
+        seen_fallback.add(pid)
+        normalized_fallback_profiles.append(pid)
+    cfg.strategy_profile_vote_fallback_profiles = normalized_fallback_profiles
     normalized_vote_map: Dict[str, list[str]] = {}
     for inst, ids in cfg.strategy_profile_vote_map.items():
         picked: list[str] = []

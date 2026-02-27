@@ -249,6 +249,11 @@ def main() -> int:
             if cfg.strategy_profile_vote_score_map
             else "-"
         )
+        profile_vote_fallback_display = (
+            ",".join(cfg.strategy_profile_vote_fallback_profiles)
+            if cfg.strategy_profile_vote_fallback_profiles
+            else "-"
+        )
         profile_ids_display = ",".join(sorted(cfg.strategy_profiles.keys())) or "DEFAULT"
         log(
             f"Start | insts={insts_display} htf={cfg.htf_bar} loc={cfg.loc_bar} ltf={cfg.ltf_bar} dry_run={cfg.dry_run} "
@@ -284,6 +289,7 @@ def main() -> int:
             f"profile_vote_mode={cfg.strategy_profile_vote_mode}/{cfg.strategy_profile_vote_min_agree} "
             f"profile_vote_score_map={profile_vote_score_display} "
             f"profile_vote_level_weight={cfg.strategy_profile_vote_level_weight} "
+            f"profile_vote_fallback={profile_vote_fallback_display} "
             f"journal={cfg.trade_journal_enabled} "
             f"journal_path={cfg.trade_journal_path} "
             f"order_link={cfg.trade_order_link_enabled} "
