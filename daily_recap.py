@@ -144,6 +144,30 @@ def _extract_entry_exec_modes(msg: str) -> List[str]:
     return out
 
 
+def _entry_exec_stats(runtime: Dict[str, Any]) -> Dict[str, Any]:
+    entry_exec = runtime.get("entry_exec_counter") or {}
+    total = int(runtime.get("entry_exec_legs", 0) or 0)
+    actions = int(runtime.get("entry_exec_open_actions", 0) or 0)
+    market = int(entry_exec.get("market", 0) or 0)
+    limit_fill = int(entry_exec.get("limit", 0) or 0)
+    fallback_market = int(entry_exec.get("limit_fallback_market", 0) or 0)
+    other = int(entry_exec.get("other", 0) or 0)
+    limit_attempts = int(limit_fill + fallback_market)
+    limit_fill_ratio = float(limit_fill / limit_attempts) if limit_attempts > 0 else 0.0
+    fallback_ratio = float(fallback_market / limit_attempts) if limit_attempts > 0 else 0.0
+    return {
+        "total": total,
+        "actions": actions,
+        "market": market,
+        "limit_fill": limit_fill,
+        "fallback_market": fallback_market,
+        "other": other,
+        "limit_attempts": limit_attempts,
+        "limit_fill_ratio": limit_fill_ratio,
+        "fallback_ratio": fallback_ratio,
+    }
+
+
 def _ts_ms_to_utc_text(ts_ms: int) -> str:
     if int(ts_ms) <= 0:
         return ""
@@ -1081,6 +1105,17 @@ def _build_md_report(report: Dict[str, Any]) -> str:
     lines.append(
         f"- 同向并发峰值(long/short/same/total): {int(side_conc.get('max_long', 0))}/{int(side_conc.get('max_short', 0))}/{int(side_conc.get('max_same_side', 0))}/{int(side_conc.get('max_total', 0))}"
     )
+    exec_stats = _entry_exec_stats(runtime)
+    if int(exec_stats["total"]) > 0:
+        lines.append(
+            f"- 入场执行(legs): total={int(exec_stats['total'])} actions={int(exec_stats['actions'])} "
+            f"market={int(exec_stats['market'])} limit_fill={int(exec_stats['limit_fill'])} "
+            f"fallback_market={int(exec_stats['fallback_market'])} "
+            f"limit_fill_rate={float(exec_stats['limit_fill_ratio']):.1%} "
+            f"fallback_rate={float(exec_stats['fallback_ratio']):.1%}"
+        )
+    else:
+        lines.append("- 入场执行(legs): N/A (窗口内无开仓执行日志)")
     equity = report.get("equity")
     if equity:
         eq_val = equity.get("equity")
@@ -1181,21 +1216,19 @@ def _build_md_report(report: Dict[str, Any]) -> str:
     lines.append(
         f"- hb_totals processed={hb['processed']} no_new={hb['no_new']} stale={hb['stale']} safety_skip={hb['safety_skip']} no_data={hb['no_data']} error={hb['error']}"
     )
-    entry_exec = runtime.get("entry_exec_counter") or {}
-    entry_exec_total = int(runtime.get("entry_exec_legs", 0) or 0)
-    if entry_exec_total > 0:
-        mkt = int(entry_exec.get("market", 0))
-        lim = int(entry_exec.get("limit", 0))
-        lim_fb = int(entry_exec.get("limit_fallback_market", 0))
-        other = int(entry_exec.get("other", 0))
+    exec_stats = _entry_exec_stats(runtime)
+    if int(exec_stats["total"]) > 0:
         lines.append(
-            f"- entry_exec legs={entry_exec_total} actions={int(runtime.get('entry_exec_open_actions', 0))} "
-            f"market={mkt} limit={lim} fallback_market={lim_fb} other={other}"
+            f"- entry_exec legs={int(exec_stats['total'])} actions={int(exec_stats['actions'])} "
+            f"market={int(exec_stats['market'])} limit={int(exec_stats['limit_fill'])} "
+            f"fallback_market={int(exec_stats['fallback_market'])} other={int(exec_stats['other'])}"
         )
         lines.append(
-            f"- entry_exec ratio: market={mkt/max(1, entry_exec_total):.1%} "
-            f"limit={lim/max(1, entry_exec_total):.1%} "
-            f"fallback_market={lim_fb/max(1, entry_exec_total):.1%}"
+            f"- entry_exec ratio: market={int(exec_stats['market'])/max(1, int(exec_stats['total'])):.1%} "
+            f"limit={int(exec_stats['limit_fill'])/max(1, int(exec_stats['total'])):.1%} "
+            f"fallback_market={int(exec_stats['fallback_market'])/max(1, int(exec_stats['total'])):.1%} "
+            f"| limit_fill_rate={float(exec_stats['limit_fill_ratio']):.1%} "
+            f"fb_rate={float(exec_stats['fallback_ratio']):.1%}"
         )
     if runtime.get("last_heartbeat"):
         lines.append(f"- last_heartbeat: {runtime['last_heartbeat']}")
@@ -1253,6 +1286,11 @@ def _build_rollup_line(report: Dict[str, Any]) -> str:
         f"warn={runtime['warn']}",
         f"err={runtime['error']}",
     ]
+    exec_stats = _entry_exec_stats(runtime)
+    parts.append(f"entry_legs={int(exec_stats['total'])}")
+    if int(exec_stats["limit_attempts"]) > 0:
+        parts.append(f"entry_fb={float(exec_stats['fallback_ratio']):.1%}")
+        parts.append(f"entry_limfill={float(exec_stats['limit_fill_ratio']):.1%}")
     exch = report.get("exchange_positions")
     if exch:
         parts.append(f"ex_loss_streak={int(exch.get('current_loss_streak', 0))}")
@@ -1307,15 +1345,14 @@ def _build_telegram_summary(report: Dict[str, Any]) -> str:
         f"同向并发峰值(long/short/same): {int(side_conc.get('max_long', 0))}/{int(side_conc.get('max_short', 0))}/{int(side_conc.get('max_same_side', 0))}"
     )
     runtime = report.get("runtime") or {}
-    entry_exec = runtime.get("entry_exec_counter") or {}
-    entry_exec_total = int(runtime.get("entry_exec_legs", 0) or 0)
-    if entry_exec_total > 0:
-        mkt = int(entry_exec.get("market", 0))
-        lim = int(entry_exec.get("limit", 0))
-        lim_fb = int(entry_exec.get("limit_fallback_market", 0))
+    exec_stats = _entry_exec_stats(runtime)
+    if int(exec_stats["total"]) > 0:
         lines.append(
-            f"入场执行(runtime): legs={entry_exec_total} market={mkt} limit={lim} "
-            f"fallback_market={lim_fb} fb_ratio={lim_fb/max(1, entry_exec_total):.1%}"
+            f"入场执行(runtime): legs={int(exec_stats['total'])} market={int(exec_stats['market'])} "
+            f"limit_fill={int(exec_stats['limit_fill'])} "
+            f"fallback_market={int(exec_stats['fallback_market'])} "
+            f"limit_fill_rate={float(exec_stats['limit_fill_ratio']):.1%} "
+            f"fb_rate={float(exec_stats['fallback_ratio']):.1%}"
         )
     if bills_quality.get("enabled"):
         lines.append(

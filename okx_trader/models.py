@@ -82,6 +82,7 @@ class StrategyParams:
     allow_reverse: bool
     entry_exec_mode: str
     entry_auto_market_level_min: int
+    entry_auto_market_level_max: int
     entry_limit_offset_bps: float
     entry_limit_ttl_sec: int
     entry_limit_poll_ms: int
@@ -104,6 +105,7 @@ class Config:
     loc_bar: str
     ltf_bar: str
     poll_seconds: int
+    fast_ltf_gate: bool
     ws_tp1_be_enabled: bool
     ws_private_url: str
     ws_reconnect_seconds: int

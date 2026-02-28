@@ -73,10 +73,18 @@ def normalize_entry_limit_fallback_mode(mode: str) -> str:
     return m
 
 
-def resolve_entry_exec_mode(mode: str, level: int, auto_market_level_min: int) -> str:
+def resolve_entry_exec_mode(
+    mode: str,
+    level: int,
+    auto_market_level_min: int,
+    auto_market_level_max: int,
+) -> str:
     norm = normalize_entry_exec_mode(mode)
     if norm != "auto":
         return norm
+    max_level = max(0, min(3, int(auto_market_level_max)))
+    if max_level > 0:
+        return "market" if int(level) <= max_level else "limit"
     threshold = max(1, min(3, int(auto_market_level_min)))
     return "market" if int(level) >= threshold else "limit"
 
@@ -528,6 +536,15 @@ def main() -> int:
         help="When entry-exec-mode=auto, levels >= this use market (default: env STRAT_ENTRY_AUTO_MARKET_LEVEL_MIN)",
     )
     parser.add_argument(
+        "--entry-auto-market-level-max",
+        type=int,
+        default=None,
+        help=(
+            "When entry-exec-mode=auto and this is set to 1~3, levels <= this use market "
+            "(default: env STRAT_ENTRY_AUTO_MARKET_LEVEL_MAX, 0=disabled)"
+        ),
+    )
+    parser.add_argument(
         "--entry-limit-fallback-mode",
         default="",
         help="When entry-exec-mode resolves to limit: market|skip (default: env STRAT_ENTRY_LIMIT_FALLBACK_MODE)",
@@ -609,6 +626,11 @@ def main() -> int:
     else:
         entry_auto_market_level_min = int(args.entry_auto_market_level_min)
     entry_auto_market_level_min = max(1, min(3, entry_auto_market_level_min))
+    if args.entry_auto_market_level_max is None:
+        entry_auto_market_level_max = int(getattr(cfg.params, "entry_auto_market_level_max", 0) or 0)
+    else:
+        entry_auto_market_level_max = int(args.entry_auto_market_level_max)
+    entry_auto_market_level_max = max(0, min(3, entry_auto_market_level_max))
 
     entry_limit_fallback_mode = normalize_entry_limit_fallback_mode(
         str(args.entry_limit_fallback_mode).strip().lower()
@@ -709,6 +731,7 @@ def main() -> int:
     )
     print(
         f"entry_exec_model: mode={entry_exec_mode} auto_market_level_min={entry_auto_market_level_min} "
+        f"auto_market_level_max={entry_auto_market_level_max} "
         f"limit_fallback={entry_limit_fallback_mode} "
         f"limit_fee_rate={entry_limit_fee_rate:.5f} limit_slippage_bps={entry_limit_slippage_bps:.2f}",
         flush=True,
@@ -1048,7 +1071,12 @@ def main() -> int:
                 skip_miss += 1
                 return False
 
-        intended_exec_mode = resolve_entry_exec_mode(entry_exec_mode, int(level), entry_auto_market_level_min)
+        intended_exec_mode = resolve_entry_exec_mode(
+            entry_exec_mode,
+            int(level),
+            entry_auto_market_level_min,
+            entry_auto_market_level_max,
+        )
         effective_exec_mode = intended_exec_mode
         fee_rate_used = fee_rate
         slippage_bps_used = slippage_bps
@@ -1341,6 +1369,7 @@ def main() -> int:
     )
     summary.append(
         f"入场执行：mode={entry_exec_mode} auto_market_level_min={entry_auto_market_level_min} "
+        f"auto_market_level_max={entry_auto_market_level_max} "
         f"limit_fallback={entry_limit_fallback_mode} "
         f"limit_fee_rate={entry_limit_fee_rate:.5f} limit_slippage_bps={entry_limit_slippage_bps:.2f}"
     )

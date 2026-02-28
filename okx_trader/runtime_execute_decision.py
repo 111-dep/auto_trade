@@ -1137,6 +1137,9 @@ def execute_decision(
         if mode not in {"market", "limit", "auto"}:
             mode = "market"
         if mode == "auto":
+            max_level = int(getattr(cfg.params, "entry_auto_market_level_max", 0) or 0)
+            if 1 <= max_level <= 3:
+                return "market" if int(planned_level) <= max_level else "limit"
             threshold = int(getattr(cfg.params, "entry_auto_market_level_min", 3) or 3)
             threshold = max(1, min(3, threshold))
             return "market" if int(planned_level) >= threshold else "limit"

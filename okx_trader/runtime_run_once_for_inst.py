@@ -65,17 +65,67 @@ def run_once_for_inst(
     profile_id = profile_ids[0]
     params = cfg.strategy_profiles.get(profile_id, get_strategy_params(cfg, inst_id))
     intrabar_mode = cfg.alert_only and cfg.alert_intrabar_enabled
+    fast_ltf_gate = bool(getattr(cfg, "fast_ltf_gate", False))
+
+    last_ts_raw = inst_state.get("last_processed_ts_ms")
+    try:
+        last_ts = int(last_ts_raw) if last_ts_raw is not None else None
+    except (TypeError, ValueError):
+        last_ts = None
+
+    def _maybe_skip_signal(signal_ts_ms: int, signal_confirmed: bool) -> Optional[str]:
+        if last_ts is not None and last_ts == signal_ts_ms:
+            if (not intrabar_mode) or signal_confirmed:
+                last_no_new_logged_raw = inst_state.get("last_no_new_logged_ts_ms")
+                try:
+                    last_no_new_logged = (
+                        int(last_no_new_logged_raw) if last_no_new_logged_raw is not None else None
+                    )
+                except Exception:
+                    last_no_new_logged = None
+                if last_no_new_logged != signal_ts_ms:
+                    log(f"[{inst_id}] No new closed candle yet.")
+                    inst_state["last_no_new_logged_ts_ms"] = signal_ts_ms
+                return "no_new"
+
+        now_ms = int(time.time() * 1000)
+        bar_s = bar_to_seconds(cfg.ltf_bar)
+        if now_ms - signal_ts_ms > bar_s * 1000 * 2:
+            last_stale_logged_raw = inst_state.get("last_stale_logged_ts_ms")
+            try:
+                last_stale_logged = (
+                    int(last_stale_logged_raw) if last_stale_logged_raw is not None else None
+                )
+            except Exception:
+                last_stale_logged = None
+            if last_stale_logged != signal_ts_ms:
+                log(f"[{inst_id}] Latest closed candle is stale. Skip trading this round.", level="WARN")
+                inst_state["last_stale_logged_ts_ms"] = signal_ts_ms
+            inst_state["last_processed_ts_ms"] = signal_ts_ms
+            return "stale"
+        return None
+
+    htf_candles = []
+    loc_candles = []
+    ltf_candles = client.get_candles(inst_id, cfg.ltf_bar, cfg.candle_limit, include_unconfirmed=intrabar_mode)
+    if not ltf_candles:
+        log(f"[{inst_id}] No LTF candle data returned from OKX.", level="WARN")
+        return False, "no_data"
+
+    if fast_ltf_gate:
+        ltf_signal_ts = int(ltf_candles[-1].ts_ms)
+        ltf_signal_confirm = bool(ltf_candles[-1].confirm)
+        skip_status = _maybe_skip_signal(ltf_signal_ts, ltf_signal_confirm)
+        if skip_status is not None:
+            return False, skip_status
+
     htf_candles = client.get_candles(inst_id, cfg.htf_bar, cfg.candle_limit)
     loc_candles = client.get_candles(inst_id, cfg.loc_bar, cfg.candle_limit)
-    ltf_candles = client.get_candles(inst_id, cfg.ltf_bar, cfg.candle_limit, include_unconfirmed=intrabar_mode)
     if not htf_candles:
         log(f"[{inst_id}] No HTF candle data returned from OKX.", level="WARN")
         return False, "no_data"
     if not loc_candles:
         log(f"[{inst_id}] No LOC candle data returned from OKX.", level="WARN")
-        return False, "no_data"
-    if not ltf_candles:
-        log(f"[{inst_id}] No LTF candle data returned from OKX.", level="WARN")
         return False, "no_data"
 
     sig = build_signals(htf_candles, loc_candles, ltf_candles, params)
@@ -134,39 +184,13 @@ def run_once_for_inst(
                 f"winner={vote_meta.get('winner_side')} "
                 f"pick={vote_meta.get('winner_profile')}@L{vote_meta.get('winner_level')}"
             )
-    last_ts_raw = inst_state.get("last_processed_ts_ms")
-    try:
-        last_ts = int(last_ts_raw) if last_ts_raw is not None else None
-    except (TypeError, ValueError):
-        last_ts = None
 
     signal_ts = int(sig["signal_ts_ms"])
     signal_confirm = bool(sig.get("signal_confirm", True))
-    if last_ts is not None and last_ts == signal_ts:
-        if (not intrabar_mode) or signal_confirm:
-            last_no_new_logged_raw = inst_state.get("last_no_new_logged_ts_ms")
-            try:
-                last_no_new_logged = int(last_no_new_logged_raw) if last_no_new_logged_raw is not None else None
-            except Exception:
-                last_no_new_logged = None
-            if last_no_new_logged != signal_ts:
-                log(f"[{inst_id}] No new closed candle yet.")
-                inst_state["last_no_new_logged_ts_ms"] = signal_ts
-            return False, "no_new"
-
-    now_ms = int(time.time() * 1000)
-    bar_s = bar_to_seconds(cfg.ltf_bar)
-    if now_ms - signal_ts > bar_s * 1000 * 2:
-        last_stale_logged_raw = inst_state.get("last_stale_logged_ts_ms")
-        try:
-            last_stale_logged = int(last_stale_logged_raw) if last_stale_logged_raw is not None else None
-        except Exception:
-            last_stale_logged = None
-        if last_stale_logged != signal_ts:
-            log(f"[{inst_id}] Latest closed candle is stale. Skip trading this round.", level="WARN")
-            inst_state["last_stale_logged_ts_ms"] = signal_ts
-        inst_state["last_processed_ts_ms"] = signal_ts
-        return False, "stale"
+    if not fast_ltf_gate:
+        skip_status = _maybe_skip_signal(signal_ts, signal_confirm)
+        if skip_status is not None:
+            return False, skip_status
 
     _record_opportunity(
         cfg=cfg,

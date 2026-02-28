@@ -149,6 +149,7 @@ pre-commit run --all-files
 - `STRAT_SPLIT_TP_ON_ENTRY`: 是否拆分 TP1/TP2 双腿下单（建议 `1`）。
 - `STRAT_ENTRY_EXEC_MODE`: 入场执行模式（`market` / `limit` / `auto`）。
 - `STRAT_ENTRY_AUTO_MARKET_LEVEL_MIN`: `auto` 下等级阈值（>= 阈值走市价）。
+- `STRAT_ENTRY_AUTO_MARKET_LEVEL_MAX`: `auto` 可选反向阈值（<= 阈值走市价，`0`=关闭，优先于 `..._MIN`）。
 - `STRAT_ENTRY_LIMIT_OFFSET_BPS`: 限价偏移基点（越大越容易成交，价格通常更差）。
 - `STRAT_ENTRY_LIMIT_TTL_SEC`: 限价等待秒数（超时后按 fallback 处理）。
 - `STRAT_ENTRY_LIMIT_REPRICE_MAX`: 限价超时后重挂次数（建议先 `0`）。
@@ -272,6 +273,17 @@ python3 -u /home/dandan/Workspace/test/okx_trade_suite/run_interleaved_backtest_
   --entry-auto-market-level-min 3 \
   --entry-limit-fallback-mode market \
   --title "2Y ManagedExit S3-LIVE_FIT AUTO"
+
+# 反向自动：L1/L2 走 market，L3 优先 limit（未成交回退 market）
+/home/dandan/Workspace/test/okx_trade_suite/scripts/backtest/run_backtest_2y_cached.sh \
+  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
+  --bars 70080 \
+  --risk-frac 0.005 \
+  --scenario s3 \
+  --entry-exec-mode auto \
+  --entry-auto-market-level-max 2 \
+  --entry-limit-fallback-mode market \
+  --title "2Y ManagedExit S3-LIVE_FIT AUTO_REV"
 ```
 
 保存“经典回测快照”（避免每次重跑后找不到历史结果）：
@@ -621,6 +633,15 @@ crontab -l | grep OKX_WEEKLY_RECAP
 
 - 2Y 组合回测交易明细 CSV 增强（`run_interleaved_backtest_2y.py`）：
   - 新增导出字段：`entry_px`、`stop_px`、`tp1_px`、`tp2_px`、`risk_px`，便于后续做“止损后路径/触发质量”复盘分析。
+- 新增实时执行优化开关（默认关闭，保持旧行为）：
+  - `OKX_FAST_LTF_GATE=1` 时，先只检查 `LTF` 是否有新收线；仅在有新收线时才拉取 `HTF/LOC` 并计算信号/执行。
+  - 目标：降低多币种串行轮询时的 REST 压力与空转延迟，不改变策略/风控/下单逻辑。
+- 入场执行 `auto` 模式新增反向阈值：
+  - 新增 `STRAT_ENTRY_AUTO_MARKET_LEVEL_MAX` / `--entry-auto-market-level-max`（`1~3`）；
+  - 当该值>0时，`auto` 按“`level <= max` 走市价，否则走限价”决策（优先于 `..._MIN`），支持 `L1/L2` 市价、`L3` 限价。
+- 日报/周报摘要增强（`daily_recap.py`，周报复用 rolling_168h）：
+  - 顶部与 Telegram 摘要新增入场执行统计：`limit_fill` / `fallback_market` 及 `limit_fill_rate` / `fb_rate`。
+  - `index.log` 一行汇总新增 `entry_legs`、`entry_fb`、`entry_limfill`，便于长期跟踪限价回退率。
 - 实盘风险系数更新（当前 env）：
   - `STRAT_RISK_FRAC` 调整为 `0.58%`（即 `risk_frac=0.0058`），并已重启实盘进程生效。
 

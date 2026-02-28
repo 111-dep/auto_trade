@@ -119,6 +119,7 @@ MISS_PROB=""
 TITLE=""
 ENTRY_EXEC_MODE=""
 ENTRY_AUTO_MARKET_LEVEL_MIN=""
+ENTRY_AUTO_MARKET_LEVEL_MAX=""
 ENTRY_LIMIT_FALLBACK_MODE=""
 ENTRY_LIMIT_SLIPPAGE_BPS=""
 ENTRY_LIMIT_FEE_RATE=""
@@ -153,6 +154,8 @@ Options:
   --entry-exec-mode MODE     Entry mode: market|limit|auto (runner default: env)
   --entry-auto-market-level-min N
                              Auto mode threshold: level>=N uses market
+  --entry-auto-market-level-max N
+                             Auto mode reverse threshold: level<=N uses market (0=disabled)
   --entry-limit-fallback-mode MODE
                              limit mode fallback when unfilled: market|skip
   --entry-limit-slippage-bps X
@@ -224,6 +227,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --entry-auto-market-level-min)
       ENTRY_AUTO_MARKET_LEVEL_MIN="${2:-}"
+      shift 2
+      ;;
+    --entry-auto-market-level-max)
+      ENTRY_AUTO_MARKET_LEVEL_MAX="${2:-}"
       shift 2
       ;;
     --entry-limit-fallback-mode)
@@ -444,6 +451,9 @@ fi
 if [[ -n "${ENTRY_AUTO_MARKET_LEVEL_MIN}" ]]; then
   CMD+=(--entry-auto-market-level-min "${ENTRY_AUTO_MARKET_LEVEL_MIN}")
 fi
+if [[ -n "${ENTRY_AUTO_MARKET_LEVEL_MAX}" ]]; then
+  CMD+=(--entry-auto-market-level-max "${ENTRY_AUTO_MARKET_LEVEL_MAX}")
+fi
 if [[ -n "${ENTRY_LIMIT_FALLBACK_MODE}" ]]; then
   CMD+=(--entry-limit-fallback-mode "${ENTRY_LIMIT_FALLBACK_MODE}")
 fi
@@ -464,8 +474,8 @@ if [[ -n "${TRADES_CSV}" ]]; then
 fi
 
 echo "[Scenario] ${SCENARIO} | fee=${FEE_RATE} slip=${SLIPPAGE_BPS} stop_extra_r=${STOP_EXTRA_R} tp_haircut_r=${TP_HAIRCUT_R} miss_prob=${MISS_PROB}"
-if [[ -n "${ENTRY_EXEC_MODE}" || -n "${ENTRY_AUTO_MARKET_LEVEL_MIN}" || -n "${ENTRY_LIMIT_FALLBACK_MODE}" || -n "${ENTRY_LIMIT_SLIPPAGE_BPS}" || -n "${ENTRY_LIMIT_FEE_RATE}" ]]; then
-  echo "[EntryExec] mode=${ENTRY_EXEC_MODE:-env} auto_lv=${ENTRY_AUTO_MARKET_LEVEL_MIN:-env} fallback=${ENTRY_LIMIT_FALLBACK_MODE:-env} limit_slip=${ENTRY_LIMIT_SLIPPAGE_BPS:-auto} limit_fee=${ENTRY_LIMIT_FEE_RATE:-auto}"
+if [[ -n "${ENTRY_EXEC_MODE}" || -n "${ENTRY_AUTO_MARKET_LEVEL_MIN}" || -n "${ENTRY_AUTO_MARKET_LEVEL_MAX}" || -n "${ENTRY_LIMIT_FALLBACK_MODE}" || -n "${ENTRY_LIMIT_SLIPPAGE_BPS}" || -n "${ENTRY_LIMIT_FEE_RATE}" ]]; then
+  echo "[EntryExec] mode=${ENTRY_EXEC_MODE:-env} auto_lv_min=${ENTRY_AUTO_MARKET_LEVEL_MIN:-env} auto_lv_max=${ENTRY_AUTO_MARKET_LEVEL_MAX:-env} fallback=${ENTRY_LIMIT_FALLBACK_MODE:-env} limit_slip=${ENTRY_LIMIT_SLIPPAGE_BPS:-auto} limit_fee=${ENTRY_LIMIT_FEE_RATE:-auto}"
 fi
 echo "[Run] ${CMD[*]}"
 if [[ -n "${RESULT_LOG}" ]]; then
@@ -479,7 +489,7 @@ if [[ -n "${RESULT_LOG}" ]]; then
   if [[ -z "${SNAP_INST_IDS}" ]]; then
     SNAP_INST_IDS="$(awk -F= '/^OKX_INST_IDS=/{print $2}' "${ENV_FILE}" | tail -n1 | tr -d '"' || true)"
   fi
-  python3 - "${INDEX_CSV}" "${RESULT_LOG}" "${TRADES_CSV}" "${SAVE_TAG}" "${TITLE}" "${BARS}" "${RISK_FRAC}" "${FEE_RATE}" "${SLIPPAGE_BPS}" "${STOP_EXTRA_R}" "${TP_HAIRCUT_R}" "${MISS_PROB}" "${MANAGED_EXIT}" "${PESSIMISTIC}" "${SNAP_INST_IDS}" "${ENTRY_EXEC_MODE}" "${ENTRY_AUTO_MARKET_LEVEL_MIN}" "${ENTRY_LIMIT_FALLBACK_MODE}" "${ENTRY_LIMIT_SLIPPAGE_BPS}" "${ENTRY_LIMIT_FEE_RATE}" <<'PY'
+python3 - "${INDEX_CSV}" "${RESULT_LOG}" "${TRADES_CSV}" "${SAVE_TAG}" "${TITLE}" "${BARS}" "${RISK_FRAC}" "${FEE_RATE}" "${SLIPPAGE_BPS}" "${STOP_EXTRA_R}" "${TP_HAIRCUT_R}" "${MISS_PROB}" "${MANAGED_EXIT}" "${PESSIMISTIC}" "${SNAP_INST_IDS}" "${ENTRY_EXEC_MODE}" "${ENTRY_AUTO_MARKET_LEVEL_MIN}" "${ENTRY_AUTO_MARKET_LEVEL_MAX}" "${ENTRY_LIMIT_FALLBACK_MODE}" "${ENTRY_LIMIT_SLIPPAGE_BPS}" "${ENTRY_LIMIT_FEE_RATE}" <<'PY'
 import csv
 import os
 import re
@@ -504,6 +514,7 @@ from datetime import datetime, timezone
     inst_ids,
     entry_exec_mode,
     entry_auto_market_level_min,
+    entry_auto_market_level_max,
     entry_limit_fallback_mode,
     entry_limit_slippage_bps,
     entry_limit_fee_rate,
@@ -583,6 +594,7 @@ row = {
     "miss_prob": miss_prob,
     "entry_exec_mode": entry_exec_mode,
     "entry_auto_market_level_min": entry_auto_market_level_min,
+    "entry_auto_market_level_max": entry_auto_market_level_max,
     "entry_limit_fallback_mode": entry_limit_fallback_mode,
     "entry_limit_slippage_bps": entry_limit_slippage_bps,
     "entry_limit_fee_rate": entry_limit_fee_rate,

@@ -121,6 +121,10 @@ def _normalize_strategy_params(params: StrategyParams) -> None:
         params.entry_auto_market_level_min = 1
     if params.entry_auto_market_level_min > 3:
         params.entry_auto_market_level_min = 3
+    if params.entry_auto_market_level_max < 0:
+        params.entry_auto_market_level_max = 0
+    if params.entry_auto_market_level_max > 3:
+        params.entry_auto_market_level_max = 3
     if params.entry_limit_offset_bps < 0:
         params.entry_limit_offset_bps = 0.0
     if params.entry_limit_ttl_sec < 0:
@@ -219,6 +223,7 @@ def _build_base_strategy_params() -> StrategyParams:
         allow_reverse=parse_bool(os.getenv("STRAT_ALLOW_REVERSE", "1"), True),
         entry_exec_mode=os.getenv("STRAT_ENTRY_EXEC_MODE", "market").strip().lower(),
         entry_auto_market_level_min=int(os.getenv("STRAT_ENTRY_AUTO_MARKET_LEVEL_MIN", "3")),
+        entry_auto_market_level_max=int(os.getenv("STRAT_ENTRY_AUTO_MARKET_LEVEL_MAX", "0")),
         entry_limit_offset_bps=float(os.getenv("STRAT_ENTRY_LIMIT_OFFSET_BPS", "1.0")),
         entry_limit_ttl_sec=int(os.getenv("STRAT_ENTRY_LIMIT_TTL_SEC", "10")),
         entry_limit_poll_ms=int(os.getenv("STRAT_ENTRY_LIMIT_POLL_MS", "500")),
@@ -564,6 +569,7 @@ def read_config(state_file_override: Optional[str]) -> Config:
         loc_bar=os.getenv("OKX_LOC_BAR", "1H"),
         ltf_bar=os.getenv("OKX_LTF_BAR", os.getenv("OKX_BAR", "15m")),
         poll_seconds=max(3, int(os.getenv("OKX_POLL_SECONDS", "10"))),
+        fast_ltf_gate=parse_bool(os.getenv("OKX_FAST_LTF_GATE", "0"), False),
         ws_tp1_be_enabled=parse_bool(os.getenv("OKX_WS_TP1_BE_ENABLED", "1"), True),
         ws_private_url=os.getenv(
             "OKX_WS_PRIVATE_URL",

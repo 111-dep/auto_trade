@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from daily_recap import (
+    _entry_exec_stats,
     _build_bills_mapping_quality,
     _resolve_net_pnl,
     _summarize_equity_delta,
@@ -16,6 +17,30 @@ from daily_recap import (
 
 
 class DailyRecapTests(unittest.TestCase):
+    def test_entry_exec_stats_basic(self) -> None:
+        runtime = {
+            "entry_exec_counter": {
+                "market": 10,
+                "limit": 30,
+                "limit_fallback_market": 5,
+            },
+            "entry_exec_open_actions": 22,
+            "entry_exec_legs": 45,
+        }
+        out = _entry_exec_stats(runtime)
+        self.assertEqual(int(out.get("total", 0)), 45)
+        self.assertEqual(int(out.get("actions", 0)), 22)
+        self.assertEqual(int(out.get("limit_attempts", 0)), 35)
+        self.assertAlmostEqual(float(out.get("limit_fill_ratio", 0.0)), 30 / 35, places=9)
+        self.assertAlmostEqual(float(out.get("fallback_ratio", 0.0)), 5 / 35, places=9)
+
+    def test_entry_exec_stats_handles_empty(self) -> None:
+        out = _entry_exec_stats({})
+        self.assertEqual(int(out.get("total", 0)), 0)
+        self.assertEqual(int(out.get("limit_attempts", 0)), 0)
+        self.assertEqual(float(out.get("limit_fill_ratio", -1.0)), 0.0)
+        self.assertEqual(float(out.get("fallback_ratio", -1.0)), 0.0)
+
     def test_summarize_trade_journal_basic(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "trade_journal.csv"
