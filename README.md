@@ -617,6 +617,13 @@ crontab -l | grep OKX_WEEKLY_RECAP
     - `full_s3_r004_xau_sibi_relax2`: `final=31406.56`（基线 `baseline_s3_r004_rightrev_cmp` 为 `35962.14`）
   - 结论：当前参数下收益劣于 `XAU classic`，暂不启用到实盘，仅保留代码与快照作为历史研究记录。
 
+### 2026-02-28
+
+- 2Y 组合回测交易明细 CSV 增强（`run_interleaved_backtest_2y.py`）：
+  - 新增导出字段：`entry_px`、`stop_px`、`tp1_px`、`tp2_px`、`risk_px`，便于后续做“止损后路径/触发质量”复盘分析。
+- 实盘风险系数更新（当前 env）：
+  - `STRAT_RISK_FRAC` 调整为 `0.58%`（即 `risk_frac=0.0058`），并已重启实盘进程生效。
+
 ## 12. 后续更新模板（复制追加）
 
 ```md
