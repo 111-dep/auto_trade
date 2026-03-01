@@ -384,6 +384,11 @@ python3 reconcile_okx_bills.py \
 /home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh
 ```
 
+口径说明（重要）：
+- `run_daily_recap.sh` 默认主口径为 `exchange_first`（交易所 `positions-history` 优先）。
+- 当交易所口径可用时，平仓胜负/连亏/净收益主摘要以交易所为准；台账口径仍保留用于辅助排查。
+- 可手动切回：`--primary-source journal` 或 `--primary-source bills_auto`。
+
 指定日期复盘：
 
 ```bash
@@ -397,6 +402,7 @@ python3 reconcile_okx_bills.py \
 ```bash
 /home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh \
   --rolling-hours 24 \
+  --primary-source exchange_first \
   --with-bills \
   --with-exchange-history \
   --with-equity \
@@ -487,6 +493,7 @@ crontab -l | grep OKX_DAILY_RECAP
 
 ```bash
 /home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_weekly_recap.sh \
+  --primary-source exchange_first \
   --with-bills \
   --with-exchange-history \
   --with-equity

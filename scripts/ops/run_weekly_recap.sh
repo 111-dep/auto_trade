@@ -32,6 +32,7 @@ WITH_BILLS=0
 WITH_EXCHANGE_HISTORY=0
 WITH_EQUITY=0
 TELEGRAM=0
+PRIMARY_SOURCE="exchange_first"
 TOP_N=8
 OUT_DIR="${ROOT_DIR}/logs/weekly_recap"
 PRINT_STDOUT=1
@@ -54,6 +55,7 @@ Options:
   --with-bills                    Include bills reconcile (requires API connectivity)
   --with-exchange-history         Include exchange positions-history stats (requires API)
   --with-equity                   Include current account equity (requires API connectivity)
+  --primary-source MODE           Recap primary source: bills_auto/journal/exchange_first
   --bills-unmapped-max-ratio X    Fallback threshold (default: 0.35)
   --bills-alert-unmapped-ratio X  Hard-alert threshold (default: 0.50)
   --bills-alert-min-selected N    Min selected rows before hard alert (default: 20)
@@ -90,6 +92,10 @@ while [[ $# -gt 0 ]]; do
     --with-equity)
       WITH_EQUITY=1
       shift
+      ;;
+    --primary-source)
+      PRIMARY_SOURCE="${2:-exchange_first}"
+      shift 2
       ;;
     --bills-unmapped-max-ratio)
       BILLS_UNMAPPED_MAX_RATIO="${2:-}"
@@ -136,12 +142,17 @@ if [[ ! -x "${RUNNER}" ]]; then
   exit 1
 fi
 
+if [[ "${PRIMARY_SOURCE}" == "exchange_first" && "${WITH_EXCHANGE_HISTORY}" != "1" ]]; then
+  WITH_EXCHANGE_HISTORY=1
+fi
+
 CMD=("${RUNNER}"
   --env "${ENV_FILE}"
   --rolling-hours "${ROLLING_HOURS}"
   --tz-offset "${TZ_OFFSET}"
   --top-n "${TOP_N}"
   --out-dir "${OUT_DIR}"
+  --primary-source "${PRIMARY_SOURCE}"
   --bills-unmapped-max-ratio "${BILLS_UNMAPPED_MAX_RATIO}"
   --bills-alert-unmapped-ratio "${BILLS_ALERT_UNMAPPED_RATIO}"
   --bills-alert-min-selected "${BILLS_ALERT_MIN_SELECTED}"

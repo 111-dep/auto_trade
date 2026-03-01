@@ -32,6 +32,7 @@ WITH_BILLS=0
 WITH_EXCHANGE_HISTORY=0
 WITH_EQUITY=0
 TELEGRAM=0
+PRIMARY_SOURCE="exchange_first"
 TOP_N=5
 OUT_DIR="${ROOT_DIR}/logs/daily_recap"
 APPEND_SUMMARY=""
@@ -54,6 +55,7 @@ Options:
   --with-exchange-history
                         Include exchange positions-history stats (requires API)
   --with-equity          Include current account equity (requires API connectivity)
+  --primary-source MODE  Recap primary source: bills_auto/journal/exchange_first
   --bills-unmapped-max-ratio X
                         Fallback threshold for bills unmapped ratio (default: 0.35)
   --bills-alert-unmapped-ratio X
@@ -98,6 +100,10 @@ while [[ $# -gt 0 ]]; do
       WITH_EQUITY=1
       shift
       ;;
+    --primary-source)
+      PRIMARY_SOURCE="${2:-exchange_first}"
+      shift 2
+      ;;
     --bills-unmapped-max-ratio)
       BILLS_UNMAPPED_MAX_RATIO="${2:-}"
       shift 2
@@ -141,6 +147,10 @@ done
 mkdir -p "${OUT_DIR}"
 APPEND_SUMMARY="${OUT_DIR}/index.log"
 
+if [[ "${PRIMARY_SOURCE}" == "exchange_first" && "${WITH_EXCHANGE_HISTORY}" != "1" ]]; then
+  WITH_EXCHANGE_HISTORY=1
+fi
+
 if [[ -n "${DATE_ARG}" ]]; then
   REPORT_DATE="${DATE_ARG}"
 else
@@ -158,6 +168,7 @@ CMD=(python3 -u "${ROOT_DIR}/daily_recap.py"
   --out-md "${OUT_MD}"
   --out-json "${OUT_JSON}"
   --append-summary "${APPEND_SUMMARY}"
+  --primary-source "${PRIMARY_SOURCE}"
   --bills-unmapped-max-ratio "${BILLS_UNMAPPED_MAX_RATIO}"
   --bills-alert-unmapped-ratio "${BILLS_ALERT_UNMAPPED_RATIO}"
   --bills-alert-min-selected "${BILLS_ALERT_MIN_SELECTED}"

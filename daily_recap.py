@@ -912,8 +912,63 @@ def _build_bills_mapping_quality(
     }
 
 
+def _normalize_primary_source(raw: Any) -> str:
+    mode = str(raw or "bills_auto").strip().lower()
+    if mode not in {"bills_auto", "journal", "exchange_first"}:
+        mode = "bills_auto"
+    return mode
+
+
+def _resolve_outcomes(report: Dict[str, Any]) -> Tuple[Dict[str, int], str]:
+    mode = _normalize_primary_source(report.get("primary_source", "bills_auto"))
+    exch = report.get("exchange_positions")
+    if mode == "exchange_first" and isinstance(exch, dict) and int(exch.get("rows", 0)) > 0:
+        return (
+            {
+                "total": int(exch.get("rows", 0)),
+                "win": int(exch.get("win", 0)),
+                "loss": int(exch.get("loss", 0)),
+                "breakeven": int(exch.get("breakeven", 0)),
+            },
+            "exchange",
+        )
+    journal = report.get("journal") or {}
+    trades = journal.get("trade_summaries") or []
+    return _trade_outcome_counts(trades), "journal"
+
+
+def _resolve_streak_summary(report: Dict[str, Any]) -> Dict[str, Any]:
+    mode = _normalize_primary_source(report.get("primary_source", "bills_auto"))
+    journal = report.get("journal") or {}
+    exch = report.get("exchange_positions") or {}
+    if mode == "exchange_first" and int(exch.get("rows", 0)) > 0:
+        return {
+            "source": "exchange",
+            "current_loss_streak": int(exch.get("current_loss_streak", 0)),
+            "max_loss_streak": int(exch.get("max_loss_streak", 0)),
+            "current_win_streak": None,
+            "max_win_streak": None,
+        }
+    return {
+        "source": "journal",
+        "current_loss_streak": int(journal.get("current_loss_streak", 0)),
+        "max_loss_streak": int(journal.get("max_loss_streak", 0)),
+        "current_win_streak": int(journal.get("current_win_streak", 0)),
+        "max_win_streak": int(journal.get("max_win_streak", 0)),
+    }
+
+
 def _resolve_net_pnl(report: Dict[str, Any]) -> Tuple[Decimal, str, str]:
+    mode = _normalize_primary_source(report.get("primary_source", "bills_auto"))
     journal_val = _to_decimal(report["journal"].get("realized_pnl"))
+    if mode == "journal":
+        return journal_val, "journal", "forced_journal"
+    if mode == "exchange_first":
+        exch = report.get("exchange_positions")
+        if isinstance(exch, dict) and int(exch.get("rows", 0)) > 0:
+            return _to_decimal(exch.get("realized_pnl_sum")), "exchange", "ok"
+        return journal_val, "journal", "exchange_unavailable_fallback_journal"
+
     bills = report.get("bills")
     if not bills:
         return journal_val, "journal", "bills_not_enabled"
@@ -1053,6 +1108,8 @@ def _build_md_report(report: Dict[str, Any]) -> str:
     journal = report["journal"]
     runtime = report["runtime"]
     outcomes = report["outcomes"]
+    outcomes_source = str(report.get("outcomes_source", "journal") or "journal")
+    streaks = _resolve_streak_summary(report)
     winners: List[TradeSummary] = report["winners"]
     losers: List[TradeSummary] = report["losers"]
     open_count = int(journal["event_counter"].get("OPEN", 0))
@@ -1066,9 +1123,14 @@ def _build_md_report(report: Dict[str, Any]) -> str:
     lines.append(f"- 窗口(UTC): {report['window_start_utc']} -> {report['window_end_utc']}")
     lines.append(f"- 标的: {','.join(report['inst_ids']) if report['inst_ids'] else '-'}")
     lines.append(f"- 开仓事件数(OPEN): {open_count}")
-    lines.append(
-        f"- 平仓交易数(按trade_id): {outcomes['total']} | 胜/负/平: {outcomes['win']}/{outcomes['loss']}/{outcomes['breakeven']}"
-    )
+    if outcomes_source == "exchange":
+        lines.append(
+            f"- 平仓交易数(交易所口径): {outcomes['total']} | 胜/负/平: {outcomes['win']}/{outcomes['loss']}/{outcomes['breakeven']}"
+        )
+    else:
+        lines.append(
+            f"- 平仓交易数(按trade_id): {outcomes['total']} | 胜/负/平: {outcomes['win']}/{outcomes['loss']}/{outcomes['breakeven']}"
+        )
     lines.append(
         f"- 已实现PnL(journal close): {_fmt_decimal(journal['realized_pnl'])} USDT | close_rows={journal['close_row_count']}"
     )
@@ -1090,10 +1152,20 @@ def _build_md_report(report: Dict[str, Any]) -> str:
         )
         if bool(bills_quality.get("hard_alert", False)):
             lines.append(f"- 对账告警: {bills_quality.get('net_note', 'bills_mapping_quality_alert')}")
-    lines.append(
-        f"- 当前连亏={journal['current_loss_streak']} | 当前连赢={journal['current_win_streak']} | 当前连续stop-like={journal['current_stop_like_streak']}"
-    )
-    lines.append(f"- 当日最大连亏(窗口内): {journal['max_loss_streak']} | 当日最大连赢(窗口内): {journal['max_win_streak']}")
+    if str(streaks.get("source")) == "exchange":
+        lines.append(
+            f"- 当前连亏(交易所口径)={int(streaks.get('current_loss_streak', 0))} | 当前连赢(交易所口径)=N/A | 当前连续stop-like(台账)={journal['current_stop_like_streak']}"
+        )
+        lines.append(
+            f"- 当日最大连亏(交易所口径): {int(streaks.get('max_loss_streak', 0))} | 当日最大连赢(台账): {journal['max_win_streak']}"
+        )
+    else:
+        lines.append(
+            f"- 当前连亏={journal['current_loss_streak']} | 当前连赢={journal['current_win_streak']} | 当前连续stop-like={journal['current_stop_like_streak']}"
+        )
+        lines.append(
+            f"- 当日最大连亏(窗口内): {journal['max_loss_streak']} | 当日最大连赢(窗口内): {journal['max_win_streak']}"
+        )
     batch_stats = journal.get("batch_stats") or {}
     side_conc = journal.get("side_concurrency") or {}
     lines.append(
@@ -1267,6 +1339,8 @@ def _build_rollup_line(report: Dict[str, Any]) -> str:
     journal = report["journal"]
     runtime = report["runtime"]
     outcomes = report["outcomes"]
+    outcomes_source = str(report.get("outcomes_source", "journal") or "journal")
+    streaks = _resolve_streak_summary(report)
     open_count = int(journal["event_counter"].get("OPEN", 0))
     batch_stats = journal.get("batch_stats") or {}
     side_conc = journal.get("side_concurrency") or {}
@@ -1279,13 +1353,15 @@ def _build_rollup_line(report: Dict[str, Any]) -> str:
         f"opens={open_count}",
         f"trades={outcomes['total']}",
         f"w/l/b={outcomes['win']}/{outcomes['loss']}/{outcomes['breakeven']}",
-        f"loss_streak={journal['current_loss_streak']}",
+        f"loss_streak={int(streaks.get('current_loss_streak', 0))}",
         f"batch_loss_streak={int(batch_stats.get('current_loss_streak', 0))}",
         f"side_peak={int(side_conc.get('max_same_side', 0))}",
         f"stop_streak={journal['current_stop_like_streak']}",
         f"warn={runtime['warn']}",
         f"err={runtime['error']}",
     ]
+    if outcomes_source != "journal":
+        parts.append(f"outcomes={outcomes_source}")
     exec_stats = _entry_exec_stats(runtime)
     parts.append(f"entry_legs={int(exec_stats['total'])}")
     if int(exec_stats["limit_attempts"]) > 0:
@@ -1305,6 +1381,8 @@ def _build_telegram_summary(report: Dict[str, Any]) -> str:
     batch_stats = journal.get("batch_stats") or {}
     side_conc = journal.get("side_concurrency") or {}
     outcomes = report["outcomes"]
+    outcomes_source = str(report.get("outcomes_source", "journal") or "journal")
+    streaks = _resolve_streak_summary(report)
     open_count = int(journal["event_counter"].get("OPEN", 0))
     net_pnl, net_src, net_note = _resolve_net_pnl(report)
     bills_quality = report.get("bills_quality") or _build_bills_mapping_quality(report)
@@ -1323,7 +1401,7 @@ def _build_telegram_summary(report: Dict[str, Any]) -> str:
         "【Daily Recap 24h】",
         f"窗口(UTC): {report['window_start_utc']} -> {report['window_end_utc']}",
         f"开仓次数: {open_count}",
-        f"平仓交易: {outcomes['total']} | 胜/负/平: {outcomes['win']}/{outcomes['loss']}/{outcomes['breakeven']}",
+        f"平仓交易({outcomes_source}): {outcomes['total']} | 胜/负/平: {outcomes['win']}/{outcomes['loss']}/{outcomes['breakeven']}",
         f"净收益({net_src}): {_fmt_decimal(net_pnl)} USDT",
         f"当前权益: {eq_text}",
         f"基准本金: {base_text}",
@@ -1335,7 +1413,9 @@ def _build_telegram_summary(report: Dict[str, Any]) -> str:
         )
     elif equity_delta:
         lines.append(f"窗口权益变化: N/A ({equity_delta.get('reason', 'unavailable')})")
-    if exch_loss is not None:
+    if str(streaks.get("source")) == "exchange":
+        lines.append(f"当前连亏(主口径=交易所): {int(streaks.get('current_loss_streak', 0))}")
+    elif exch_loss is not None:
         lines.append(f"当前连亏(交易所): {exch_loss}")
     lines.append(f"当前连亏/连赢(台账): {journal_loss}/{journal_win}")
     lines.append(
@@ -1396,6 +1476,12 @@ def main() -> int:
     parser.add_argument("--journal-path", default="", help="Override trade_journal.csv path.")
     parser.add_argument("--runtime-log", default="", help="Override runtime.log path.")
     parser.add_argument("--inst-ids", default="", help="Optional comma-separated scope.")
+    parser.add_argument(
+        "--primary-source",
+        default="bills_auto",
+        choices=["bills_auto", "journal", "exchange_first"],
+        help="Primary source for recap headline metrics.",
+    )
     parser.add_argument("--top-n", type=int, default=5)
     parser.add_argument("--with-bills", action="store_true", help="Fetch bills and add net reconcile.")
     parser.add_argument(
@@ -1450,7 +1536,7 @@ def main() -> int:
 
     journal = summarize_trade_journal(journal_path, start_ms=start_ms, end_ms=end_ms)
     runtime = summarize_runtime_log(runtime_path, start_ms=start_ms, end_ms=end_ms, tz=tz)
-    outcomes = _trade_outcome_counts(journal["trade_summaries"])
+    journal_outcomes = _trade_outcome_counts(journal["trade_summaries"])
     winners, losers = _top_trades(journal["trade_summaries"], n=max(1, int(args.top_n)))
 
     report: Dict[str, Any] = {
@@ -1460,9 +1546,12 @@ def main() -> int:
         "window_start_utc": datetime.fromtimestamp(start_ms / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "window_end_utc": datetime.fromtimestamp(end_ms / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "inst_ids": inst_ids,
+        "primary_source": _normalize_primary_source(args.primary_source),
         "journal": journal,
         "runtime": runtime,
-        "outcomes": outcomes,
+        "journal_outcomes": journal_outcomes,
+        "outcomes": journal_outcomes,
+        "outcomes_source": "journal",
         "winners": winners,
         "losers": losers,
     }
@@ -1483,6 +1572,7 @@ def main() -> int:
             end_ms=end_ms,
             inst_ids=inst_ids,
         )
+    report["outcomes"], report["outcomes_source"] = _resolve_outcomes(report)
     if args.with_equity:
         report["equity"] = _summarize_equity(cfg)
         eq_val = _to_decimal((report.get("equity") or {}).get("equity"))

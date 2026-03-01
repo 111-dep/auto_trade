@@ -9,7 +9,9 @@ from pathlib import Path
 from daily_recap import (
     _entry_exec_stats,
     _build_bills_mapping_quality,
+    _resolve_outcomes,
     _resolve_net_pnl,
+    _resolve_streak_summary,
     _summarize_equity_delta,
     summarize_runtime_log,
     summarize_trade_journal,
@@ -235,6 +237,60 @@ class DailyRecapTests(unittest.TestCase):
         self.assertEqual(str(net), "88.88")
         self.assertEqual(src, "bills")
         self.assertEqual(note, "ok")
+
+    def test_resolve_net_pnl_exchange_first_prefers_exchange(self) -> None:
+        report = {
+            "primary_source": "exchange_first",
+            "journal": {"realized_pnl": "123.45"},
+            "exchange_positions": {
+                "rows": 3,
+                "realized_pnl_sum": "-77.70",
+            },
+        }
+        net, src, note = _resolve_net_pnl(report)
+        self.assertEqual(str(net), "-77.70")
+        self.assertEqual(src, "exchange")
+        self.assertEqual(note, "ok")
+
+    def test_resolve_net_pnl_exchange_first_fallback_to_journal(self) -> None:
+        report = {
+            "primary_source": "exchange_first",
+            "journal": {"realized_pnl": "12.34"},
+            "exchange_positions": {"rows": 0, "realized_pnl_sum": "-1.23"},
+        }
+        net, src, note = _resolve_net_pnl(report)
+        self.assertEqual(str(net), "12.34")
+        self.assertEqual(src, "journal")
+        self.assertEqual(note, "exchange_unavailable_fallback_journal")
+
+    def test_resolve_outcomes_exchange_first_prefers_exchange(self) -> None:
+        report = {
+            "primary_source": "exchange_first",
+            "journal": {"trade_summaries": []},
+            "exchange_positions": {"rows": 10, "win": 3, "loss": 7, "breakeven": 0},
+        }
+        out, source = _resolve_outcomes(report)
+        self.assertEqual(source, "exchange")
+        self.assertEqual(int(out.get("total", 0)), 10)
+        self.assertEqual(int(out.get("win", 0)), 3)
+        self.assertEqual(int(out.get("loss", 0)), 7)
+        self.assertEqual(int(out.get("breakeven", 0)), 0)
+
+    def test_resolve_streak_summary_exchange_first_prefers_exchange(self) -> None:
+        report = {
+            "primary_source": "exchange_first",
+            "journal": {
+                "current_loss_streak": 2,
+                "max_loss_streak": 5,
+                "current_win_streak": 1,
+            },
+            "exchange_positions": {"rows": 8, "current_loss_streak": 6, "max_loss_streak": 9},
+        }
+        streaks = _resolve_streak_summary(report)
+        self.assertEqual(str(streaks.get("source")), "exchange")
+        self.assertEqual(int(streaks.get("current_loss_streak", 0)), 6)
+        self.assertEqual(int(streaks.get("max_loss_streak", 0)), 9)
+        self.assertIsNone(streaks.get("current_win_streak"))
 
     def test_build_bills_mapping_quality_hard_alert_when_unmapped_too_high(self) -> None:
         report = {
