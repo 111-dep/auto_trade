@@ -9,7 +9,10 @@ root-level command compatibility.
   - `restart_live_trader.sh`
 - `scripts/ops/`
   - `run_daily_recap.sh`
+  - `run_expectation_watch.sh`
+  - `expectation_watch.py`
   - `setup_daily_recap_cron.sh`
+  - `setup_expectation_watch_cron.sh`
   - `run_weekly_recap.sh`
   - `setup_weekly_recap_cron.sh`
 - `scripts/backtest/`
