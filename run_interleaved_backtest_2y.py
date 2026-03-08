@@ -31,6 +31,12 @@ from okx_trader.config import (
     resolve_exec_max_level,
 )
 from okx_trader.decision_core import resolve_entry_decision
+from okx_trader.entry_exec_policy import (
+    normalize_entry_exec_mode,
+    normalize_entry_limit_fallback_mode,
+    resolve_entry_exec_mode,
+    resolve_entry_limit_fallback_mode_for_params,
+)
 from okx_trader.okx_client import OKXClient
 from okx_trader.profile_vote import merge_entry_votes
 from okx_trader.risk_guard import (
@@ -58,35 +64,6 @@ def clamp01(x: float) -> float:
         return 1.0
     return v
 
-
-def normalize_entry_exec_mode(mode: str) -> str:
-    m = str(mode or "").strip().lower()
-    if m not in {"market", "limit", "auto"}:
-        return "market"
-    return m
-
-
-def normalize_entry_limit_fallback_mode(mode: str) -> str:
-    m = str(mode or "").strip().lower()
-    if m not in {"market", "skip"}:
-        return "market"
-    return m
-
-
-def resolve_entry_exec_mode(
-    mode: str,
-    level: int,
-    auto_market_level_min: int,
-    auto_market_level_max: int,
-) -> str:
-    norm = normalize_entry_exec_mode(mode)
-    if norm != "auto":
-        return norm
-    max_level = max(0, min(3, int(auto_market_level_max)))
-    if max_level > 0:
-        return "market" if int(level) <= max_level else "limit"
-    threshold = max(1, min(3, int(auto_market_level_min)))
-    return "market" if int(level) >= threshold else "limit"
 
 
 def stable_u01(key: str) -> float:
@@ -1318,7 +1295,8 @@ def main() -> int:
                 no_fill_key = f"{inst}|{int(ts)}|{side}|{int(level)}|limit_nofill|{'rev' if is_reverse else 'std'}"
                 no_fill = stable_u01(no_fill_key) < miss_prob
             if no_fill:
-                if entry_limit_fallback_mode == "skip":
+                resolved_limit_fallback_mode = resolve_entry_limit_fallback_mode_for_params(cfg.params, int(level))
+                if resolved_limit_fallback_mode == "skip":
                     skip_limit_unfilled += 1
                     return False
                 effective_exec_mode = "limit_fallback_market"

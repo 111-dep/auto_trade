@@ -81,13 +81,22 @@ class StrategyParams:
     split_tp_on_entry: bool
     allow_reverse: bool
     entry_exec_mode: str
+    entry_exec_mode_l1: str
+    entry_exec_mode_l2: str
+    entry_exec_mode_l3: str
     entry_auto_market_level_min: int
     entry_auto_market_level_max: int
     entry_limit_offset_bps: float
     entry_limit_ttl_sec: int
+    entry_limit_ttl_sec_l1: int
+    entry_limit_ttl_sec_l2: int
+    entry_limit_ttl_sec_l3: int
     entry_limit_poll_ms: int
     entry_limit_reprice_max: int
     entry_limit_fallback_mode: str
+    entry_limit_fallback_mode_l1: str
+    entry_limit_fallback_mode_l2: str
+    entry_limit_fallback_mode_l3: str
     manage_only_script_positions: bool
     skip_on_foreign_mgnmode_pos: bool
 

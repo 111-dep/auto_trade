@@ -7,6 +7,11 @@ from typing import Any, Dict, List, Optional
 from .alerts import handle_entry_alert, notify_trade_execution
 from .common import bar_to_seconds, log, round_size
 from .decision_core import resolve_entry_decision
+from .entry_exec_policy import (
+    resolve_entry_exec_mode_for_params,
+    resolve_entry_limit_fallback_mode_for_params,
+    resolve_entry_limit_ttl_sec_for_params,
+)
 from .models import Config, PositionState
 from .okx_client import OKXClient, calc_order_size
 from .risk_guard import (
@@ -1133,17 +1138,7 @@ def execute_decision(
             return float(default)
 
     def _resolve_entry_exec_mode(planned_level: int) -> str:
-        mode = str(getattr(cfg.params, "entry_exec_mode", "market") or "market").strip().lower()
-        if mode not in {"market", "limit", "auto"}:
-            mode = "market"
-        if mode == "auto":
-            max_level = int(getattr(cfg.params, "entry_auto_market_level_max", 0) or 0)
-            if 1 <= max_level <= 3:
-                return "market" if int(planned_level) <= max_level else "limit"
-            threshold = int(getattr(cfg.params, "entry_auto_market_level_min", 3) or 3)
-            threshold = max(1, min(3, threshold))
-            return "market" if int(planned_level) >= threshold else "limit"
-        return mode
+        return resolve_entry_exec_mode_for_params(cfg.params, int(planned_level))
 
     def _parse_filled_size(order_row: Dict[str, Any], fallback: float = 0.0) -> float:
         if not isinstance(order_row, dict):
@@ -1189,10 +1184,11 @@ def execute_decision(
         ord_id: str,
         cl_ord_id: str,
         requested_sz: float,
+        planned_level: int,
     ) -> tuple[float, Dict[str, Any], str]:
         if cfg.dry_run:
             return float(requested_sz), {}, "filled"
-        ttl_sec = max(0, int(getattr(cfg.params, "entry_limit_ttl_sec", 10) or 10))
+        ttl_sec = resolve_entry_limit_ttl_sec_for_params(cfg.params, int(planned_level))
         poll_ms = max(100, int(getattr(cfg.params, "entry_limit_poll_ms", 500) or 500))
         if ttl_sec <= 0:
             return 0.0, {}, "timeout"
@@ -1279,7 +1275,7 @@ def execute_decision(
             return _place_market_leg(open_size=float(norm_size), tag=action_tag)
 
         # limit mode: wait for fill, optional reprice, then fallback market/skip.
-        fallback_mode = str(getattr(cfg.params, "entry_limit_fallback_mode", "market") or "market").strip().lower()
+        fallback_mode = resolve_entry_limit_fallback_mode_for_params(cfg.params, int(planned_level))
         max_reprice = max(0, int(getattr(cfg.params, "entry_limit_reprice_max", 0) or 0))
         remaining = float(norm_size)
         opened_total = 0.0
@@ -1326,7 +1322,7 @@ def execute_decision(
             ord_id = str(meta_l.get("entry_ord_id", "") or "").strip()
             if not ord_id:
                 ord_id = str((resp_l.get("data", [{}])[0] if isinstance(resp_l, dict) else {}).get("ordId", "") or "").strip()
-            filled_sz, _, _ = _wait_limit_fill(ord_id=ord_id, cl_ord_id=leg_cl_ord_id, requested_sz=remaining)
+            filled_sz, _, _ = _wait_limit_fill(ord_id=ord_id, cl_ord_id=leg_cl_ord_id, requested_sz=remaining, planned_level=int(planned_level))
             if filled_sz < remaining - 1e-12:
                 cancel_ok = False
                 try:
@@ -1378,7 +1374,7 @@ def execute_decision(
 
         if opened_total <= 0:
             raise RuntimeError(
-                f"entry {entry_side} not filled in limit mode (fallback={fallback_mode}, ttl={cfg.params.entry_limit_ttl_sec}s)"
+                f"entry {entry_side} not filled in limit mode (fallback={fallback_mode}, ttl={resolve_entry_limit_ttl_sec_for_params(cfg.params, int(planned_level))}s)"
             )
         merged_meta["entry_exec_mode"] = "limit_fallback_market" if used_fallback_market else "limit"
         if attach_algo_ords and attach_algo_cl_ord_id and ("attach_algo_cl_ord_id" not in merged_meta):

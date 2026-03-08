@@ -152,8 +152,11 @@ pre-commit run --all-files
 - `STRAT_ENTRY_AUTO_MARKET_LEVEL_MAX`: `auto` 可选反向阈值（<= 阈值走市价，`0`=关闭，优先于 `..._MIN`）。
 - `STRAT_ENTRY_LIMIT_OFFSET_BPS`: 限价偏移基点（越大越容易成交，价格通常更差）。
 - `STRAT_ENTRY_LIMIT_TTL_SEC`: 限价等待秒数（超时后按 fallback 处理）。
+- `STRAT_ENTRY_L1/L2/L3_EXEC_MODE`: 进阶版分级执行覆盖（留空=继承全局，支持 `market` / `limit` / `auto`）。
+- `STRAT_ENTRY_L1/L2/L3_LIMIT_TTL_SEC`: 进阶版分级限价等待秒数（`-1`=继承全局）。
 - `STRAT_ENTRY_LIMIT_REPRICE_MAX`: 限价超时后重挂次数（建议先 `0`）。
 - `STRAT_ENTRY_LIMIT_FALLBACK_MODE`: 限价未成交回退（`market` / `skip`）。
+- `STRAT_ENTRY_L1/L2/L3_LIMIT_FALLBACK_MODE`: 进阶版分级未成交回退（留空=继承全局）。
 - `STRAT_SKIP_ON_FOREIGN_MGNMODE_POS`: 是否因异保证金模式仓位而跳过该币种。
 - `OKX_SINGLE_INSTANCE_LOCK`: 是否启用单实例锁（默认 `1`）。
 - `OKX_INSTANCE_LOCK_FILE`: 单实例锁文件路径（默认 `${OKX_STATE_FILE}.lock`）。
@@ -628,6 +631,9 @@ crontab -l | grep OKX_WEEKLY_RECAP
   - 从 runtime 日志解析 `entry_exec=`，新增入场执行统计（market/limit/fallback 比例）。
 - 近期实盘推荐默认（当前 env）：
   - `auto + L3市价`，`limit_ttl=5s`，`reprice=0`，`fallback=market`。
+- 新增“进阶版”分级执行覆盖：
+  - 可按 `L1/L2/L3` 单独指定 `exec_mode / limit_ttl / fallback_mode`；
+  - 典型用法：`L1=market`、`L2=limit(2s后market)`、`L3=limit(4~5s后skip)`。
 - 新增实验策略 `xau_sibi_v1`（SIBI/FVG 回踩做空，含 strict/soft 失衡区近似与 one-touch 约束）：
   - 仅用于回测实验，未加入当前实盘配置。
   - 关键快照（S3, risk=0.4%）：

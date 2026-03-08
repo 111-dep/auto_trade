@@ -6,6 +6,7 @@ from dataclasses import replace
 from typing import Dict, Optional
 
 from .common import parse_bool, parse_csv, parse_inst_ids
+from .entry_exec_policy import normalize_entry_exec_mode, normalize_entry_limit_fallback_mode
 from .models import Config, StrategyParams
 from .strategy_variant import normalize_strategy_variant
 
@@ -43,6 +44,15 @@ _STRATEGY_PROFILE_SUFFIX_ALIAS: Dict[str, str] = {
     "MGMT_BE_FEE_BUFFER_PCT": "be_fee_buffer_pct",
     "MGMT_TRAIL_ATR_MULT": "trail_atr_mult",
     "MGMT_TRAIL_AFTER_TP1": "trail_after_tp1",
+    "ENTRY_L1_EXEC_MODE": "entry_exec_mode_l1",
+    "ENTRY_L2_EXEC_MODE": "entry_exec_mode_l2",
+    "ENTRY_L3_EXEC_MODE": "entry_exec_mode_l3",
+    "ENTRY_L1_LIMIT_TTL_SEC": "entry_limit_ttl_sec_l1",
+    "ENTRY_L2_LIMIT_TTL_SEC": "entry_limit_ttl_sec_l2",
+    "ENTRY_L3_LIMIT_TTL_SEC": "entry_limit_ttl_sec_l3",
+    "ENTRY_L1_LIMIT_FALLBACK_MODE": "entry_limit_fallback_mode_l1",
+    "ENTRY_L2_LIMIT_FALLBACK_MODE": "entry_limit_fallback_mode_l2",
+    "ENTRY_L3_LIMIT_FALLBACK_MODE": "entry_limit_fallback_mode_l3",
     "HTF_LOCATION_LOOKBACK": "loc_lookback",
 }
 
@@ -114,9 +124,10 @@ def _normalize_strategy_params(params: StrategyParams) -> None:
     if params.exec_max_level > 3:
         params.exec_max_level = 3
     params.exec_l3_inst_ids = parse_inst_ids(",".join(params.exec_l3_inst_ids))
-    params.entry_exec_mode = str(getattr(params, "entry_exec_mode", "market") or "market").strip().lower()
-    if params.entry_exec_mode not in {"market", "limit", "auto"}:
-        params.entry_exec_mode = "market"
+    params.entry_exec_mode = normalize_entry_exec_mode(getattr(params, "entry_exec_mode", "market"))
+    params.entry_exec_mode_l1 = normalize_entry_exec_mode(getattr(params, "entry_exec_mode_l1", ""), allow_empty=True)
+    params.entry_exec_mode_l2 = normalize_entry_exec_mode(getattr(params, "entry_exec_mode_l2", ""), allow_empty=True)
+    params.entry_exec_mode_l3 = normalize_entry_exec_mode(getattr(params, "entry_exec_mode_l3", ""), allow_empty=True)
     if params.entry_auto_market_level_min < 1:
         params.entry_auto_market_level_min = 1
     if params.entry_auto_market_level_min > 3:
@@ -129,13 +140,25 @@ def _normalize_strategy_params(params: StrategyParams) -> None:
         params.entry_limit_offset_bps = 0.0
     if params.entry_limit_ttl_sec < 0:
         params.entry_limit_ttl_sec = 0
+    for field_name in ("entry_limit_ttl_sec_l1", "entry_limit_ttl_sec_l2", "entry_limit_ttl_sec_l3"):
+        field_val = int(getattr(params, field_name, -1))
+        if field_val < 0:
+            field_val = -1
+        setattr(params, field_name, field_val)
     if params.entry_limit_poll_ms < 100:
         params.entry_limit_poll_ms = 100
     if params.entry_limit_reprice_max < 0:
         params.entry_limit_reprice_max = 0
-    params.entry_limit_fallback_mode = str(getattr(params, "entry_limit_fallback_mode", "market") or "market").strip().lower()
-    if params.entry_limit_fallback_mode not in {"market", "skip"}:
-        params.entry_limit_fallback_mode = "market"
+    params.entry_limit_fallback_mode = normalize_entry_limit_fallback_mode(getattr(params, "entry_limit_fallback_mode", "market"))
+    params.entry_limit_fallback_mode_l1 = normalize_entry_limit_fallback_mode(
+        getattr(params, "entry_limit_fallback_mode_l1", ""), allow_empty=True
+    )
+    params.entry_limit_fallback_mode_l2 = normalize_entry_limit_fallback_mode(
+        getattr(params, "entry_limit_fallback_mode_l2", ""), allow_empty=True
+    )
+    params.entry_limit_fallback_mode_l3 = normalize_entry_limit_fallback_mode(
+        getattr(params, "entry_limit_fallback_mode_l3", ""), allow_empty=True
+    )
 
 
 def _build_base_strategy_params() -> StrategyParams:
@@ -222,13 +245,22 @@ def _build_base_strategy_params() -> StrategyParams:
         split_tp_on_entry=parse_bool(os.getenv("STRAT_SPLIT_TP_ON_ENTRY", "0"), False),
         allow_reverse=parse_bool(os.getenv("STRAT_ALLOW_REVERSE", "1"), True),
         entry_exec_mode=os.getenv("STRAT_ENTRY_EXEC_MODE", "market").strip().lower(),
+        entry_exec_mode_l1=os.getenv("STRAT_ENTRY_L1_EXEC_MODE", "").strip().lower(),
+        entry_exec_mode_l2=os.getenv("STRAT_ENTRY_L2_EXEC_MODE", "").strip().lower(),
+        entry_exec_mode_l3=os.getenv("STRAT_ENTRY_L3_EXEC_MODE", "").strip().lower(),
         entry_auto_market_level_min=int(os.getenv("STRAT_ENTRY_AUTO_MARKET_LEVEL_MIN", "3")),
         entry_auto_market_level_max=int(os.getenv("STRAT_ENTRY_AUTO_MARKET_LEVEL_MAX", "0")),
         entry_limit_offset_bps=float(os.getenv("STRAT_ENTRY_LIMIT_OFFSET_BPS", "1.0")),
         entry_limit_ttl_sec=int(os.getenv("STRAT_ENTRY_LIMIT_TTL_SEC", "10")),
+        entry_limit_ttl_sec_l1=int(os.getenv("STRAT_ENTRY_L1_LIMIT_TTL_SEC", "-1")),
+        entry_limit_ttl_sec_l2=int(os.getenv("STRAT_ENTRY_L2_LIMIT_TTL_SEC", "-1")),
+        entry_limit_ttl_sec_l3=int(os.getenv("STRAT_ENTRY_L3_LIMIT_TTL_SEC", "-1")),
         entry_limit_poll_ms=int(os.getenv("STRAT_ENTRY_LIMIT_POLL_MS", "500")),
         entry_limit_reprice_max=int(os.getenv("STRAT_ENTRY_LIMIT_REPRICE_MAX", "0")),
         entry_limit_fallback_mode=os.getenv("STRAT_ENTRY_LIMIT_FALLBACK_MODE", "market").strip().lower(),
+        entry_limit_fallback_mode_l1=os.getenv("STRAT_ENTRY_L1_LIMIT_FALLBACK_MODE", "").strip().lower(),
+        entry_limit_fallback_mode_l2=os.getenv("STRAT_ENTRY_L2_LIMIT_FALLBACK_MODE", "").strip().lower(),
+        entry_limit_fallback_mode_l3=os.getenv("STRAT_ENTRY_L3_LIMIT_FALLBACK_MODE", "").strip().lower(),
         manage_only_script_positions=parse_bool(os.getenv("STRAT_MANAGE_ONLY_SCRIPT_POSITIONS", "1"), True),
         skip_on_foreign_mgnmode_pos=parse_bool(os.getenv("STRAT_SKIP_ON_FOREIGN_MGNMODE_POS", "1"), True),
     )
