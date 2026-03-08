@@ -653,6 +653,8 @@ def _build_backtest_signal_fast(
 
     return {
         "close": float(close),
+        "high": float(pre["highs"][i]),
+        "low": float(pre["lows"][i]),
         "ema": float(em),
         "atr": float(a),
         "macd_hist": float(mh),

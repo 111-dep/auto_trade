@@ -213,6 +213,16 @@ def _close_remaining_r(side: str, entry: float, risk: float, close_px: float) ->
     return (float(entry) - float(close_px)) / float(risk)
 
 
+def _signal_high_low(sig: Dict[str, Any], close_px: float) -> tuple[float, float]:
+    hi = float(sig.get("high", close_px) or close_px)
+    lo = float(sig.get("low", close_px) or close_px)
+    hi = max(hi, close_px)
+    lo = min(lo, close_px)
+    if hi < lo:
+        hi, lo = lo, hi
+    return hi, lo
+
+
 def _position_potential_loss_usdt(pos: Dict[str, Any]) -> float:
     risk_amt = max(0.0, float(pos.get("risk_amt", 0.0) or 0.0))
     if risk_amt <= 0:
@@ -268,8 +278,132 @@ def _simulate_live_position_step(
 
     be_total_offset = max(0.0, float(params.be_offset_pct) + float(params.be_fee_buffer_pct))
     be_trigger_r = max(0.0, float(params.be_trigger_r_mult))
+    split_tp_enabled = bool(pos.get("exchange_split_tp_enabled", False))
+    high, low = _signal_high_low(sig, close)
+
+    def _close_now(*, outcome: str, close_px: float, is_stop: bool) -> Dict[str, Any]:
+        nonlocal realized_r
+        realized_r += qty_rem * _close_remaining_r(side_u, entry, risk, close_px)
+        pos["qty_rem"] = 0.0
+        pos["realized_r"] = realized_r
+        reverse_decision = None
+        if allow_reverse and (decision is not None):
+            want_side = "SHORT" if side_u == "LONG" else "LONG"
+            if str(getattr(decision, "side", "")).upper() == want_side:
+                reverse_decision = decision
+        return {
+            "closed": True,
+            "outcome": str(outcome),
+            "r_raw": float(realized_r),
+            "is_stop": bool(is_stop),
+            "reverse_decision": reverse_decision,
+        }
+
+    def _finalize_open_state(*, next_qty: float, next_realized_r: float, next_tp1_done: bool, next_be_armed: bool, next_hard_stop: float) -> None:
+        pos["qty_rem"] = max(0.0, float(next_qty))
+        pos["realized_r"] = float(next_realized_r)
+        pos["tp1_done"] = bool(next_tp1_done)
+        pos["be_armed"] = bool(next_be_armed)
+        pos["hard_stop"] = float(next_hard_stop)
 
     if side_u == "LONG":
+        if managed_exit and split_tp_enabled:
+            active_stop = float(hard_stop)
+            use_tp2 = bool(params.tp2_close_rest and float(params.tp1_close_pct) < 0.999)
+            tp1_pct = min(max(float(params.tp1_close_pct), 0.0), 1.0)
+
+            if not tp1_done:
+                stop_hit = low <= active_stop
+                tp1_hit = high >= tp1 and tp1_pct > 0.0
+                tp2_hit = use_tp2 and high >= tp2
+                if stop_hit and (tp1_hit or tp2_hit):
+                    return _close_now(outcome="STOP", close_px=active_stop, is_stop=True)
+                if stop_hit:
+                    return _close_now(outcome="STOP", close_px=active_stop, is_stop=True)
+                if tp1_hit:
+                    close_qty = qty_rem * tp1_pct
+                    if close_qty > 0:
+                        realized_r += close_qty * _close_remaining_r("LONG", entry, risk, tp1)
+                        qty_rem = max(0.0, qty_rem - close_qty)
+                    tp1_done = True
+                    be_armed = True
+                    if qty_rem <= 1e-9:
+                        pos["qty_rem"] = 0.0
+                        pos["realized_r"] = realized_r
+                        pos["tp1_done"] = True
+                        pos["be_armed"] = True
+                        return {
+                            "closed": True,
+                            "outcome": "TP1",
+                            "r_raw": float(realized_r),
+                            "is_stop": False,
+                            "reverse_decision": None,
+                        }
+                    if tp2_hit:
+                        realized_r += qty_rem * _close_remaining_r("LONG", entry, risk, tp2)
+                        qty_rem = 0.0
+                        pos["qty_rem"] = 0.0
+                        pos["realized_r"] = realized_r
+                        pos["tp1_done"] = True
+                        pos["be_armed"] = True
+                        return {
+                            "closed": True,
+                            "outcome": "TP2",
+                            "r_raw": float(realized_r),
+                            "is_stop": False,
+                            "reverse_decision": None,
+                        }
+
+            if tp1_done and qty_rem > 0:
+                stop_hit = low <= active_stop
+                tp2_hit = use_tp2 and high >= tp2
+                if stop_hit and tp2_hit:
+                    return _close_now(outcome="TP1", close_px=active_stop, is_stop=True)
+                if stop_hit:
+                    return _close_now(outcome="TP1", close_px=active_stop, is_stop=True)
+                if tp2_hit:
+                    return _close_now(outcome="TP2", close_px=tp2, is_stop=False)
+
+            peak = max(float(pos.get("peak_price", entry) or entry), close)
+            pos["peak_price"] = peak
+            if (not be_armed) and close >= entry + risk * be_trigger_r:
+                be_armed = True
+
+            next_stop = max(active_stop, float(sig.get("long_stop", active_stop) or active_stop))
+            if be_armed:
+                next_stop = max(next_stop, entry * (1.0 + be_total_offset))
+            if (not bool(params.trail_after_tp1)) or tp1_done:
+                atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
+                trail_stop = peak - atr_v * float(params.trail_atr_mult)
+                next_stop = max(next_stop, trail_stop)
+
+            _finalize_open_state(
+                next_qty=qty_rem,
+                next_realized_r=realized_r,
+                next_tp1_done=tp1_done,
+                next_be_armed=be_armed,
+                next_hard_stop=next_stop,
+            )
+
+            long_exit = bool(sig.get("long_exit", False)) if use_signal_exit else False
+            stop_hit = close <= next_stop
+            if long_exit or stop_hit:
+                realized_r += qty_rem * _close_remaining_r("LONG", entry, risk, close)
+                pos["qty_rem"] = 0.0
+                pos["realized_r"] = realized_r
+                outcome = "TP1" if tp1_done else ("STOP" if stop_hit else "EXIT")
+                reverse_decision = None
+                if allow_reverse and (decision is not None) and str(getattr(decision, "side", "")).upper() == "SHORT":
+                    reverse_decision = decision
+                return {
+                    "closed": True,
+                    "outcome": str(outcome),
+                    "r_raw": float(realized_r),
+                    "is_stop": bool(stop_hit),
+                    "reverse_decision": reverse_decision,
+                }
+            return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
+
         if not managed_exit:
             stop_hit = close <= float(pos.get("stop", entry) or entry)
             tp_hit = close >= tp2
@@ -400,6 +534,103 @@ def _simulate_live_position_step(
             reverse_decision = None
             reverse_now = stop_hit or short_exit
             if reverse_now and allow_reverse and (decision is not None) and str(getattr(decision, "side", "")).upper() == "LONG":
+                reverse_decision = decision
+            return {
+                "closed": True,
+                "outcome": str(outcome),
+                "r_raw": float(realized_r),
+                "is_stop": bool(stop_hit),
+                "reverse_decision": reverse_decision,
+            }
+        return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
+
+    if split_tp_enabled:
+        active_stop = float(hard_stop)
+        use_tp2 = bool(params.tp2_close_rest and float(params.tp1_close_pct) < 0.999)
+        tp1_pct = min(max(float(params.tp1_close_pct), 0.0), 1.0)
+
+        if not tp1_done:
+            stop_hit = high >= active_stop
+            tp1_hit = low <= tp1 and tp1_pct > 0.0
+            tp2_hit = use_tp2 and low <= tp2
+            if stop_hit and (tp1_hit or tp2_hit):
+                return _close_now(outcome="STOP", close_px=active_stop, is_stop=True)
+            if stop_hit:
+                return _close_now(outcome="STOP", close_px=active_stop, is_stop=True)
+            if tp1_hit:
+                close_qty = qty_rem * tp1_pct
+                if close_qty > 0:
+                    realized_r += close_qty * _close_remaining_r("SHORT", entry, risk, tp1)
+                    qty_rem = max(0.0, qty_rem - close_qty)
+                tp1_done = True
+                be_armed = True
+                if qty_rem <= 1e-9:
+                    pos["qty_rem"] = 0.0
+                    pos["realized_r"] = realized_r
+                    pos["tp1_done"] = True
+                    pos["be_armed"] = True
+                    return {
+                        "closed": True,
+                        "outcome": "TP1",
+                        "r_raw": float(realized_r),
+                        "is_stop": False,
+                        "reverse_decision": None,
+                    }
+                if tp2_hit:
+                    realized_r += qty_rem * _close_remaining_r("SHORT", entry, risk, tp2)
+                    qty_rem = 0.0
+                    pos["qty_rem"] = 0.0
+                    pos["realized_r"] = realized_r
+                    pos["tp1_done"] = True
+                    pos["be_armed"] = True
+                    return {
+                        "closed": True,
+                        "outcome": "TP2",
+                        "r_raw": float(realized_r),
+                        "is_stop": False,
+                        "reverse_decision": None,
+                    }
+
+        if tp1_done and qty_rem > 0:
+            stop_hit = high >= active_stop
+            tp2_hit = use_tp2 and low <= tp2
+            if stop_hit and tp2_hit:
+                return _close_now(outcome="TP1", close_px=active_stop, is_stop=True)
+            if stop_hit:
+                return _close_now(outcome="TP1", close_px=active_stop, is_stop=True)
+            if tp2_hit:
+                return _close_now(outcome="TP2", close_px=tp2, is_stop=False)
+
+        trough = min(float(pos.get("trough_price", entry) or entry), close)
+        pos["trough_price"] = trough
+        if (not be_armed) and close <= entry - risk * be_trigger_r:
+            be_armed = True
+
+        next_stop = min(active_stop, float(sig.get("short_stop", active_stop) or active_stop))
+        if be_armed:
+            next_stop = min(next_stop, entry * (1.0 - be_total_offset))
+        if (not bool(params.trail_after_tp1)) or tp1_done:
+            atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
+            trail_stop = trough + atr_v * float(params.trail_atr_mult)
+            next_stop = min(next_stop, trail_stop)
+
+        _finalize_open_state(
+            next_qty=qty_rem,
+            next_realized_r=realized_r,
+            next_tp1_done=tp1_done,
+            next_be_armed=be_armed,
+            next_hard_stop=next_stop,
+        )
+
+        short_exit = bool(sig.get("short_exit", False)) if use_signal_exit else False
+        stop_hit = close >= next_stop
+        if short_exit or stop_hit:
+            realized_r += qty_rem * _close_remaining_r("SHORT", entry, risk, close)
+            pos["qty_rem"] = 0.0
+            pos["realized_r"] = realized_r
+            outcome = "TP1" if tp1_done else ("STOP" if stop_hit else "EXIT")
+            reverse_decision = None
+            if allow_reverse and (decision is not None) and str(getattr(decision, "side", "")).upper() == "LONG":
                 reverse_decision = decision
             return {
                 "closed": True,
@@ -1108,6 +1339,13 @@ def main() -> int:
         pos["entry_exec_mode_intended"] = str(intended_exec_mode)
         pos["fee_rate"] = float(fee_rate_used)
         pos["slippage_bps"] = float(slippage_bps_used)
+        pos["exchange_split_tp_enabled"] = bool(
+            managed_exit
+            and bool(getattr(cfg, "attach_tpsl_on_entry", False))
+            and bool(getattr(cfg.params, "enable_close", False))
+            and bool(getattr(cfg.params, "split_tp_on_entry", False))
+            and 0.0 < float(getattr(cfg.params, "tp1_close_pct", 0.0) or 0.0) < 1.0
+        )
         open_positions[inst] = pos
         open_positions_total += 1
 
