@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from run_interleaved_backtest_2y import _position_potential_loss_usdt, _sum_open_positions_potential_loss
+from run_interleaved_backtest_2y import (
+    _count_open_l3_side_positions,
+    _position_potential_loss_usdt,
+    _sum_open_positions_potential_loss,
+)
 
 
 class ProjectedOpenRiskTests(unittest.TestCase):
@@ -64,6 +68,18 @@ class ProjectedOpenRiskTests(unittest.TestCase):
         }
         # BTC contributes 10, ETH contributes 0 (hard_stop above entry on long).
         self.assertAlmostEqual(_sum_open_positions_potential_loss(open_positions), 10.0, places=6)
+
+    def test_count_open_l3_same_side_positions(self) -> None:
+        open_positions = {
+            "BTC-USDT-SWAP": {"side": "LONG", "level": 3, "qty_rem": 1.0},
+            "ETH-USDT-SWAP": {"side": "LONG", "level": 3, "qty_rem": 0.4},
+            "SOL-USDT-SWAP": {"side": "LONG", "level": 2, "qty_rem": 1.0},
+            "DOGE-USDT-SWAP": {"side": "SHORT", "level": 3, "qty_rem": 1.0},
+            "SUI-USDT-SWAP": {"side": "LONG", "level": 3, "qty_rem": 0.0},
+        }
+        self.assertEqual(_count_open_l3_side_positions(open_positions, "LONG"), 2)
+        self.assertEqual(_count_open_l3_side_positions(open_positions, "SHORT"), 1)
+        self.assertEqual(_count_open_l3_side_positions(open_positions, "flat"), 0)
 
 
 if __name__ == "__main__":

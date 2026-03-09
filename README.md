@@ -10,7 +10,7 @@
 - 同币多策略投票后只下一个单（`STRAT_PROFILE_VOTE_*`）。
 - 分级执行与白名单（L1/L2/L3，`STRAT_EXEC_MAX_LEVEL` + `STRAT_EXEC_L3_INST_IDS`）。
 - Managed Exit：TP1 分批、TP2、保本/费用缓冲、移动止损。
-- 开仓可选拆分双腿（TP1/TP2）并在 TP1 后自动推进剩余仓位保本止损（支持 WS 快速通道）。
+- 开仓优先尝试交易所原生多 TP（TP1/TP2）；若账户角色不支持，则自动退回为“入场仅 attach 止损 + 独立 TP1/TP2”，并在 TP1 后自动推进剩余仓位保本止损（支持 WS 快速通道）。
 - 风控：日亏熔断、开仓频率限制、连续止损冷却/冻结、风险开仓硬保护。
 - 下单幂等：支持 `clOrdId`（客户端订单号）以降低重复下单风险。
 - 进程安全：单实例锁（默认开启，防止重复启动多个实盘进程）。
@@ -146,7 +146,7 @@ pre-commit run --all-files
 - `STRAT_STOP_STREAK_L2_ONLY`: 冻结期间仅禁 L3 或全禁。
 - `STRAT_ENABLE_CLOSE`: 是否允许脚本主动平仓（止盈/止损/反手）。
 - `STRAT_SIGNAL_EXIT_ENABLED`: 是否启用信号失效提前平仓（默认建议 `0`，更贴近当前回测口径）。
-- `STRAT_SPLIT_TP_ON_ENTRY`: 是否拆分 TP1/TP2 双腿下单（建议 `1`）。
+- `STRAT_SPLIT_TP_ON_ENTRY`: 是否启用交易所原生 TP1/TP2 多目标止盈（建议 `1`；若账户角色不支持多 TP，会自动退回为“入场仅 attach 止损 + 独立 TP1/TP2”）。
 - `STRAT_ENTRY_EXEC_MODE`: 入场执行模式（`market` / `limit` / `auto`）。
 - `STRAT_ENTRY_AUTO_MARKET_LEVEL_MIN`: `auto` 下等级阈值（>= 阈值走市价）。
 - `STRAT_ENTRY_AUTO_MARKET_LEVEL_MAX`: `auto` 可选反向阈值（<= 阈值走市价，`0`=关闭，优先于 `..._MIN`）。

@@ -11,6 +11,109 @@ def _c(ts: int, o: float, h: float, l: float, c: float) -> Candle:
 
 
 class ManagedExitTests(unittest.TestCase):
+    def test_live_style_close_based_tp1_and_tightened_stop(self) -> None:
+        candles = [
+            _c(0, 100, 100, 100, 100),
+            _c(1, 100, 108, 100.2, 108),
+            _c(2, 108, 108, 100.8, 101),
+        ]
+        signal_map = {
+            1: {"close": 108.0, "high": 108.0, "low": 100.2, "atr": 1.0, "long_stop": 95.0},
+            2: {"close": 101.0, "high": 108.0, "low": 100.8, "atr": 1.0, "long_stop": 102.0},
+        }
+        outcome, r_value, held, exit_idx = eval_signal_outcome(
+            side="LONG",
+            entry=100.0,
+            stop=95.0,
+            tp1=107.5,
+            tp2=112.5,
+            ltf_candles=candles,
+            start_idx=0,
+            horizon_bars=3,
+            managed_exit=True,
+            tp1_close_pct=0.5,
+            tp2_close_rest=True,
+            be_trigger_r_mult=1.0,
+            be_offset_pct=0.0,
+            be_fee_buffer_pct=0.0,
+            signal_lookup=lambda idx: signal_map.get(idx),
+            trail_after_tp1=True,
+            trail_atr_mult=0.0,
+            signal_exit_enabled=False,
+        )
+        self.assertEqual(outcome, "TP1")
+        self.assertAlmostEqual(r_value, 0.9, places=6)
+        self.assertEqual(held, 2)
+        self.assertEqual(exit_idx, 2)
+
+    def test_live_style_without_split_ignores_intrabar_tp1_wick(self) -> None:
+        candles = [
+            _c(0, 100, 100, 100, 100),
+            _c(1, 100, 108, 100.0, 106),
+            _c(2, 106, 106, 93.5, 94),
+        ]
+        signal_map = {
+            1: {"close": 106.0, "high": 108.0, "low": 100.0, "atr": 1.0, "long_stop": 95.0},
+            2: {"close": 94.0, "high": 106.0, "low": 93.5, "atr": 1.0, "long_stop": 95.0},
+        }
+        outcome, r_value, held, exit_idx = eval_signal_outcome(
+            side="LONG",
+            entry=100.0,
+            stop=95.0,
+            tp1=107.5,
+            tp2=112.5,
+            ltf_candles=candles,
+            start_idx=0,
+            horizon_bars=3,
+            managed_exit=True,
+            tp1_close_pct=0.5,
+            tp2_close_rest=True,
+            be_trigger_r_mult=1.0,
+            be_offset_pct=0.0,
+            be_fee_buffer_pct=0.0,
+            signal_lookup=lambda idx: signal_map.get(idx),
+            trail_after_tp1=True,
+            trail_atr_mult=0.0,
+            signal_exit_enabled=False,
+        )
+        self.assertEqual(outcome, "STOP")
+        self.assertAlmostEqual(r_value, -1.2, places=6)
+        self.assertEqual(held, 2)
+        self.assertEqual(exit_idx, 2)
+
+    def test_live_style_split_tp_keeps_intrabar_stop_first(self) -> None:
+        candles = [
+            _c(0, 100, 100, 100, 100),
+            _c(1, 100, 108, 94, 100),
+        ]
+        signal_map = {
+            1: {"close": 100.0, "high": 108.0, "low": 94.0, "atr": 1.0, "long_stop": 95.0},
+        }
+        outcome, r_value, held, exit_idx = eval_signal_outcome(
+            side="LONG",
+            entry=100.0,
+            stop=95.0,
+            tp1=107.5,
+            tp2=112.5,
+            ltf_candles=candles,
+            start_idx=0,
+            horizon_bars=2,
+            managed_exit=True,
+            tp1_close_pct=0.5,
+            tp2_close_rest=True,
+            be_trigger_r_mult=1.0,
+            be_offset_pct=0.0,
+            be_fee_buffer_pct=0.0,
+            signal_lookup=lambda idx: signal_map.get(idx),
+            trail_after_tp1=True,
+            trail_atr_mult=0.0,
+            signal_exit_enabled=False,
+            split_tp_enabled=True,
+        )
+        self.assertEqual(outcome, "STOP")
+        self.assertAlmostEqual(r_value, -1.0, places=6)
+        self.assertEqual(held, 1)
+        self.assertEqual(exit_idx, 1)
     def test_long_tp1_then_be_stop(self) -> None:
         candles = [
             _c(0, 100, 100, 100, 100),

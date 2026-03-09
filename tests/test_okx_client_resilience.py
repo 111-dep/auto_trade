@@ -182,6 +182,86 @@ class OKXClientResilienceTests(unittest.TestCase):
         self.assertEqual(row.get("tpOrdPx"), "-1")
         self.assertEqual(row.get("slOrdPx"), "-1")
 
+    def test_build_sl_attach_algo_ords_keeps_attach_algo_cl_id(self) -> None:
+        client = OKXClient(_cfg())
+        ords = client.build_sl_attach_algo_ords(
+            sl_price=1.11,
+            attach_algo_cl_ord_id="ALG-SL-ONLY-001",
+        )
+        self.assertEqual(len(ords), 1)
+        row = ords[0]
+        self.assertEqual(row.get("attachAlgoClOrdId"), "ALG-SL-ONLY-001")
+        self.assertEqual(row.get("slOrdPx"), "-1")
+        self.assertEqual(row.get("slTriggerPxType"), "mark")
+
+    def test_build_split_tp_attach_algo_ords_builds_two_tp_and_one_sl(self) -> None:
+        client = OKXClient(_cfg())
+        ords = client.build_split_tp_attach_algo_ords(
+            tp1_price=1.23,
+            tp1_size="3",
+            tp2_price=1.45,
+            tp2_size="7",
+            sl_price=1.11,
+            tp1_attach_algo_cl_ord_id="ALG-TP1-001",
+            tp2_attach_algo_cl_ord_id="ALG-TP2-001",
+            sl_attach_algo_cl_ord_id="ALG-SL-001",
+            move_sl_to_avg_px_on_tp1=True,
+        )
+        self.assertEqual(len(ords), 3)
+        tp1, tp2, sl = ords
+        self.assertEqual(tp1.get("attachAlgoClOrdId"), "ALG-TP1-001")
+        self.assertEqual(tp1.get("tpOrdPx"), "-1")
+        self.assertEqual(tp1.get("sz"), "3")
+        self.assertEqual(tp2.get("attachAlgoClOrdId"), "ALG-TP2-001")
+        self.assertEqual(tp2.get("tpOrdPx"), "-1")
+        self.assertEqual(tp2.get("sz"), "7")
+        self.assertEqual(sl.get("attachAlgoClOrdId"), "ALG-SL-001")
+        self.assertEqual(sl.get("slOrdPx"), "-1")
+        self.assertEqual(sl.get("amendPxOnTriggerType"), "1")
+
+    def test_build_partial_tp_attach_algo_ords_builds_one_tp_and_one_sl(self) -> None:
+        client = OKXClient(_cfg())
+        ords = client.build_partial_tp_attach_algo_ords(
+            tp_price=1.23,
+            tp_size="3",
+            sl_price=1.11,
+            tp_attach_algo_cl_ord_id="ALG-TP1-ONLY",
+            sl_attach_algo_cl_ord_id="ALG-SL-ONLY",
+        )
+        self.assertEqual(len(ords), 2)
+        tp1, sl = ords
+        self.assertEqual(tp1.get("attachAlgoClOrdId"), "ALG-TP1-ONLY")
+        self.assertEqual(tp1.get("tpOrdPx"), "-1")
+        self.assertEqual(tp1.get("sz"), "3")
+        self.assertEqual(sl.get("attachAlgoClOrdId"), "ALG-SL-ONLY")
+        self.assertEqual(sl.get("slOrdPx"), "-1")
+
+    def test_amend_order_attached_sl_prefers_sl_attach_algo(self) -> None:
+        client = OKXClient(_cfg())
+        order_row = {
+            "ordId": "111",
+            "clOrdId": "ENTRY-CL-1",
+            "attachAlgoOrds": [
+                {"attachAlgoClOrdId": "ALG-TP1", "tpTriggerPx": "101", "tpOrdPx": "-1"},
+                {"attachAlgoClOrdId": "ALG-TP2", "tpTriggerPx": "102", "tpOrdPx": "-1"},
+                {"attachAlgoClOrdId": "ALG-SL", "slTriggerPx": "95", "slOrdPx": "-1"},
+            ],
+        }
+        with patch.object(client, "get_order", return_value=order_row):
+            with patch.object(client, "_request", return_value={"code": "0", "data": []}) as mocked:
+                client.amend_order_attached_sl(
+                    inst_id="BTC-USDT-SWAP",
+                    ord_id="111",
+                    cl_ord_id="ENTRY-CL-1",
+                    new_sl_trigger_px=96.0,
+                )
+        self.assertEqual(mocked.call_count, 1)
+        _, kwargs = mocked.call_args
+        body = kwargs.get("body") or {}
+        attach_rows = body.get("attachAlgoOrds") or []
+        self.assertEqual(len(attach_rows), 1)
+        self.assertEqual(attach_rows[0].get("attachAlgoClOrdId"), "ALG-SL")
+
 
 if __name__ == "__main__":
     unittest.main()

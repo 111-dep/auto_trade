@@ -123,6 +123,7 @@ ENTRY_AUTO_MARKET_LEVEL_MAX=""
 ENTRY_LIMIT_FALLBACK_MODE=""
 ENTRY_LIMIT_SLIPPAGE_BPS=""
 ENTRY_LIMIT_FEE_RATE=""
+L3_SIDE_CAP=""
 INST_IDS=""
 TRADES_CSV=""
 SEND_TG=0
@@ -161,6 +162,7 @@ Options:
   --entry-limit-slippage-bps X
                              Slippage bps for limit-filled entries
   --entry-limit-fee-rate X   Fee rate for limit-filled entries
+  --l3-side-cap N            Max concurrent open L3 positions per side (<=0 disables)
   --title TEXT               Override auto title
   --dump-trades-csv PATH     Dump accepted trades to CSV (for Monte Carlo)
   --send-telegram            Enable telegram send (default: off)
@@ -243,6 +245,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --entry-limit-fee-rate)
       ENTRY_LIMIT_FEE_RATE="${2:-}"
+      shift 2
+      ;;
+    --l3-side-cap)
+      L3_SIDE_CAP="${2:-}"
       shift 2
       ;;
     --title)
@@ -463,6 +469,9 @@ fi
 if [[ -n "${ENTRY_LIMIT_FEE_RATE}" ]]; then
   CMD+=(--entry-limit-fee-rate "${ENTRY_LIMIT_FEE_RATE}")
 fi
+if [[ -n "${L3_SIDE_CAP}" ]]; then
+  CMD+=(--l3-side-cap "${L3_SIDE_CAP}")
+fi
 if [[ "${MANAGED_EXIT}" -eq 1 ]]; then
   CMD+=(--managed-exit)
 fi
@@ -474,8 +483,8 @@ if [[ -n "${TRADES_CSV}" ]]; then
 fi
 
 echo "[Scenario] ${SCENARIO} | fee=${FEE_RATE} slip=${SLIPPAGE_BPS} stop_extra_r=${STOP_EXTRA_R} tp_haircut_r=${TP_HAIRCUT_R} miss_prob=${MISS_PROB}"
-if [[ -n "${ENTRY_EXEC_MODE}" || -n "${ENTRY_AUTO_MARKET_LEVEL_MIN}" || -n "${ENTRY_AUTO_MARKET_LEVEL_MAX}" || -n "${ENTRY_LIMIT_FALLBACK_MODE}" || -n "${ENTRY_LIMIT_SLIPPAGE_BPS}" || -n "${ENTRY_LIMIT_FEE_RATE}" ]]; then
-  echo "[EntryExec] mode=${ENTRY_EXEC_MODE:-env} auto_lv_min=${ENTRY_AUTO_MARKET_LEVEL_MIN:-env} auto_lv_max=${ENTRY_AUTO_MARKET_LEVEL_MAX:-env} fallback=${ENTRY_LIMIT_FALLBACK_MODE:-env} limit_slip=${ENTRY_LIMIT_SLIPPAGE_BPS:-auto} limit_fee=${ENTRY_LIMIT_FEE_RATE:-auto}"
+if [[ -n "${ENTRY_EXEC_MODE}" || -n "${ENTRY_AUTO_MARKET_LEVEL_MIN}" || -n "${ENTRY_AUTO_MARKET_LEVEL_MAX}" || -n "${ENTRY_LIMIT_FALLBACK_MODE}" || -n "${ENTRY_LIMIT_SLIPPAGE_BPS}" || -n "${ENTRY_LIMIT_FEE_RATE}" || -n "${L3_SIDE_CAP}" ]]; then
+  echo "[EntryExec] mode=${ENTRY_EXEC_MODE:-env} auto_lv_min=${ENTRY_AUTO_MARKET_LEVEL_MIN:-env} auto_lv_max=${ENTRY_AUTO_MARKET_LEVEL_MAX:-env} fallback=${ENTRY_LIMIT_FALLBACK_MODE:-env} limit_slip=${ENTRY_LIMIT_SLIPPAGE_BPS:-auto} limit_fee=${ENTRY_LIMIT_FEE_RATE:-auto} l3_side_cap=${L3_SIDE_CAP:--}"
 fi
 echo "[Run] ${CMD[*]}"
 if [[ -n "${RESULT_LOG}" ]]; then

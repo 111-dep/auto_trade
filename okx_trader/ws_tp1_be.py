@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from .common import log
 from .config import get_strategy_params
+from .managed_tp2 import clear_managed_tp1_order_state, ensure_managed_tp2_limit_order, has_external_tp1_fill_mode
 from .models import Config
 from .okx_client import OKXClient
 from .state_store import _get_inst_state
@@ -32,8 +33,8 @@ def _sync_ws_be_stop(
     trade: Dict[str, Any],
     new_sl: float,
 ) -> Tuple[bool, str]:
-    attach_algo_id = str(trade.get("attach_algo_id", "") or "").strip()
-    attach_algo_cl_id = str(trade.get("attach_algo_cl_ord_id", "") or "").strip()
+    attach_algo_id = str(trade.get("exchange_sl_attach_algo_id", trade.get("attach_algo_id", "")) or "").strip()
+    attach_algo_cl_id = str(trade.get("exchange_sl_attach_algo_cl_ord_id", trade.get("attach_algo_cl_ord_id", "")) or "").strip()
     entry_ord_id = str(trade.get("entry_ord_id", "") or "").strip()
     entry_cl_ord_id = str(trade.get("entry_cl_ord_id", "") or "").strip()
 
@@ -98,7 +99,7 @@ def handle_tp1_fill_from_position(
     trade = inst_state.get("trade")
     if not isinstance(trade, dict):
         return False
-    if not bool(trade.get("exchange_split_tp_enabled", False)):
+    if not has_external_tp1_fill_mode(trade):
         return False
     if bool(trade.get("tp1_done", False)):
         return False
@@ -139,6 +140,7 @@ def handle_tp1_fill_from_position(
 
     trade["tp1_done"] = True
     trade["be_armed"] = True
+    clear_managed_tp1_order_state(trade)
 
     now_ms = int(event_ts_ms or int(time.time() * 1000))
     target_sl = _safe_float(trade.get("hard_stop", 0.0), 0.0)
@@ -162,6 +164,22 @@ def handle_tp1_fill_from_position(
             f"[{inst_id}] WS fast-manage: TP1 filled but BE SL sync failed ({side}): {err}",
             level="WARN",
         )
+
+    if bool(trade.get("managed_tp2_enabled", False)) and bool(params.tp2_close_rest) and current_pos_size > 0:
+        ok_tp2, err_tp2 = ensure_managed_tp2_limit_order(
+            cfg=cfg,
+            client=client,
+            inst_id=inst_id,
+            trade=trade,
+            signal_ts_ms=now_ms,
+            level=int(trade.get("entry_level", 0) or 0),
+            reason="tp1_be_ws",
+        )
+        if (not ok_tp2) and err_tp2 not in {"filled", "live", "partially_filled"}:
+            log(
+                f"[{inst_id}] WS fast-manage: TP1 filled but managed TP2 place failed ({side}): {err_tp2}",
+                level="WARN",
+            )
     return True
 
 

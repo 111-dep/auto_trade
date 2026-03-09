@@ -228,6 +228,24 @@ def _sum_open_positions_potential_loss(open_positions: Dict[str, Dict[str, Any]]
     return total
 
 
+def _count_open_l3_side_positions(open_positions: Dict[str, Dict[str, Any]], side: str) -> int:
+    side_u = str(side or '').strip().upper()
+    if side_u not in {'LONG', 'SHORT'}:
+        return 0
+    total = 0
+    for pos in open_positions.values():
+        if not isinstance(pos, dict):
+            continue
+        if int(pos.get('level', 0) or 0) != 3:
+            continue
+        if str(pos.get('side', '') or '').strip().upper() != side_u:
+            continue
+        if max(0.0, float(pos.get('qty_rem', 0.0) or 0.0)) <= 0:
+            continue
+        total += 1
+    return total
+
+
 def _simulate_live_position_step(
     *,
     pos: Dict[str, Any],
@@ -784,6 +802,12 @@ def main() -> int:
         action="store_true",
         help="Disable signal-based early close (long_exit/short_exit) in backtest management path",
     )
+    parser.add_argument(
+        "--l3-side-cap",
+        type=int,
+        default=0,
+        help="Max concurrent open L3 positions per side across instruments (<=0 disables)",
+    )
     args = parser.parse_args()
 
     load_dotenv(args.env)
@@ -892,6 +916,7 @@ def main() -> int:
     loss_base_fixed = float(cfg.params.daily_loss_base_usdt)
     loss_base_mode = normalize_loss_base_mode(str(cfg.params.daily_loss_base_mode))
     loss_window_ms = 24 * 3600 * 1000
+    l3_side_cap = max(0, int(args.l3_side_cap))
 
     start_equity = loss_base_fixed if loss_base_fixed > 0 else 1000.0
 
@@ -923,7 +948,8 @@ def main() -> int:
         )
     print(
         f"constraints: min_gap={min_gap_minutes}m inst_cap={per_inst_cap}/24h global_cap={global_cap}/24h "
-        f"loss_guard={loss_limit_pct*100:.2f}%({loss_base_mode},projected)",
+        f"loss_guard={loss_limit_pct*100:.2f}%({loss_base_mode},projected) "
+        f"l3_side_cap={(l3_side_cap if l3_side_cap > 0 else '-')}",
         flush=True,
     )
     print(
@@ -1080,6 +1106,7 @@ def main() -> int:
     skip_unresolved = 0
     skip_loss_guard = 0
     skip_stop_guard = 0
+    skip_l3_side_cap = 0
     stop_guard: Dict[str, Dict[str, Dict[str, int]]] = {
         inst: {"long": {}, "short": {}} for inst in inst_ids
     }
@@ -1232,7 +1259,7 @@ def main() -> int:
             max_dd_trough_ts = int(exit_ts)
 
     def _can_open(inst: str, side: str, level: int, ts: int, candidate_loss_usdt: float = 0.0) -> bool:
-        nonlocal skip_gap, skip_inst_cap, skip_global_cap, skip_loss_guard
+        nonlocal skip_gap, skip_inst_cap, skip_global_cap, skip_loss_guard, skip_l3_side_cap
         prune_ts_deque_window(global_open_ts, ts, window_ms)
         q_inst = inst_open_ts[inst]
         prune_ts_deque_window(q_inst, ts, window_ms)
@@ -1248,6 +1275,10 @@ def main() -> int:
         if is_open_limit_reached(len(global_open_ts), global_cap):
             skip_global_cap += 1
             return False
+        if l3_side_cap > 0 and int(level) == 3:
+            if _count_open_l3_side_positions(open_positions, side) >= l3_side_cap:
+                skip_l3_side_cap += 1
+                return False
         if not _sg_allow(inst, side, level, int(ts)):
             return False
 
@@ -1570,6 +1601,7 @@ def main() -> int:
     summary.append(
         f"约束：min_gap={min_gap_minutes}m inst_cap={per_inst_cap}/24h global_cap={global_cap}/24h "
         f"loss_guard={loss_limit_pct*100:.2f}%({loss_base_mode},projected) "
+        f"l3_side_cap={(l3_side_cap if l3_side_cap > 0 else '-')} "
         f"tp1_only={tp1_only} managed_exit={managed_exit}"
     )
     summary.append(
@@ -1596,7 +1628,7 @@ def main() -> int:
         f"levels：L1={by_level.get(1,0)} L2={by_level.get(2,0)} L3={by_level.get(3,0)} "
         f"skip_gap={skip_gap} skip_inst_cap={skip_inst_cap} skip_global_cap={skip_global_cap} "
         f"skip_loss_guard={skip_loss_guard} skip_stop_guard={skip_stop_guard} "
-        f"skip_miss={skip_miss} skip_unresolved={skip_unresolved}"
+        f"skip_l3_side_cap={skip_l3_side_cap} skip_miss={skip_miss} skip_unresolved={skip_unresolved}"
     )
     summary.append(
         f"entry_modes：market={by_entry_exec_mode.get('market',0)} "

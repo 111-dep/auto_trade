@@ -794,6 +794,109 @@ class OKXClient:
             ord_item["attachAlgoClOrdId"] = algo_cl_id
         return [ord_item]
 
+    def build_sl_attach_algo_ords(
+        self,
+        *,
+        sl_price: float,
+        attach_algo_cl_ord_id: str = "",
+    ) -> List[Dict[str, str]]:
+        if sl_price <= 0:
+            return []
+        ord_item: Dict[str, str] = {
+            "slTriggerPx": self._fmt_price(sl_price),
+            "slOrdPx": "-1",
+            "slTriggerPxType": self.cfg.attach_tpsl_trigger_px_type,
+        }
+        algo_cl_id = str(attach_algo_cl_ord_id or "").strip()
+        if algo_cl_id:
+            ord_item["attachAlgoClOrdId"] = algo_cl_id
+        return [ord_item]
+
+    def build_partial_tp_attach_algo_ords(
+        self,
+        *,
+        tp_price: float,
+        tp_size: str,
+        sl_price: float,
+        tp_attach_algo_cl_ord_id: str = "",
+        sl_attach_algo_cl_ord_id: str = "",
+    ) -> List[Dict[str, str]]:
+        if tp_price <= 0 or sl_price <= 0:
+            return []
+        tp_sz = str(tp_size or "").strip()
+        if not tp_sz:
+            return []
+        px_type = self.cfg.attach_tpsl_trigger_px_type
+        tp_item: Dict[str, str] = {
+            "tpTriggerPx": self._fmt_price(tp_price),
+            "tpOrdPx": "-1",
+            "tpTriggerPxType": px_type,
+            "sz": tp_sz,
+        }
+        sl_item: Dict[str, str] = {
+            "slTriggerPx": self._fmt_price(sl_price),
+            "slOrdPx": "-1",
+            "slTriggerPxType": px_type,
+        }
+        tp_algo_cl_id = str(tp_attach_algo_cl_ord_id or "").strip()
+        sl_algo_cl_id = str(sl_attach_algo_cl_ord_id or "").strip()
+        if tp_algo_cl_id:
+            tp_item["attachAlgoClOrdId"] = tp_algo_cl_id
+        if sl_algo_cl_id:
+            sl_item["attachAlgoClOrdId"] = sl_algo_cl_id
+        return [tp_item, sl_item]
+
+    def build_split_tp_attach_algo_ords(
+        self,
+        *,
+        tp1_price: float,
+        tp1_size: str,
+        tp2_price: float,
+        tp2_size: str,
+        sl_price: float,
+        tp1_attach_algo_cl_ord_id: str = "",
+        tp2_attach_algo_cl_ord_id: str = "",
+        sl_attach_algo_cl_ord_id: str = "",
+        move_sl_to_avg_px_on_tp1: bool = True,
+    ) -> List[Dict[str, str]]:
+        if tp1_price <= 0 or tp2_price <= 0 or sl_price <= 0:
+            return []
+        tp1_sz = str(tp1_size or "").strip()
+        tp2_sz = str(tp2_size or "").strip()
+        if (not tp1_sz) or (not tp2_sz):
+            return []
+        px_type = self.cfg.attach_tpsl_trigger_px_type
+        tp1_item: Dict[str, str] = {
+            "tpTriggerPx": self._fmt_price(tp1_price),
+            "tpOrdPx": "-1",
+            "tpTriggerPxType": px_type,
+            "sz": tp1_sz,
+        }
+        tp2_item: Dict[str, str] = {
+            "tpTriggerPx": self._fmt_price(tp2_price),
+            "tpOrdPx": "-1",
+            "tpTriggerPxType": px_type,
+            "sz": tp2_sz,
+        }
+        sl_item: Dict[str, str] = {
+            "slTriggerPx": self._fmt_price(sl_price),
+            "slOrdPx": "-1",
+            "slTriggerPxType": px_type,
+        }
+        if move_sl_to_avg_px_on_tp1:
+            sl_item["amendPxOnTriggerType"] = "1"
+
+        tp1_algo_cl_id = str(tp1_attach_algo_cl_ord_id or "").strip()
+        tp2_algo_cl_id = str(tp2_attach_algo_cl_ord_id or "").strip()
+        sl_algo_cl_id = str(sl_attach_algo_cl_ord_id or "").strip()
+        if tp1_algo_cl_id:
+            tp1_item["attachAlgoClOrdId"] = tp1_algo_cl_id
+        if tp2_algo_cl_id:
+            tp2_item["attachAlgoClOrdId"] = tp2_algo_cl_id
+        if sl_algo_cl_id:
+            sl_item["attachAlgoClOrdId"] = sl_algo_cl_id
+        return [tp1_item, tp2_item, sl_item]
+
     def get_order(self, inst_id: str, ord_id: str = "", cl_ord_id: str = "") -> Dict[str, Any]:
         params: Dict[str, str] = {"instId": inst_id}
         if str(ord_id or "").strip():
@@ -822,11 +925,24 @@ class OKXClient:
         return self._request("POST", "/api/v5/trade/cancel-order", body=body, private=True)
 
     @staticmethod
-    def _extract_first_attach_algo(order_row: Dict[str, Any]) -> Dict[str, Any]:
+    def _extract_attach_algo(order_row: Dict[str, Any], *, prefer: str = "") -> Dict[str, Any]:
         attach = order_row.get("attachAlgoOrds")
-        if isinstance(attach, list) and attach and isinstance(attach[0], dict):
-            return dict(attach[0])
-        return {}
+        if not (isinstance(attach, list) and attach):
+            return {}
+        rows = [dict(item) for item in attach if isinstance(item, dict)]
+        if not rows:
+            return {}
+
+        prefer_norm = str(prefer or "").strip().lower()
+        if prefer_norm == "sl":
+            for item in rows:
+                if str(item.get("slTriggerPx", "") or "").strip():
+                    return item
+        if prefer_norm == "tp":
+            for item in rows:
+                if str(item.get("tpTriggerPx", "") or "").strip():
+                    return item
+        return rows[0]
 
     def amend_order_attached_sl(
         self,
@@ -849,7 +965,7 @@ class OKXClient:
         algo_cl_id = str(attach_algo_cl_ord_id or "").strip()
         if not algo_id and not algo_cl_id:
             row = self.get_order(inst_id=inst_id, ord_id=ord_id_txt, cl_ord_id=cl_ord_txt)
-            first = self._extract_first_attach_algo(row)
+            first = self._extract_attach_algo(row, prefer="sl")
             algo_id = str(first.get("attachAlgoId", "") or "").strip()
             algo_cl_id = str(first.get("attachAlgoClOrdId", "") or "").strip()
         if not algo_id and not algo_cl_id:
