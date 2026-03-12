@@ -139,7 +139,9 @@ if [[ -n "${TG_TRADE_EXEC_OVERRIDE}" ]] && [[ "${TG_TRADE_EXEC_OVERRIDE}" != "0"
 fi
 
 find_pids() {
-  pgrep -f "python3 -u ${TRADER}" || true
+  local pattern
+  pattern="python3 -u ${TRADER} --env ${ENV_FILE}"
+  pgrep -f "${pattern}" || true
 }
 
 print_status() {

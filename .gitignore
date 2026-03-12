@@ -1,5 +1,8 @@
 # --- Secrets / env ---
 okx_auto_trader.env
+.binance_auto_trader_state.json.lock
+.binance_auto_trader_state.json
+binance_auto_trader.env
 .env
 .env.*
 !.env.example

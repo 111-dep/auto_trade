@@ -20,6 +20,13 @@ from .models import Candle, Config, PositionState
 
 
 class OKXClient:
+    provider_name = "okx"
+    supports_attached_tpsl_on_entry = True
+    supports_private_ws_tp1_be = True
+    _client_managed_tpsl_on_open = False
+    _client_managed_sl_on_open = True
+    _native_split_tp_supported = True
+
     def __init__(self, config: Config):
         self.cfg = config
         self._instrument_cache: Dict[str, Dict[str, Any]] = {}
@@ -435,6 +442,16 @@ class OKXClient:
         )
         return data.get("data", [])
 
+    def split_positions_by_mgn_mode(
+        self,
+        rows: List[Dict[str, Any]],
+        td_mode: str,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        return split_positions_by_mgn_mode(rows, td_mode)
+
+    def parse_position(self, rows: List[Dict[str, Any]], pos_mode: str) -> PositionState:
+        return parse_position(rows, pos_mode)
+
     def _to_float(self, v: Any) -> float:
         try:
             return float(v)
@@ -490,6 +507,23 @@ class OKXClient:
         except Exception as e:
             log(f"[Account] equity fetch failed: {e}")
             return None
+
+    def calc_order_size(
+        self,
+        cfg: Config,
+        inst_id: str,
+        entry_price: float,
+        stop_price: Optional[float] = None,
+        entry_side: str = "",
+    ) -> float:
+        return calc_order_size(
+            self,
+            cfg,
+            inst_id,
+            entry_price,
+            stop_price=stop_price,
+            entry_side=entry_side,
+        )
 
     def resolve_margin_usdt(self) -> float:
         base_margin = float(self.cfg.margin_usdt)
@@ -923,6 +957,166 @@ class OKXClient:
             log(f"[DRY-RUN] cancel_order payload={json.dumps(body, ensure_ascii=False)}")
             return {"data": [{"sCode": "0", "sMsg": "", "ordId": ord_id_txt or "DRY_RUN", "clOrdId": cl_ord_id_txt}]}
         return self._request("POST", "/api/v5/trade/cancel-order", body=body, private=True)
+
+    @staticmethod
+    def _normalize_close_order_side(side: str) -> str:
+        side_txt = str(side or "").strip().lower()
+        if side_txt in {"long", "sell"}:
+            return "sell"
+        if side_txt in {"short", "buy"}:
+            return "buy"
+        raise RuntimeError(f"Unsupported close side: {side}")
+
+    def _normalize_stop_order_row(self, raw: Optional[Dict[str, Any]], fallback_cl_ord_id: str = "") -> Dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        row = dict(raw)
+        algo_id = str(row.get("algoId", row.get("ordId", "")) or "").strip()
+        algo_cl_id = str(row.get("algoClOrdId", row.get("clOrdId", fallback_cl_ord_id)) or fallback_cl_ord_id).strip()
+        if algo_id:
+            row["attachAlgoId"] = algo_id
+            row["ordId"] = algo_id
+        if algo_cl_id:
+            row["attachAlgoClOrdId"] = algo_cl_id
+            row["clOrdId"] = algo_cl_id
+        return row
+
+    def get_pending_stop_loss_order(
+        self,
+        *,
+        inst_id: str,
+        side: str = "",
+        algo_id: str = "",
+        algo_cl_ord_id: str = "",
+    ) -> Dict[str, Any]:
+        data = self._request(
+            "GET",
+            "/api/v5/trade/orders-algo-pending",
+            params={"instId": inst_id, "ordType": "conditional"},
+            private=True,
+        )
+        rows = data.get("data", []) if isinstance(data, dict) else []
+        if not isinstance(rows, list):
+            return {}
+
+        want_algo_id = str(algo_id or "").strip()
+        want_algo_cl_id = str(algo_cl_ord_id or "").strip()
+        want_close_side = ""
+        want_pos_side = ""
+        if str(side or "").strip():
+            want_close_side = self._normalize_close_order_side(side)
+            want_pos_side = self._infer_pos_side(want_close_side, True)
+
+        normalized = [self._normalize_stop_order_row(row) for row in rows if isinstance(row, dict)]
+
+        def _is_live_stop(row: Dict[str, Any]) -> bool:
+            if not isinstance(row, dict):
+                return False
+            if not str(row.get("slTriggerPx", "") or "").strip():
+                return False
+            state_txt = str(row.get("state", "") or "").strip().lower()
+            if state_txt and state_txt not in {"live", "effective", "partially_effective"}:
+                return False
+            return True
+
+        for row in normalized:
+            if not _is_live_stop(row):
+                continue
+            row_algo_id = str(row.get("algoId", row.get("attachAlgoId", "")) or "").strip()
+            row_algo_cl_id = str(row.get("algoClOrdId", row.get("attachAlgoClOrdId", "")) or "").strip()
+            if want_algo_id and want_algo_id == row_algo_id:
+                return row
+            if want_algo_cl_id and want_algo_cl_id == row_algo_cl_id:
+                return row
+
+        if want_algo_id or want_algo_cl_id:
+            return {}
+
+        for row in normalized:
+            if not _is_live_stop(row):
+                continue
+            if want_close_side:
+                row_side = str(row.get("side", "") or "").strip().lower()
+                if row_side and row_side != want_close_side:
+                    continue
+            if want_pos_side:
+                row_pos_side = str(row.get("posSide", "") or "").strip().lower()
+                if row_pos_side and row_pos_side != want_pos_side:
+                    continue
+            return row
+        return {}
+
+    def place_stop_loss_order(
+        self,
+        *,
+        inst_id: str,
+        side: str,
+        stop_price: float,
+        cl_ord_id: str = "",
+        size: float = 0.0,
+    ) -> Dict[str, Any]:
+        if stop_price <= 0:
+            raise RuntimeError("stop_price must be > 0")
+        close_side = self._normalize_close_order_side(side)
+        pos_side = self._infer_pos_side(close_side, True)
+        algo_cl_id_txt = str(cl_ord_id or "").strip()
+        body: Dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": self.cfg.td_mode,
+            "side": close_side,
+            "ordType": "conditional",
+            "reduceOnly": "true",
+            "closeFraction": "1",
+            "slTriggerPx": self._fmt_price(float(stop_price)),
+            "slOrdPx": "-1",
+            "slTriggerPxType": self.cfg.attach_tpsl_trigger_px_type,
+            "posSide": pos_side,
+        }
+        if algo_cl_id_txt:
+            body["algoClOrdId"] = algo_cl_id_txt
+
+        if self.cfg.dry_run:
+            row = self._normalize_stop_order_row(
+                {
+                    "algoId": "DRY_RUN_STOP",
+                    "algoClOrdId": algo_cl_id_txt,
+                    "state": "live",
+                    "side": close_side,
+                    "posSide": pos_side,
+                    "slTriggerPx": self._fmt_price(float(stop_price)),
+                },
+                fallback_cl_ord_id=algo_cl_id_txt,
+            )
+            return {"data": [row]}
+
+        def _place(payload: Dict[str, Any]) -> Dict[str, Any]:
+            data = self._request("POST", "/api/v5/trade/order-algo", body=payload, private=True)
+            rows = data.get("data") if isinstance(data, dict) else None
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                return {"data": [self._normalize_stop_order_row(rows[0], fallback_cl_ord_id=algo_cl_id_txt)]}
+            return data
+
+        try:
+            return _place(body)
+        except Exception as e:
+            if float(size or 0.0) > 0:
+                try:
+                    _, size_txt = self.normalize_order_size(inst_id, float(size), reduce_only=True)
+                    body_with_sz = dict(body)
+                    body_with_sz.pop("closeFraction", None)
+                    body_with_sz["sz"] = size_txt
+                    return _place(body_with_sz)
+                except Exception:
+                    pass
+            if algo_cl_id_txt and self._is_duplicate_cl_ord_id_error(e):
+                existing = self.get_pending_stop_loss_order(
+                    inst_id=inst_id,
+                    side=side,
+                    algo_cl_ord_id=algo_cl_id_txt,
+                )
+                if existing:
+                    return {"data": [existing]}
+            raise
 
     @staticmethod
     def _extract_attach_algo(order_row: Dict[str, Any], *, prefer: str = "") -> Dict[str, Any]:

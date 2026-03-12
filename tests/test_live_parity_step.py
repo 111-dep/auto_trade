@@ -4,7 +4,11 @@ import unittest
 from types import SimpleNamespace
 
 from okx_trader.decision_core import EntryDecision
-from run_interleaved_backtest_2y import _new_sim_position, _simulate_live_position_step
+from run_interleaved_backtest_2y import (
+    _invert_signal_symmetric,
+    _new_sim_position,
+    _simulate_live_position_step,
+)
 
 
 def _params() -> SimpleNamespace:
@@ -22,6 +26,115 @@ def _params() -> SimpleNamespace:
 
 
 class LiveParityStepTests(unittest.TestCase):
+    def test_invert_signal_swaps_direction_and_mirrors_stop(self) -> None:
+        sig = {
+            "close": 100.0,
+            "long_entry": True,
+            "short_entry": False,
+            "long_entry_l2": True,
+            "short_entry_l2": False,
+            "long_entry_l3": True,
+            "short_entry_l3": False,
+            "long_level": 2,
+            "short_level": 0,
+            "long_stop": 95.0,
+            "short_stop": 104.0,
+            "long_exit": False,
+            "short_exit": True,
+            "bias": "long",
+            "vote_winner": "LONG",
+        }
+        out = _invert_signal_symmetric(sig)
+        self.assertFalse(out["long_entry"])
+        self.assertTrue(out["short_entry"])
+        self.assertEqual(out["short_level"], 2)
+        self.assertEqual(out["bias"], "short")
+        self.assertEqual(out["vote_winner"], "SHORT")
+        self.assertAlmostEqual(out["long_stop"], 96.0, places=6)
+        self.assertAlmostEqual(out["short_stop"], 105.0, places=6)
+        self.assertTrue(out["short_exit"] is False)
+        self.assertTrue(out["long_exit"] is True)
+
+    def test_swapped_reverse_long_take_hits_one_r(self) -> None:
+        params = _params()
+        long_decision = EntryDecision(
+            side="LONG",
+            level=2,
+            entry=100.0,
+            stop=95.0,
+            risk=5.0,
+            tp1=107.5,
+            tp2=112.5,
+        )
+        pos = _new_sim_position(
+            decision=long_decision,
+            entry_ts=1,
+            entry_i=1,
+            risk_amt=10.0,
+            exit_model="swapped_reverse",
+            swap_stop_r_mult=1.5,
+        )
+
+        res = _simulate_live_position_step(
+            pos=pos,
+            sig={
+                "close": 102.0,
+                "high": 105.1,
+                "low": 99.0,
+                "atr": 1.0,
+                "long_exit": False,
+                "short_exit": False,
+            },
+            params=params,
+            decision=None,
+            allow_reverse=False,
+            managed_exit=True,
+        )
+        self.assertTrue(res["closed"])
+        self.assertEqual(res["outcome"], "TP1")
+        self.assertFalse(res["is_stop"])
+        self.assertAlmostEqual(res["r_raw"], 1.0, places=6)
+
+    def test_swapped_reverse_same_bar_stop_wins_conservatively(self) -> None:
+        params = _params()
+        long_decision = EntryDecision(
+            side="LONG",
+            level=2,
+            entry=100.0,
+            stop=95.0,
+            risk=5.0,
+            tp1=107.5,
+            tp2=112.5,
+        )
+        pos = _new_sim_position(
+            decision=long_decision,
+            entry_ts=1,
+            entry_i=1,
+            risk_amt=10.0,
+            exit_model="swapped_reverse",
+            swap_stop_r_mult=1.5,
+        )
+
+        res = _simulate_live_position_step(
+            pos=pos,
+            sig={
+                "close": 100.0,
+                "high": 105.5,
+                "low": 92.4,
+                "atr": 1.0,
+                "long_exit": False,
+                "short_exit": False,
+            },
+            params=params,
+            decision=None,
+            allow_reverse=False,
+            managed_exit=True,
+        )
+        self.assertTrue(res["closed"])
+        self.assertEqual(res["outcome"], "STOP")
+        self.assertTrue(res["is_stop"])
+        self.assertAlmostEqual(res["r_raw"], -1.5, places=6)
+
     def test_long_exit_with_reverse_signal(self) -> None:
         params = _params()
         long_decision = EntryDecision(

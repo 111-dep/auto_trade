@@ -12,7 +12,6 @@ from .config import (
 )
 from .decision_core import resolve_entry_decision
 from .models import Config, PositionState, StrategyParams
-from .okx_client import OKXClient, parse_position, split_positions_by_mgn_mode
 from .profile_vote import merge_entry_votes
 from .runtime_execute_decision import execute_decision
 from .signals import build_signals
@@ -20,7 +19,7 @@ from .state_store import _record_opportunity
 
 
 def _execute_decision_with_params(
-    client: OKXClient,
+    client: Any,
     cfg: Config,
     inst_id: str,
     sig: Dict[str, Any],
@@ -53,7 +52,7 @@ def _execute_decision_with_params(
 
 
 def run_once_for_inst(
-    client: OKXClient,
+    client: Any,
     cfg: Config,
     inst_id: str,
     inst_state: Dict[str, Any],
@@ -107,7 +106,11 @@ def run_once_for_inst(
 
     htf_candles = []
     loc_candles = []
-    ltf_candles = client.get_candles(inst_id, cfg.ltf_bar, cfg.candle_limit, include_unconfirmed=intrabar_mode)
+    ltf_probe_limit = cfg.candle_limit
+    if fast_ltf_gate:
+        ltf_probe_limit = max(2, min(cfg.candle_limit, 3 if intrabar_mode else 2))
+
+    ltf_candles = client.get_candles(inst_id, cfg.ltf_bar, ltf_probe_limit, include_unconfirmed=intrabar_mode)
     if not ltf_candles:
         log(f"[{inst_id}] No LTF candle data returned from OKX.", level="WARN")
         return False, "no_data"
@@ -118,6 +121,16 @@ def run_once_for_inst(
         skip_status = _maybe_skip_signal(ltf_signal_ts, ltf_signal_confirm)
         if skip_status is not None:
             return False, skip_status
+        if ltf_probe_limit < int(cfg.candle_limit):
+            ltf_candles = client.get_candles(
+                inst_id,
+                cfg.ltf_bar,
+                cfg.candle_limit,
+                include_unconfirmed=intrabar_mode,
+            )
+            if not ltf_candles:
+                log(f"[{inst_id}] No LTF candle data returned from OKX.", level="WARN")
+                return False, "no_data"
 
     htf_candles = client.get_candles(inst_id, cfg.htf_bar, cfg.candle_limit)
     loc_candles = client.get_candles(inst_id, cfg.loc_bar, cfg.candle_limit)
@@ -216,7 +229,7 @@ def run_once_for_inst(
         pos = PositionState("flat", 0.0)
     else:
         rows_all = client.get_positions(inst_id)
-        rows, foreign_rows = split_positions_by_mgn_mode(rows_all, cfg.td_mode)
+        rows, foreign_rows = client.split_positions_by_mgn_mode(rows_all, cfg.td_mode)
 
         foreign_nonzero = 0
         for r in foreign_rows:
@@ -254,7 +267,7 @@ def run_once_for_inst(
                         "Auto-posSide fallback enabled. Recommend setting OKX_POS_MODE=long_short."
                     )
                     inst_state["warned_pos_mode_mismatch"] = True
-        pos = parse_position(rows, cfg.pos_mode)
+        pos = client.parse_position(rows, cfg.pos_mode)
 
     _execute_decision_with_params(
         client=client,

@@ -15,7 +15,7 @@ class _FakeClient:
         self.calls = []
 
     def get_candles(self, inst_id, bar, limit, include_unconfirmed=False):
-        self.calls.append((inst_id, bar, bool(include_unconfirmed)))
+        self.calls.append((inst_id, bar, int(limit), bool(include_unconfirmed)))
         return list(self._candles_by_bar.get(bar, []))
 
 
@@ -64,6 +64,7 @@ class RuntimeLtfGateTests(unittest.TestCase):
         self.assertEqual(status, "no_new")
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(client.calls[0][1], "15m")
+        self.assertEqual(client.calls[0][2], 2)
 
     def test_fast_ltf_gate_runs_full_path_on_new_ltf_close(self) -> None:
         now_ms = int(time.time() * 1000)
@@ -88,7 +89,9 @@ class RuntimeLtfGateTests(unittest.TestCase):
 
         self.assertTrue(processed)
         self.assertEqual(status, "processed")
-        self.assertEqual([c[1] for c in client.calls], ["15m", "4H", "1H"])
+        self.assertEqual([c[1] for c in client.calls], ["15m", "15m", "4H", "1H"])
+        self.assertEqual(client.calls[0][2], 2)
+        self.assertEqual(client.calls[1][2], 300)
         self.assertEqual(mock_build.call_count, 1)
         self.assertEqual(mock_exec.call_count, 1)
 

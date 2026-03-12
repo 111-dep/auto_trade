@@ -9,9 +9,9 @@ from typing import Optional
 from .alerts import run_test_alert, send_telegram
 from .backtest import build_backtest_telegram_summary, run_backtest, run_backtest_compare
 from .common import load_dotenv, log, parse_backtest_levels, parse_bool, parse_inst_ids, round_size, set_log_level
+from .client_factory import create_client
 from .config import read_config
 from .instance_lock import SingleInstanceLock
-from .okx_client import OKXClient
 from .runtime import print_stats, run_once
 from .state_store import load_state
 from .ws_tp1_be import OKXWsTp1BeWorker
@@ -125,7 +125,7 @@ def main() -> int:
             return print_stats(cfg, state, days)
 
         if args.backtest:
-            client = OKXClient(cfg)
+            client = create_client(cfg)
             try:
                 bars = int(args.bt_bars)
             except Exception:
@@ -234,7 +234,7 @@ def main() -> int:
                     return 1
             return 0
 
-        client = OKXClient(cfg)
+        client = create_client(cfg)
         state = load_state(cfg.state_file)
 
         insts_display = ",".join(cfg.inst_ids)
@@ -256,7 +256,7 @@ def main() -> int:
         )
         profile_ids_display = ",".join(sorted(cfg.strategy_profiles.keys())) or "DEFAULT"
         log(
-            f"Start | insts={insts_display} htf={cfg.htf_bar} loc={cfg.loc_bar} ltf={cfg.ltf_bar} dry_run={cfg.dry_run} "
+            f"Start | provider={cfg.exchange_provider} insts={insts_display} htf={cfg.htf_bar} loc={cfg.loc_bar} ltf={cfg.ltf_bar} dry_run={cfg.dry_run} "
             f"paper={cfg.paper} pos_mode={cfg.pos_mode} td_mode={cfg.td_mode} "
             f"hist_cache={cfg.history_cache_enabled} ttl={cfg.history_cache_ttl_seconds}s "
             f"fast_ltf_gate={cfg.fast_ltf_gate} "
@@ -313,9 +313,11 @@ def main() -> int:
             f"intrabar={cfg.alert_intrabar_enabled} stats_keep_days={cfg.alert_stats_keep_days} "
             f"local_sound={cfg.alert_local_sound} local_file={cfg.alert_local_file}"
         )
-        if not args.once:
+        if (not args.once) and cfg.exchange_provider == "okx":
             ws_worker = OKXWsTp1BeWorker(cfg, client, state)
             ws_worker.start()
+        elif (not args.once) and cfg.exchange_provider != "okx":
+            log(f"[{cfg.exchange_provider}] private WS TP1/BE worker disabled; use polling management.")
 
         try:
             if args.once:

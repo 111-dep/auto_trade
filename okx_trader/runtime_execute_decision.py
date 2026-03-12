@@ -21,7 +21,7 @@ from .managed_tp2 import (
     has_external_tp1_fill_mode,
 )
 from .models import Config, PositionState
-from .okx_client import OKXClient, calc_order_size
+from .okx_client import calc_order_size as okx_calc_order_size
 from .risk_guard import (
     is_open_limit_reached,
     min_open_gap_remaining_minutes,
@@ -37,7 +37,7 @@ from .trade_journal import append_trade_journal, append_trade_order_link
 from .runtime_order_id import build_runtime_order_cl_id
 
 def execute_decision(
-    client: OKXClient,
+    client: Any,
     cfg: Config,
     inst_id: str,
     sig: Dict[str, Any],
@@ -731,8 +731,11 @@ def execute_decision(
                 )
                 return False
 
+        freeze_count = int(max(0, cfg.params.stop_streak_freeze_count))
+        freeze_hours = int(max(0, cfg.params.stop_streak_freeze_hours))
+        freeze_enabled = freeze_count > 0 and freeze_hours > 0
         freeze_until_ts = int(bucket.get("freeze_until_ts_ms", 0) or 0)
-        if freeze_until_ts > now_ts:
+        if freeze_enabled and freeze_until_ts > now_ts:
             remain_ms = max(0, freeze_until_ts - now_ts)
             remain_min = max(1, int((remain_ms + 60 * 1000 - 1) / (60 * 1000)))
             if cfg.params.stop_streak_l2_only:
@@ -894,7 +897,16 @@ def execute_decision(
         if client.use_pos_side(inst_id):
             lev_pos_side = "long" if entry_side == "long" else "short"
         client.ensure_leverage(inst_id, lev_pos_side, entry_side=entry_side)
-        return calc_order_size(
+        calc_fn = getattr(client, "calc_order_size", None)
+        if callable(calc_fn):
+            return calc_fn(
+                cfg,
+                inst_id,
+                float(sig["close"]),
+                stop_price=float(planned_stop),
+                entry_side=entry_side,
+            )
+        return okx_calc_order_size(
             client,
             cfg,
             inst_id,
@@ -912,7 +924,9 @@ def execute_decision(
         tp_r_override: Optional[float] = None,
     ) -> Dict[str, Any]:
         plan: Dict[str, Any] = {"ords": None, "meta": {}}
-        if not cfg.attach_tpsl_on_entry:
+        client_managed_open_tpsl = bool(getattr(client, "_client_managed_tpsl_on_open", False))
+        client_managed_open_sl = bool(getattr(client, "_client_managed_sl_on_open", False))
+        if (not cfg.attach_tpsl_on_entry) and (not client_managed_open_tpsl):
             return plan
         entry_price = float(sig["close"])
         if planned_stop <= 0 or entry_price <= 0 or float(requested_size) <= 0:
@@ -978,13 +992,20 @@ def execute_decision(
                                 sl_price=float(planned_stop),
                                 attach_algo_cl_ord_id=sl_attach_algo_cl_ord_id,
                             )
-                            if ords:
-                                log(
-                                    f"[{inst_id}] Attach SL on entry (managed TP1/TP2): side={target_side} "
-                                    f"sl={planned_stop:.6f} tp1={float(tp1):.6f} sz1={round_size(tp1_size)} "
-                                    f"tp2={float(tp2):.6f} sz2={round_size(tp2_size)}"
-                                )
-                                plan["ords"] = ords
+                            if ords or client_managed_open_tpsl:
+                                if ords:
+                                    log(
+                                        f"[{inst_id}] Attach SL on entry (managed TP1/TP2): side={target_side} "
+                                        f"sl={planned_stop:.6f} tp1={float(tp1):.6f} sz1={round_size(tp1_size)} "
+                                        f"tp2={float(tp2):.6f} sz2={round_size(tp2_size)}"
+                                    )
+                                else:
+                                    log(
+                                        f"[{inst_id}] Client-managed SL/TP on open: side={target_side} "
+                                        f"sl={planned_stop:.6f} tp1={float(tp1):.6f} sz1={round_size(tp1_size)} "
+                                        f"tp2={float(tp2):.6f} sz2={round_size(tp2_size)}"
+                                    )
+                                plan["ords"] = ords or None
                                 plan["meta"] = {
                                     "managed_tp1_enabled": True,
                                     "managed_tp2_enabled": True,
@@ -996,10 +1017,12 @@ def execute_decision(
                                     "managed_tp1_target_size": float(tp1_size),
                                     "managed_tp2_target_px": float(tp2),
                                     "managed_tp2_target_size": float(tp2_size),
-                                    "exchange_sl_attach_algo_cl_ord_id": sl_attach_algo_cl_ord_id,
-                                    "attach_algo_cl_ord_id": sl_attach_algo_cl_ord_id,
                                     "planned_stop": float(planned_stop),
+                                    "exchange_sl_post_open_enabled": bool(client_managed_open_sl),
                                 }
+                                if ords:
+                                    plan["meta"]["exchange_sl_attach_algo_cl_ord_id"] = sl_attach_algo_cl_ord_id
+                                    plan["meta"]["attach_algo_cl_ord_id"] = sl_attach_algo_cl_ord_id
                                 return plan
                     else:
                         log(
@@ -1041,12 +1064,19 @@ def execute_decision(
                 "planned_stop": float(planned_stop),
                 "exchange_tp_px": float(tp),
             }
+            return plan
+        if client_managed_open_tpsl:
+            plan["meta"] = {
+                "planned_stop": float(planned_stop),
+                "exchange_tp_px": float(tp),
+                "exchange_sl_post_open_enabled": bool(client_managed_open_sl),
+            }
         return plan
 
     def should_split_tp_on_entry() -> bool:
         if not bool(getattr(cfg.params, "split_tp_on_entry", False)):
             return False
-        if not cfg.attach_tpsl_on_entry:
+        if (not cfg.attach_tpsl_on_entry) and (not bool(getattr(client, "_client_managed_tpsl_on_open", False))):
             return False
         if not cfg.params.enable_close:
             return False
@@ -1142,6 +1172,7 @@ def execute_decision(
                     tp_px = 0.0
                 if sl_px > 0:
                     out["exchange_sl_px"] = sl_px
+                    out["exchange_sl_independent"] = False
                 if tp_px > 0:
                     out["exchange_tp_px"] = tp_px
         except Exception:
@@ -1193,12 +1224,13 @@ def execute_decision(
         if side_l == "short" and old_sl > 0 and new_sl >= old_sl - eps:
             return
 
-        now_ts = int(sig["signal_ts_ms"])
+        now_signal_ts = int(sig["signal_ts_ms"])
+        now_wall_ts = int(time.time() * 1000)
         try:
             last_sync_ts = int(trade.get("exchange_sl_last_sync_ts_ms", 0) or 0)
         except Exception:
             last_sync_ts = 0
-        if last_sync_ts == now_ts:
+        if last_sync_ts == now_signal_ts:
             return
 
         try:
@@ -1206,13 +1238,52 @@ def execute_decision(
         except Exception:
             last_fail_ts = 0
         fail_cooldown_ms = max(60_000, int(bar_to_seconds(cfg.ltf_bar) * 500))
-        if last_fail_ts > 0 and (now_ts - last_fail_ts) < fail_cooldown_ms:
+        if last_fail_ts > 0 and (now_wall_ts - last_fail_ts) < fail_cooldown_ms:
             return
 
         attach_algo_id = str(trade.get("exchange_sl_attach_algo_id", trade.get("attach_algo_id", "")) or "").strip()
         attach_algo_cl_id = str(trade.get("exchange_sl_attach_algo_cl_ord_id", trade.get("attach_algo_cl_ord_id", "")) or "").strip()
+        sl_independent = bool(trade.get("exchange_sl_independent", False))
+        if sl_independent and (attach_algo_id or attach_algo_cl_id):
+            try:
+                amend_resp = client.amend_algo_sl(
+                    inst_id=inst_id,
+                    algo_id=attach_algo_id,
+                    algo_cl_ord_id=attach_algo_cl_id,
+                    new_sl_trigger_px=new_sl,
+                )
+                amend_row = {}
+                if isinstance(amend_resp, dict):
+                    amend_rows = amend_resp.get("data")
+                    if isinstance(amend_rows, list) and amend_rows and isinstance(amend_rows[0], dict):
+                        amend_row = amend_rows[0]
+                if amend_row:
+                    new_attach_id = str(amend_row.get("attachAlgoId", amend_row.get("algoId", amend_row.get("ordId", ""))) or "").strip()
+                    new_attach_cl_id = str(amend_row.get("attachAlgoClOrdId", amend_row.get("algoClOrdId", amend_row.get("clOrdId", ""))) or "").strip()
+                    if new_attach_id:
+                        trade["exchange_sl_attach_algo_id"] = new_attach_id
+                        trade["attach_algo_id"] = new_attach_id
+                    if new_attach_cl_id:
+                        trade["exchange_sl_attach_algo_cl_ord_id"] = new_attach_cl_id
+                        trade["attach_algo_cl_ord_id"] = new_attach_cl_id
+                trade["exchange_sl_px"] = float(new_sl)
+                trade["exchange_sl_last_sync_ts_ms"] = now_signal_ts
+                trade["exchange_sl_last_reason"] = f"{reason}:independent"
+                trade.pop("exchange_sl_last_fail_ts_ms", None)
+                log(
+                    f"[{inst_id}] Exchange SL synced ({side_l}) -> {new_sl:.6f} "
+                    f"(reason={reason}, old={old_sl:.6f}, via=independent)"
+                )
+                return
+            except Exception as e:
+                trade["exchange_sl_last_fail_ts_ms"] = now_wall_ts
+                log(
+                    f"[{inst_id}] Exchange SL sync failed ({side_l}, reason={reason}, independent=true): {e}",
+                    level="WARN",
+                )
+                return
         try:
-            client.amend_order_attached_sl(
+            amend_resp = client.amend_order_attached_sl(
                 inst_id=inst_id,
                 ord_id=ord_id,
                 cl_ord_id=cl_ord_id,
@@ -1220,9 +1291,24 @@ def execute_decision(
                 attach_algo_cl_ord_id=attach_algo_cl_id,
                 new_sl_trigger_px=new_sl,
             )
+            amend_row = {}
+            if isinstance(amend_resp, dict):
+                amend_rows = amend_resp.get("data")
+                if isinstance(amend_rows, list) and amend_rows and isinstance(amend_rows[0], dict):
+                    amend_row = amend_rows[0]
+            if amend_row:
+                new_attach_id = str(amend_row.get("attachAlgoId", amend_row.get("ordId", "")) or "").strip()
+                new_attach_cl_id = str(amend_row.get("attachAlgoClOrdId", amend_row.get("clOrdId", "")) or "").strip()
+                if new_attach_id:
+                    trade["exchange_sl_attach_algo_id"] = new_attach_id
+                    trade["attach_algo_id"] = new_attach_id
+                if new_attach_cl_id:
+                    trade["exchange_sl_attach_algo_cl_ord_id"] = new_attach_cl_id
+                    trade["attach_algo_cl_ord_id"] = new_attach_cl_id
             trade["exchange_sl_px"] = float(new_sl)
-            trade["exchange_sl_last_sync_ts_ms"] = now_ts
+            trade["exchange_sl_last_sync_ts_ms"] = now_signal_ts
             trade["exchange_sl_last_reason"] = reason
+            trade.pop("exchange_sl_last_fail_ts_ms", None)
             log(
                 f"[{inst_id}] Exchange SL synced ({side_l}) -> {new_sl:.6f} "
                 f"(reason={reason}, old={old_sl:.6f})"
@@ -1233,29 +1319,44 @@ def execute_decision(
                 and _should_retry_with_amend_algos(e)
             ):
                 try:
-                    client.amend_algo_sl(
+                    amend_resp = client.amend_algo_sl(
                         inst_id=inst_id,
                         algo_id=attach_algo_id,
                         algo_cl_ord_id=attach_algo_cl_id,
                         new_sl_trigger_px=new_sl,
                     )
+                    amend_row = {}
+                    if isinstance(amend_resp, dict):
+                        amend_rows = amend_resp.get("data")
+                        if isinstance(amend_rows, list) and amend_rows and isinstance(amend_rows[0], dict):
+                            amend_row = amend_rows[0]
+                    if amend_row:
+                        new_attach_id = str(amend_row.get("attachAlgoId", amend_row.get("ordId", "")) or "").strip()
+                        new_attach_cl_id = str(amend_row.get("attachAlgoClOrdId", amend_row.get("clOrdId", "")) or "").strip()
+                        if new_attach_id:
+                            trade["exchange_sl_attach_algo_id"] = new_attach_id
+                            trade["attach_algo_id"] = new_attach_id
+                        if new_attach_cl_id:
+                            trade["exchange_sl_attach_algo_cl_ord_id"] = new_attach_cl_id
+                            trade["attach_algo_cl_ord_id"] = new_attach_cl_id
                     trade["exchange_sl_px"] = float(new_sl)
-                    trade["exchange_sl_last_sync_ts_ms"] = now_ts
+                    trade["exchange_sl_last_sync_ts_ms"] = now_signal_ts
                     trade["exchange_sl_last_reason"] = f"{reason}:amend_algos_fallback"
+                    trade.pop("exchange_sl_last_fail_ts_ms", None)
                     log(
                         f"[{inst_id}] Exchange SL synced ({side_l}) -> {new_sl:.6f} "
                         f"(reason={reason}, old={old_sl:.6f}, via=amend-algos)"
                     )
                     return
                 except Exception as e2:
-                    trade["exchange_sl_last_fail_ts_ms"] = now_ts
+                    trade["exchange_sl_last_fail_ts_ms"] = now_wall_ts
                     log(
                         f"[{inst_id}] Exchange SL sync failed after amend-algos fallback "
                         f"({side_l}, reason={reason}): amend-order={e} | amend-algos={e2}",
                         level="WARN",
                     )
                     return
-            trade["exchange_sl_last_fail_ts_ms"] = now_ts
+            trade["exchange_sl_last_fail_ts_ms"] = now_wall_ts
             log(
                 f"[{inst_id}] Exchange SL sync failed ({side_l}, reason={reason}): {e}",
                 level="WARN",
@@ -1428,10 +1529,12 @@ def execute_decision(
         merged_meta: Dict[str, Any] = {}
         first_cl_ord_id = cl_ord_id
         used_fallback_market = False
+        partial_limit_fill_canceled = False
 
         for reprice_idx in range(max_reprice + 1):
             if remaining <= 0:
                 break
+            leg_requested = float(remaining)
             leg_tag = action_tag if reprice_idx == 0 else f"{action_tag}_rp{reprice_idx}"
             leg_cl_ord_id = build_cl_ord_id(entry_side, leg_tag)
             if reprice_idx == 0:
@@ -1468,7 +1571,7 @@ def execute_decision(
             if not ord_id:
                 ord_id = str((resp_l.get("data", [{}])[0] if isinstance(resp_l, dict) else {}).get("ordId", "") or "").strip()
             filled_sz, _, _ = _wait_limit_fill(ord_id=ord_id, cl_ord_id=leg_cl_ord_id, requested_sz=remaining, planned_level=int(planned_level))
-            if filled_sz < remaining - 1e-12:
+            if filled_sz < leg_requested - 1e-12:
                 cancel_ok = False
                 try:
                     client.cancel_order(inst_id=inst_id, ord_id=ord_id, cl_ord_id=leg_cl_ord_id)
@@ -1500,6 +1603,21 @@ def execute_decision(
                         f"limit entry cancel not confirmed (no post-cancel snapshot) clOrdId={leg_cl_ord_id}"
                     )
             if filled_sz > 0:
+                if filled_sz < leg_requested - 1e-12:
+                    partial_limit_fill_canceled = True
+                    if bool(getattr(client, "_client_managed_sl_on_open", False)):
+                        attach_algo_ords = None
+                        attach_meta = dict(attach_meta)
+                        for stale_key in (
+                            "attach_algo_id",
+                            "exchange_sl_attach_algo_id",
+                            "attach_algo_cl_ord_id",
+                            "exchange_sl_attach_algo_cl_ord_id",
+                            "exchange_sl_px",
+                            "exchange_sl_independent",
+                        ):
+                            attach_meta.pop(stale_key, None)
+                        attach_meta["exchange_sl_post_open_enabled"] = True
                 opened_total += float(filled_sz)
                 remaining = max(0.0, remaining - float(filled_sz))
                 merged_meta = dict(meta_l)
@@ -1598,6 +1716,248 @@ def execute_decision(
         )
         if not ok_tp1 and err_tp1 not in {"filled", "live", "partially_filled", "tp1_already_done"}:
             log(f"[{inst_id}] Managed TP1 ensure warning ({reason}): {err_tp1}", level="WARN")
+
+    def ensure_post_open_exchange_sl(trade: Dict[str, Any], *, reason: str) -> None:
+        if not isinstance(trade, dict):
+            return
+        post_open_enabled = bool(trade.get("exchange_sl_post_open_enabled", False))
+        if (not post_open_enabled) and bool(getattr(client, "_client_managed_sl_on_open", False)):
+            legacy_should_manage = (
+                bool(trade.get("managed_tp1_enabled", False))
+                or bool(trade.get("managed_tp2_enabled", False))
+                or bool(trade.get("exchange_sl_independent", False))
+            )
+            if legacy_should_manage:
+                post_open_enabled = True
+                trade["exchange_sl_post_open_enabled"] = True
+        if not post_open_enabled:
+            return
+        side_txt = str(trade.get("side", "") or "").strip().lower()
+        if side_txt not in {"long", "short"}:
+            return
+        stop_px = float(trade.get("planned_stop", trade.get("hard_stop", 0.0)) or 0.0)
+        if stop_px <= 0:
+            return
+        desired_stop_size = float(trade.get("remaining_size", trade.get("open_size", 0.0)) or 0.0)
+
+        ord_id = str(trade.get("entry_ord_id", "") or "").strip()
+        cl_ord_id = str(trade.get("entry_cl_ord_id", "") or "").strip()
+
+        def _maybe_cleanup_duplicate_sl_orders(*, max_cancel: int = 1) -> None:
+            cleanup_stop_fn = getattr(client, "cleanup_pending_stop_loss_orders", None)
+            if not callable(cleanup_stop_fn):
+                return
+            keep_id = str(trade.get("exchange_sl_attach_algo_id", trade.get("attach_algo_id", "")) or "").strip()
+            keep_cl_id = str(trade.get("exchange_sl_attach_algo_cl_ord_id", trade.get("attach_algo_cl_ord_id", "")) or "").strip()
+            if not keep_id and not keep_cl_id:
+                return
+            try:
+                canceled = cleanup_stop_fn(
+                    inst_id=inst_id,
+                    side=side_txt,
+                    keep_algo_id=keep_id,
+                    keep_algo_cl_ord_id=keep_cl_id,
+                    max_cancel=int(max(0, max_cancel)),
+                )
+            except Exception as e:
+                log(f"[{inst_id}] Exchange SL cleanup warning ({reason}): {e}", level="WARN")
+                return
+            if int(canceled or 0) > 0:
+                log(f"[{inst_id}] Exchange SL duplicate cleanup: canceled={int(canceled)} side={side_txt}")
+
+        def _adopt_sl_row(row: Dict[str, Any], *, independent: bool, adopt_reason: str) -> bool:
+            if not isinstance(row, dict) or not row:
+                return False
+            attach_id = str(row.get("attachAlgoId", row.get("algoId", row.get("ordId", ""))) or "").strip()
+            attach_cl_id = str(row.get("attachAlgoClOrdId", row.get("algoClOrdId", row.get("clOrdId", ""))) or "").strip()
+            try:
+                live_sl_px = float(row.get("slTriggerPx", row.get("newSlTriggerPx", 0.0)) or 0.0)
+            except Exception:
+                live_sl_px = 0.0
+            if attach_id:
+                trade["exchange_sl_attach_algo_id"] = attach_id
+                trade["attach_algo_id"] = attach_id
+            if attach_cl_id:
+                trade["exchange_sl_attach_algo_cl_ord_id"] = attach_cl_id
+                trade["attach_algo_cl_ord_id"] = attach_cl_id
+            if live_sl_px > 0:
+                trade["exchange_sl_px"] = live_sl_px
+            trade["exchange_sl_independent"] = bool(independent)
+            trade["exchange_sl_last_sync_ts_ms"] = int(sig["signal_ts_ms"])
+            trade["exchange_sl_last_reason"] = adopt_reason
+            trade.pop("exchange_sl_last_fail_ts_ms", None)
+            log(
+                f"[{inst_id}] Exchange SL adopted ({side_txt}) -> {float(trade.get('exchange_sl_px', stop_px) or stop_px):.6f} "
+                f"reason={adopt_reason} independent={bool(independent)}"
+            )
+            return True
+
+        def _lookup_pending_stop(**kwargs: Any) -> Dict[str, Any]:
+            lookup_stop_fn = getattr(client, "get_pending_stop_loss_order", None)
+            if not callable(lookup_stop_fn):
+                return {}
+            try:
+                return lookup_stop_fn(**kwargs)
+            except TypeError:
+                kwargs.pop("size", None)
+                kwargs.pop("stop_price", None)
+                return lookup_stop_fn(**kwargs)
+
+        extract_attach = getattr(client, "_extract_attach_algo", None)
+        if ord_id or cl_ord_id:
+            try:
+                entry_row = client.get_order(inst_id=inst_id, ord_id=ord_id, cl_ord_id=cl_ord_id)
+            except Exception:
+                entry_row = {}
+            if isinstance(entry_row, dict) and entry_row and callable(extract_attach):
+                try:
+                    attach_row = extract_attach(entry_row, prefer="sl")
+                except Exception:
+                    attach_row = {}
+                if isinstance(attach_row, dict) and attach_row and str(attach_row.get("slTriggerPx", "") or "").strip():
+                    if _adopt_sl_row(attach_row, independent=False, adopt_reason=f"{reason}:attached_detected"):
+                        return
+
+        needs_repair = False
+        duplicate_cleanup_needed = False
+        existing_id = str(trade.get("exchange_sl_attach_algo_id", trade.get("attach_algo_id", "")) or "").strip()
+        existing_cl_id = str(trade.get("exchange_sl_attach_algo_cl_ord_id", trade.get("attach_algo_cl_ord_id", "")) or "").strip()
+        lookup_stop_fn = getattr(client, "get_pending_stop_loss_order", None)
+        if callable(lookup_stop_fn):
+            try:
+                existing_row = {}
+                if existing_id or existing_cl_id:
+                    existing_row = _lookup_pending_stop(
+                        inst_id=inst_id,
+                        side=side_txt,
+                        algo_id=existing_id,
+                        algo_cl_ord_id=existing_cl_id,
+                        size=desired_stop_size,
+                        stop_price=float(stop_px),
+                    )
+                if existing_row:
+                    if _adopt_sl_row(existing_row, independent=True, adopt_reason=f"{reason}:existing_detected"):
+                        duplicate_cleanup_needed = int(existing_row.get("_extra_count", 0) or 0) > 0
+                        if bool(existing_row.get("_qty_match", True)):
+                            if duplicate_cleanup_needed:
+                                _maybe_cleanup_duplicate_sl_orders(max_cancel=1)
+                            return
+                        needs_repair = True
+                elif existing_id or existing_cl_id:
+                    for stale_key in (
+                        "exchange_sl_attach_algo_id",
+                        "attach_algo_id",
+                        "exchange_sl_attach_algo_cl_ord_id",
+                        "attach_algo_cl_ord_id",
+                    ):
+                        trade.pop(stale_key, None)
+                any_row = _lookup_pending_stop(
+                    inst_id=inst_id,
+                    side=side_txt,
+                    size=desired_stop_size,
+                    stop_price=float(stop_px),
+                )
+                if any_row:
+                    if _adopt_sl_row(any_row, independent=True, adopt_reason=f"{reason}:existing_any"):
+                        duplicate_cleanup_needed = int(any_row.get("_extra_count", 0) or 0) > 0
+                        if bool(any_row.get("_qty_match", True)):
+                            if duplicate_cleanup_needed:
+                                _maybe_cleanup_duplicate_sl_orders(max_cancel=1)
+                            return
+                        needs_repair = True
+            except Exception as e:
+                log(f"[{inst_id}] Exchange SL lookup warning ({reason}): {e}", level="WARN")
+
+        try:
+            last_fail_ts = int(trade.get("exchange_sl_last_fail_ts_ms", 0) or 0)
+        except Exception:
+            last_fail_ts = 0
+        initial_fail_cooldown_ms = max(15_000, min(45_000, int(bar_to_seconds(cfg.ltf_bar) * 1000 * 0.02)))
+        if last_fail_ts > 0 and (int(time.time() * 1000) - last_fail_ts) < initial_fail_cooldown_ms:
+            return
+
+        if needs_repair:
+            amend_fn = getattr(client, "amend_algo_sl", None)
+            repair_algo_id = str(trade.get("exchange_sl_attach_algo_id", trade.get("attach_algo_id", "")) or "").strip()
+            repair_algo_cl_id = str(trade.get("exchange_sl_attach_algo_cl_ord_id", trade.get("attach_algo_cl_ord_id", "")) or "").strip()
+            if callable(amend_fn) and (repair_algo_id or repair_algo_cl_id):
+                amend_kwargs: Dict[str, Any] = {
+                    "inst_id": inst_id,
+                    "algo_id": repair_algo_id,
+                    "algo_cl_ord_id": repair_algo_cl_id,
+                    "new_sl_trigger_px": float(stop_px),
+                }
+                if desired_stop_size > 0:
+                    amend_kwargs["size"] = float(desired_stop_size)
+                try:
+                    try:
+                        resp = amend_fn(**amend_kwargs)
+                    except TypeError:
+                        amend_kwargs.pop("size", None)
+                        resp = amend_fn(**amend_kwargs)
+                except Exception as e:
+                    trade["exchange_sl_last_fail_ts_ms"] = int(time.time() * 1000)
+                    log(f"[{inst_id}] Exchange SL repair failed ({reason}): {e}", level="WARN")
+                    return
+                row = {}
+                if isinstance(resp, dict):
+                    rows = resp.get("data")
+                    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                        row = rows[0]
+                attach_id = str(row.get("attachAlgoId", row.get("algoId", row.get("ordId", repair_algo_id))) or repair_algo_id).strip()
+                attach_cl_id = str(row.get("attachAlgoClOrdId", row.get("algoClOrdId", row.get("clOrdId", repair_algo_cl_id))) or repair_algo_cl_id).strip()
+                if attach_id:
+                    trade["exchange_sl_attach_algo_id"] = attach_id
+                    trade["attach_algo_id"] = attach_id
+                if attach_cl_id:
+                    trade["exchange_sl_attach_algo_cl_ord_id"] = attach_cl_id
+                    trade["attach_algo_cl_ord_id"] = attach_cl_id
+                trade["exchange_sl_independent"] = True
+                trade["exchange_sl_px"] = float(stop_px)
+                trade["exchange_sl_last_sync_ts_ms"] = int(sig["signal_ts_ms"])
+                trade["exchange_sl_last_reason"] = f"{reason}:repair"
+                trade.pop("exchange_sl_last_fail_ts_ms", None)
+                log(f"[{inst_id}] Exchange SL repaired ({side_txt}) -> {float(stop_px):.6f} reason={reason}")
+                if duplicate_cleanup_needed:
+                    _maybe_cleanup_duplicate_sl_orders(max_cancel=1)
+            return
+
+        place_stop_fn = getattr(client, "place_stop_loss_order", None)
+        if not callable(place_stop_fn):
+            return
+        cl_id = build_cl_ord_id(side_txt, f"{reason}_sl")
+        try:
+            resp = place_stop_fn(
+                inst_id=inst_id,
+                side=side_txt,
+                stop_price=float(stop_px),
+                cl_ord_id=cl_id,
+                size=float(desired_stop_size or 0.0),
+            )
+        except Exception as e:
+            trade["exchange_sl_last_fail_ts_ms"] = int(time.time() * 1000)
+            log(f"[{inst_id}] Exchange SL initial place failed ({reason}): {e}", level="WARN")
+            return
+        row = {}
+        if isinstance(resp, dict):
+            rows = resp.get("data")
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                row = rows[0]
+        attach_id = str(row.get("attachAlgoId", row.get("algoId", row.get("ordId", ""))) or "").strip()
+        attach_cl_id = str(row.get("attachAlgoClOrdId", row.get("algoClOrdId", row.get("clOrdId", cl_id))) or cl_id).strip()
+        if attach_id:
+            trade["exchange_sl_attach_algo_id"] = attach_id
+            trade["attach_algo_id"] = attach_id
+        if attach_cl_id:
+            trade["exchange_sl_attach_algo_cl_ord_id"] = attach_cl_id
+            trade["attach_algo_cl_ord_id"] = attach_cl_id
+        trade["exchange_sl_independent"] = True
+        trade["exchange_sl_px"] = float(stop_px)
+        trade["exchange_sl_last_sync_ts_ms"] = int(sig["signal_ts_ms"])
+        trade["exchange_sl_last_reason"] = reason
+        trade.pop("exchange_sl_last_fail_ts_ms", None)
+        log(f"[{inst_id}] Exchange SL armed ({side_txt}) -> {float(stop_px):.6f} reason={reason}")
+        _maybe_cleanup_duplicate_sl_orders(max_cancel=1)
 
     def _open_entry_once(
         *,
@@ -1886,6 +2246,7 @@ def execute_decision(
                 if isinstance(trade_ref, dict):
                     trade_ref["journal_trade_id"] = trade_id
                     trade_ref["entry_level"] = int(entry_level)
+                    ensure_post_open_exchange_sl(trade_ref, reason="open_long")
                     ensure_post_open_managed_tp1(trade_ref, reason="open_long")
                 entry_px = float(sig["close"])
                 stop_px = float(entry_order_meta.get("planned_stop", entry_stop or float(sig["long_stop"])))
@@ -1926,6 +2287,7 @@ def execute_decision(
                 if isinstance(trade_ref, dict):
                     trade_ref["journal_trade_id"] = trade_id
                     trade_ref["entry_level"] = int(entry_level)
+                    ensure_post_open_exchange_sl(trade_ref, reason="open_short")
                     ensure_post_open_managed_tp1(trade_ref, reason="open_short")
                 entry_px = float(sig["close"])
                 stop_px = float(entry_order_meta.get("planned_stop", entry_stop or float(sig["short_stop"])))
@@ -2004,6 +2366,7 @@ def execute_decision(
         managed_tp1_enabled = bool(trade_state.get("managed_tp1_enabled", False))
         managed_tp2_enabled = bool(trade_state.get("managed_tp2_enabled", False))
         external_tp1_mode = has_external_tp1_fill_mode(trade_state)
+        ensure_post_open_exchange_sl(trade_state, reason="loop_long")
 
         if external_tp1_mode and (not trade_state.get("tp1_done", False)):
             expected_tp2_size = float(trade_state.get("exchange_tp2_size", 0.0) or 0.0)
@@ -2332,6 +2695,7 @@ def execute_decision(
         managed_tp1_enabled = bool(trade_state.get("managed_tp1_enabled", False))
         managed_tp2_enabled = bool(trade_state.get("managed_tp2_enabled", False))
         external_tp1_mode = has_external_tp1_fill_mode(trade_state)
+        ensure_post_open_exchange_sl(trade_state, reason="loop_short")
 
         if external_tp1_mode and (not trade_state.get("tp1_done", False)):
             expected_tp2_size = float(trade_state.get("exchange_tp2_size", 0.0) or 0.0)

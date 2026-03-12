@@ -1,16 +1,19 @@
 # OKX Auto Trader (okx_trade_suite)
 
-本项目是一个面向 OKX 永续合约的自动交易与回测系统，支持多币种、多策略档案、同币多策略投票、实盘风控、2Y 组合回测与 Telegram 提醒。
+本项目是一个面向 OKX / Binance USDC 永续合约的自动交易与回测系统，支持多币种、多策略档案、同币多策略投票、实盘风控、2Y 组合回测与 Telegram 提醒。
 
 ## 1. 当前能力总览
 
-- 多币种轮询执行（`OKX_INST_IDS`）。
+- 双交易所执行层：`EXCHANGE_PROVIDER=okx|binance`。
+- 多币种轮询执行（`OKX_INST_IDS` / `BINANCE_INST_IDS`）。
 - 多策略变体（`classic` / `btceth_smc_a2` / `elder_tss_v1` / `r_breaker_v1` / `range_reversion_v1` 等）。
 - 档案化参数（`STRAT_PROFILE_MAP` + `STRAT_PROFILE_<PROFILE>_*`）。
 - 同币多策略投票后只下一个单（`STRAT_PROFILE_VOTE_*`）。
 - 分级执行与白名单（L1/L2/L3，`STRAT_EXEC_MAX_LEVEL` + `STRAT_EXEC_L3_INST_IDS`）。
 - Managed Exit：TP1 分批、TP2、保本/费用缓冲、移动止损。
 - 开仓优先尝试交易所原生多 TP（TP1/TP2）；若账户角色不支持，则自动退回为“入场仅 attach 止损 + 独立 TP1/TP2”，并在 TP1 后自动推进剩余仓位保本止损（支持 WS 快速通道）。
+- Binance：支持 Unified Account / Portfolio Margin 的 `PAPI` 自动识别，公共 REST 支持多域 fallback + 最近 K 线缓存兜底。
+- Binance：条件止损单支持“接管已有单 / 修复数量不匹配 / 渐进清理重复单”，降低重启后重复挂止损风险。
 - 风控：日亏熔断、开仓频率限制、连续止损冷却/冻结、风险开仓硬保护。
 - 下单幂等：支持 `clOrdId`（客户端订单号）以降低重复下单风险。
 - 进程安全：单实例锁（默认开启，防止重复启动多个实盘进程）。
@@ -35,15 +38,15 @@
   - `scripts/utils/`: 工具脚本。
 - `scripts/backtest/run_backtest_batch_levels.sh`: L2/L3 批量回测脚本。
 - `scripts/backtest/run_backtest_2y_cached.sh`: 2Y 缓存回测脚本。
-- `scripts/ops/run_daily_recap.sh` / `scripts/ops/setup_daily_recap_cron.sh` / `scripts/live/restart_live_trader.sh`: 实盘运维脚本。
+- `scripts/ops/run_daily_recap.sh` / `scripts/ops/setup_daily_recap_cron.sh` / `scripts/live/restart_live_trader.sh` / `scripts/live/restart_binance_trader.sh`: 实盘运维脚本。
 - `okx_trader/`: 核心包（信号、执行、风控、回测、状态、告警）。
   - `runtime.py`: 运行循环与心跳/状态汇总。
   - `runtime_run_once_for_inst.py`: 单币种轮询主流程（取数/投票/持仓检查）。
   - `runtime_execute_decision.py`: 下单与持仓管理执行层。
-- `runtime.log`: 实盘运行日志。
+- `runtime.log` / `logs/binance_runtime.log`: OKX / Binance 实盘运行日志。
 - `alerts.log`: 本地提醒日志。
-- `trade_journal.csv`: 逐笔交易台账。
-- `trade_journal_order_links.csv`: 订单关联台账（复盘/对账用）。
+- `trade_journal.csv` / `logs/binance_trade_journal.csv`: OKX / Binance 逐笔交易台账。
+- `trade_journal_order_links.csv` / `logs/binance_trade_journal_order_links.csv`: 订单关联台账（复盘/对账用）。
 
 ## 3. 快速启动
 
@@ -103,6 +106,18 @@ pkill -TERM -f "python3 -u /home/dandan/Workspace/test/okx_trade_suite/okx_auto_
 # 启动 + 一键安装每天07:00的24h日报TG（含净收益/权益）
 /home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh \
   --start --no-open-tg --setup-daily-recap-7am
+```
+
+
+Binance 启停（与 OKX 解耦）：
+
+```bash
+# 启动 / 查看状态
+/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_binance_trader.sh --start
+/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_binance_trader.sh --status
+
+# 只重启不 tail
+/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_binance_trader.sh --no-tail
 ```
 
 7. 最小回归测试（本地无交易所依赖）

@@ -22,6 +22,7 @@ from okx_trader.backtest_report import (
     normalize_backtest_result,
     update_level_perf,
 )
+from okx_trader.client_factory import create_client
 from okx_trader.common import bar_to_seconds, load_dotenv
 from okx_trader.config import (
     get_strategy_params,
@@ -37,7 +38,6 @@ from okx_trader.entry_exec_policy import (
     resolve_entry_exec_mode,
     resolve_entry_limit_fallback_mode_for_params,
 )
-from okx_trader.okx_client import OKXClient
 from okx_trader.profile_vote import merge_entry_votes
 from okx_trader.risk_guard import (
     is_open_limit_reached,
@@ -149,12 +149,24 @@ def dump_trades_csv(path: str, rows: List[Dict[str, Any]]) -> None:
             )
 
 
+def _reverse_swap_exit_prices(*, side: str, entry: float, risk: float, stop_r_mult: float) -> tuple[float, float]:
+    side_u = str(side or "").strip().upper()
+    stop_r = max(1.0, float(stop_r_mult or 1.0))
+    if side_u == "LONG":
+        return float(entry) + float(risk), float(entry) - float(risk) * stop_r
+    if side_u == "SHORT":
+        return float(entry) - float(risk), float(entry) + float(risk) * stop_r
+    raise RuntimeError(f"Unsupported side for swapped reverse exit prices: {side}")
+
+
 def _new_sim_position(
     *,
     decision: Any,
     entry_ts: int,
     entry_i: int,
     risk_amt: float,
+    exit_model: str = "standard",
+    swap_stop_r_mult: float = 0.0,
 ) -> Dict[str, Any]:
     entry = float(decision.entry)
     stop = float(decision.stop)
@@ -162,7 +174,7 @@ def _new_sim_position(
     if risk <= 0:
         risk = abs(entry - stop)
     risk = max(risk, 1e-8)
-    return {
+    pos = {
         "side": str(decision.side),
         "level": int(decision.level),
         "entry_ts": int(entry_ts),
@@ -180,7 +192,25 @@ def _new_sim_position(
         "hard_stop": float(stop),
         "peak_price": float(entry),
         "trough_price": float(entry),
+        "exit_model": str(exit_model or "standard"),
+        "friction_stop": float(stop),
     }
+    if pos["exit_model"] == "swapped_reverse":
+        take_px, hard_stop_px = _reverse_swap_exit_prices(
+            side=str(decision.side),
+            entry=float(entry),
+            risk=float(risk),
+            stop_r_mult=float(swap_stop_r_mult),
+        )
+        pos["tp1"] = float(take_px)
+        pos["tp2"] = float(take_px)
+        pos["stop"] = float(hard_stop_px)
+        pos["hard_stop"] = float(hard_stop_px)
+        pos["swap_take_px"] = float(take_px)
+        pos["swap_stop_px"] = float(hard_stop_px)
+        pos["swap_take_r"] = 1.0
+        pos["swap_stop_r"] = max(1.0, float(swap_stop_r_mult or 1.0))
+    return pos
 
 
 def _close_remaining_r(side: str, entry: float, risk: float, close_px: float) -> float:
@@ -198,6 +228,64 @@ def _signal_high_low(sig: Dict[str, Any], close_px: float) -> tuple[float, float
     if hi < lo:
         hi, lo = lo, hi
     return hi, lo
+
+
+def _flip_side(side: str) -> str:
+    side_u = str(side or "").strip().upper()
+    if side_u == "LONG":
+        return "SHORT"
+    if side_u == "SHORT":
+        return "LONG"
+    raise RuntimeError(f"Unsupported side for inversion: {side}")
+
+
+def _mirror_stop(close_px: float, reference_stop: float, *, side: str) -> float:
+    entry = float(close_px)
+    dist = abs(float(reference_stop) - entry)
+    if dist <= 1e-12:
+        dist = max(abs(entry) * 0.0005, 1e-8)
+    side_u = str(side or "").strip().upper()
+    if side_u == "LONG":
+        return entry - dist
+    if side_u == "SHORT":
+        return entry + dist
+    raise RuntimeError(f"Unsupported side for mirrored stop: {side}")
+
+
+def _invert_signal_symmetric(sig: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(sig or {})
+    close_px = float(out.get("close", 0.0) or 0.0)
+    orig_long_stop = float(out.get("long_stop", close_px) or close_px)
+    orig_short_stop = float(out.get("short_stop", close_px) or close_px)
+
+    swap_pairs = (
+        ("long_entry", "short_entry"),
+        ("long_entry_l2", "short_entry_l2"),
+        ("long_entry_l3", "short_entry_l3"),
+        ("long_level", "short_level"),
+        ("long_exit", "short_exit"),
+    )
+    for left_key, right_key in swap_pairs:
+        left_val = out.get(left_key)
+        right_val = out.get(right_key)
+        out[left_key] = right_val
+        out[right_key] = left_val
+
+    out["long_stop"] = _mirror_stop(close_px, orig_short_stop, side="LONG")
+    out["short_stop"] = _mirror_stop(close_px, orig_long_stop, side="SHORT")
+
+    bias = str(out.get("bias", "") or "").strip().lower()
+    if bias == "long":
+        out["bias"] = "short"
+    elif bias == "short":
+        out["bias"] = "long"
+
+    vote_winner = str(out.get("vote_winner", "") or "").strip().upper()
+    if vote_winner in {"LONG", "SHORT"}:
+        out["vote_winner"] = _flip_side(vote_winner)
+
+    return out
+
 
 
 def _position_potential_loss_usdt(pos: Dict[str, Any]) -> float:
@@ -300,6 +388,38 @@ def _simulate_live_position_step(
         pos["tp1_done"] = bool(next_tp1_done)
         pos["be_armed"] = bool(next_be_armed)
         pos["hard_stop"] = float(next_hard_stop)
+
+    exit_model = str(pos.get("exit_model", "standard") or "standard")
+    if exit_model == "swapped_reverse":
+        swap_take_px = float(pos.get("swap_take_px", tp1) or tp1)
+        swap_stop_px = float(pos.get("swap_stop_px", hard_stop) or hard_stop)
+        pos["hard_stop"] = float(swap_stop_px)
+        if side_u == "LONG":
+            stop_hit = low <= swap_stop_px
+            tp_hit = high >= swap_take_px
+            long_exit = bool(sig.get("long_exit", False)) if use_signal_exit else False
+            if stop_hit and tp_hit:
+                return _close_now(outcome="STOP", close_px=swap_stop_px, is_stop=True)
+            if stop_hit:
+                return _close_now(outcome="STOP", close_px=swap_stop_px, is_stop=True)
+            if tp_hit:
+                return _close_now(outcome="TP1", close_px=swap_take_px, is_stop=False)
+            if long_exit:
+                return _close_now(outcome="EXIT", close_px=close, is_stop=False)
+            return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
+
+        stop_hit = high >= swap_stop_px
+        tp_hit = low <= swap_take_px
+        short_exit = bool(sig.get("short_exit", False)) if use_signal_exit else False
+        if stop_hit and tp_hit:
+            return _close_now(outcome="STOP", close_px=swap_stop_px, is_stop=True)
+        if stop_hit:
+            return _close_now(outcome="STOP", close_px=swap_stop_px, is_stop=True)
+        if tp_hit:
+            return _close_now(outcome="TP1", close_px=swap_take_px, is_stop=False)
+        if short_exit:
+            return _close_now(outcome="EXIT", close_px=close, is_stop=False)
+        return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
 
     if side_u == "LONG":
         if managed_exit and split_tp_enabled:
@@ -808,11 +928,21 @@ def main() -> int:
         default=0,
         help="Max concurrent open L3 positions per side across instruments (<=0 disables)",
     )
+    parser.add_argument(
+        "--invert-signals",
+        action="store_true",
+        help="Invert long/short signals and mirror risk symmetrically around entry price",
+    )
+    parser.add_argument(
+        "--invert-signals-swap-exits",
+        action="store_true",
+        help="Invert signals and swap exit structure to 1R TP / original-TP1-distance stop",
+    )
     args = parser.parse_args()
 
     load_dotenv(args.env)
     cfg = read_config(None)
-    client = OKXClient(cfg)
+    client = create_client(cfg)
     run_start = time.monotonic()
 
     inst_ids = list(cfg.inst_ids)
@@ -901,6 +1031,8 @@ def main() -> int:
     tp1_only = not bool(args.managed_exit)
     managed_exit = bool(args.managed_exit)
     use_signal_exit = bool(cfg.params.signal_exit_enabled) and (not bool(args.ignore_signal_exit))
+    invert_signal_mode = bool(args.invert_signals) or bool(args.invert_signals_swap_exits)
+    inversion_mode_label = "swap_exits" if bool(args.invert_signals_swap_exits) else ("symmetric" if bool(args.invert_signals) else "off")
 
     per_inst_cap = int(cfg.params.max_open_entries)
     global_cap = int(cfg.params.max_open_entries_global)
@@ -927,6 +1059,7 @@ def main() -> int:
         f"require_tp_sl={require_tp_sl} tp1_only={tp1_only} managed_exit={managed_exit}",
         flush=True,
     )
+    print(f"signal_inversion={inversion_mode_label}", flush=True)
     print(
         f"level_control: base_exec_max={base_exec_max_level} "
         f"l3_whitelist={','.join(sorted(l3_inst_set)) if l3_inst_set else '-'}",
@@ -1175,6 +1308,7 @@ def main() -> int:
 
         entry = float(pos.get("entry", 0.0) or 0.0)
         stop = float(pos.get("stop", 0.0) or 0.0)
+        friction_stop = float(pos.get("friction_stop", stop) or stop)
         level = int(pos.get("level", 0) or 0)
         side = str(pos.get("side", "") or "").upper()
         risk_amt = float(pos.get("risk_amt", 0.0) or 0.0)
@@ -1187,7 +1321,7 @@ def main() -> int:
             r_raw=float(r_raw),
             outcome=outcome_k,
             entry=entry,
-            stop=stop,
+            stop=friction_stop,
             fee_rate=fee_rate_used,
             slippage_bps=slippage_bps_used,
             stop_extra_r=stop_extra_r,
@@ -1302,7 +1436,17 @@ def main() -> int:
         risk_amt = max(0.0, float(equity) * risk_frac)
         if risk_amt <= 0:
             return False
-        if not _can_open(inst, side, level, ts, candidate_loss_usdt=float(risk_amt)):
+
+        exit_model = "swapped_reverse" if bool(args.invert_signals_swap_exits) else "standard"
+        swap_stop_r_mult = 0.0
+        candidate_loss_usdt = float(risk_amt)
+        if exit_model == "swapped_reverse":
+            base_risk = max(1e-8, float(decision.risk))
+            swap_stop_r_mult = abs(float(decision.tp1) - float(decision.entry)) / base_risk
+            swap_stop_r_mult = max(1.0, float(swap_stop_r_mult))
+            candidate_loss_usdt = float(risk_amt) * float(swap_stop_r_mult)
+
+        if not _can_open(inst, side, level, ts, candidate_loss_usdt=float(candidate_loss_usdt)):
             return False
         if miss_prob > 0:
             miss_key = f"{inst}|{int(ts)}|{side}|{int(level)}|{'rev' if is_reverse else 'std'}"
@@ -1343,6 +1487,8 @@ def main() -> int:
             entry_ts=int(ts),
             entry_i=int(i),
             risk_amt=float(risk_amt),
+            exit_model=exit_model,
+            swap_stop_r_mult=float(swap_stop_r_mult),
         )
         pos["entry_exec_mode"] = str(effective_exec_mode)
         pos["entry_exec_mode_intended"] = str(intended_exec_mode)
@@ -1429,6 +1575,9 @@ def main() -> int:
                     profile_score_map=cfg.strategy_profile_vote_score_map,
                     level_weight=cfg.strategy_profile_vote_level_weight,
                 )
+
+            if invert_signal_mode:
+                sig = _invert_signal_symmetric(sig)
 
             decision = resolve_entry_decision(
                 sig,
@@ -1602,7 +1751,7 @@ def main() -> int:
         f"约束：min_gap={min_gap_minutes}m inst_cap={per_inst_cap}/24h global_cap={global_cap}/24h "
         f"loss_guard={loss_limit_pct*100:.2f}%({loss_base_mode},projected) "
         f"l3_side_cap={(l3_side_cap if l3_side_cap > 0 else '-')} "
-        f"tp1_only={tp1_only} managed_exit={managed_exit}"
+        f"tp1_only={tp1_only} managed_exit={managed_exit} inversion={inversion_mode_label}"
     )
     summary.append(
         f"复利：risk={risk_frac*100:.2f}%/单 start={start_equity:.2f} final={equity:.2f} "

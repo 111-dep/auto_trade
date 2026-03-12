@@ -294,6 +294,27 @@ def _parse_strategy_profile_map(raw: str) -> Dict[str, str]:
     return mapping
 
 
+def _parse_symbol_map(raw: str) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    if not raw:
+        return mapping
+    for item in str(raw).split(","):
+        pair = item.strip()
+        if not pair:
+            continue
+        if ":" in pair:
+            left, right = pair.split(":", 1)
+        elif "=" in pair:
+            left, right = pair.split("=", 1)
+        else:
+            raise ValueError(f"Invalid BINANCE_SYMBOL_MAP item: {pair} (expected INST:SYMBOL)")
+        inst = str(left).strip().upper()
+        symbol = str(right).strip().upper()
+        if inst and symbol:
+            mapping[inst] = symbol
+    return mapping
+
+
 def _parse_strategy_profile_inst_groups(raw: str) -> Dict[str, str]:
     """Parse grouped profile mapping: PROFILE:INST1,INST2;PROFILE2:INST3,..."""
     mapping: Dict[str, str] = {}
@@ -549,7 +570,16 @@ def read_config(state_file_override: Optional[str]) -> Config:
     params = _build_base_strategy_params()
     _normalize_strategy_params(params)
 
-    inst_ids = parse_inst_ids(os.getenv("OKX_INST_IDS", ""))
+    exchange_provider = os.getenv("EXCHANGE_PROVIDER", "okx").strip().lower()
+    if exchange_provider not in {"okx", "binance"}:
+        raise ValueError("EXCHANGE_PROVIDER must be okx or binance")
+    binance_quote_asset = os.getenv("BINANCE_QUOTE_ASSET", "USDC").strip().upper() or "USDC"
+    binance_recv_window = max(1000, int(os.getenv("BINANCE_RECV_WINDOW", "5000")))
+    binance_symbol_map = _parse_symbol_map(os.getenv("BINANCE_SYMBOL_MAP", ""))
+
+    inst_ids = parse_inst_ids(os.getenv("BINANCE_INST_IDS", "")) if exchange_provider == "binance" else []
+    if not inst_ids:
+        inst_ids = parse_inst_ids(os.getenv("OKX_INST_IDS", ""))
     if not inst_ids:
         inst_ids = [os.getenv("OKX_INST_ID", "XAU-USDT-SWAP").strip().upper()]
 
@@ -589,11 +619,21 @@ def read_config(state_file_override: Optional[str]) -> Config:
     default_alert_file = os.path.join(base_dir, "alerts.log")
     default_trade_journal_file = os.path.join(base_dir, "trade_journal.csv")
     default_history_cache_dir = os.path.join(base_dir, ".cache", "history")
+    provider_base_url = (
+        os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/")
+        if exchange_provider == "binance"
+        else os.getenv("OKX_BASE_URL", "https://www.okx.com").rstrip("/")
+    )
+    provider_api_key = os.getenv("BINANCE_API_KEY", "") if exchange_provider == "binance" else os.getenv("OKX_API_KEY", "")
+    provider_secret_key = os.getenv("BINANCE_SECRET_KEY", "") if exchange_provider == "binance" else os.getenv("OKX_SECRET_KEY", "")
+    provider_passphrase = "" if exchange_provider == "binance" else os.getenv("OKX_PASSPHRASE", "")
+    compound_balance_ccy_default = binance_quote_asset if exchange_provider == "binance" else "USDT"
+
     cfg = Config(
-        base_url=os.getenv("OKX_BASE_URL", "https://www.okx.com").rstrip("/"),
-        api_key=os.getenv("OKX_API_KEY", ""),
-        secret_key=os.getenv("OKX_SECRET_KEY", ""),
-        passphrase=os.getenv("OKX_PASSPHRASE", ""),
+        base_url=provider_base_url,
+        api_key=provider_api_key,
+        secret_key=provider_secret_key,
+        passphrase=provider_passphrase,
         paper=parse_bool(os.getenv("OKX_PAPER", "1"), True),
         dry_run=parse_bool(os.getenv("OKX_DRY_RUN", "1"), True),
         inst_ids=inst_ids,
@@ -632,7 +672,7 @@ def read_config(state_file_override: Optional[str]) -> Config:
         compound_max_margin=float(os.getenv("OKX_COMPOUND_MAX_MARGIN", "500")),
         compound_dd_guard_pct=float(os.getenv("OKX_COMPOUND_DD_GUARD_PCT", "0.15")),
         compound_dd_factor=float(os.getenv("OKX_COMPOUND_DD_FACTOR", "0.5")),
-        compound_balance_ccy=os.getenv("OKX_COMPOUND_BALANCE_CCY", "USDT").strip().upper(),
+        compound_balance_ccy=os.getenv("OKX_COMPOUND_BALANCE_CCY", compound_balance_ccy_default).strip().upper(),
         compound_cache_seconds=max(0, int(os.getenv("OKX_COMPOUND_CACHE_SECONDS", "30"))),
         state_file=state_file_override or os.getenv("OKX_STATE_FILE", default_state),
         user_agent=os.getenv(
@@ -681,9 +721,15 @@ def read_config(state_file_override: Optional[str]) -> Config:
         strategy_profile_vote_level_weight=strategy_profile_vote_level_weight,
         strategy_profile_vote_fallback_profiles=strategy_profile_vote_fallback_profiles,
         strategy_profiles=strategy_profiles,
+        exchange_provider=exchange_provider,
+        binance_quote_asset=binance_quote_asset,
+        binance_recv_window=binance_recv_window,
+        binance_symbol_map=binance_symbol_map,
     )
     if cfg.pos_mode not in {"net", "long_short"}:
         raise ValueError("OKX_POS_MODE must be net or long_short")
+    if cfg.exchange_provider == "binance" and cfg.pos_mode != "net":
+        raise ValueError("Binance live path currently supports OKX_POS_MODE=net only")
     if cfg.td_mode not in {"cross", "isolated"}:
         raise ValueError("OKX_TD_MODE must be cross or isolated")
     if cfg.sizing_mode not in {"fixed", "margin"}:
@@ -702,6 +748,8 @@ def read_config(state_file_override: Optional[str]) -> Config:
         cfg.log_level = "INFO"
     if not cfg.ws_private_url:
         cfg.ws_private_url = "wss://ws.okx.com:8443/ws/v5/private"
+    if cfg.exchange_provider == "binance" and not cfg.compound_balance_ccy:
+        cfg.compound_balance_ccy = cfg.binance_quote_asset or "USDC"
     if cfg.ws_reconnect_seconds < 1:
         cfg.ws_reconnect_seconds = 1
     if cfg.log_heartbeat_seconds < 30:
