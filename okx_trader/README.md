@@ -1,6 +1,6 @@
 # OKX Trader Package
 
-> 项目级使用说明、实盘命令、回测口径与重大更新记录请看仓库根目录 `README.md`。
+> 项目级使用说明与实盘命令请看仓库根目录 `README.md`，历史更新记录请看 `CHANGELOG.md`。
 
 模块职责：
 

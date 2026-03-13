@@ -1,187 +1,224 @@
-# OKX Auto Trader (okx_trade_suite)
+# OKX Auto Trader (`okx_trade_suite`)
 
-本项目是一个面向 OKX / Binance USDC 永续合约的自动交易与回测系统，支持多币种、多策略档案、同币多策略投票、实盘风控、2Y 组合回测与 Telegram 提醒。
+一个面向 **OKX / Binance USDC 永续合约** 的自动交易与回测系统，支持多币种轮询、多策略档案、多策略投票、分级执行、Managed Exit、日报/周报、Telegram 提醒，以及 2 年组合回测。
 
-## 1. 当前能力总览
+> 快速入口：
+> - 项目使用说明：`README.md`
+> - 模块说明：`okx_trader/README.md`
+> - 历史更新记录：`CHANGELOG.md`
 
-- 双交易所执行层：`EXCHANGE_PROVIDER=okx|binance`。
-- 多币种轮询执行（`OKX_INST_IDS` / `BINANCE_INST_IDS`）。
-- 多策略变体（`classic` / `btceth_smc_a2` / `elder_tss_v1` / `r_breaker_v1` / `range_reversion_v1` 等）。
-- 档案化参数（`STRAT_PROFILE_MAP` + `STRAT_PROFILE_<PROFILE>_*`）。
-- 同币多策略投票后只下一个单（`STRAT_PROFILE_VOTE_*`）。
-- 分级执行与白名单（L1/L2/L3，`STRAT_EXEC_MAX_LEVEL` + `STRAT_EXEC_L3_INST_IDS`）。
-- Managed Exit：TP1 分批、TP2、保本/费用缓冲、移动止损。
-- 开仓优先尝试交易所原生多 TP（TP1/TP2）；若账户角色不支持，则自动退回为“入场仅 attach 止损 + 独立 TP1/TP2”，并在 TP1 后自动推进剩余仓位保本止损（支持 WS 快速通道）。
-- Binance：支持 Unified Account / Portfolio Margin 的 `PAPI` 自动识别，公共 REST 支持多域 fallback + 最近 K 线缓存兜底。
-- Binance：条件止损单支持“接管已有单 / 修复数量不匹配 / 渐进清理重复单”，降低重启后重复挂止损风险。
-- 风控：日亏熔断、开仓频率限制、连续止损冷却/冻结、风险开仓硬保护。
-- 下单幂等：支持 `clOrdId`（客户端订单号）以降低重复下单风险。
-- 进程安全：单实例锁（默认开启，防止重复启动多个实盘进程）。
-- 可选按风险百分比自动算仓（`OKX_MARGIN_USDT=0` + `STRAT_RISK_FRAC`）。
-- 非同保证金模式仓位处理（`STRAT_SKIP_ON_FOREIGN_MGNMODE_POS`）。
-- 逐笔交易台账（CSV，开仓/部分止盈/平仓/外部平仓）。
-- 订单关联台账（CSV，按 `trade_id` 记录 `entry/event ordId/clOrdId`，便于精确对账）。
-- 回测：
-  - `okx_auto_trader.py --backtest`（单路径回测）
-  - `run_interleaved_backtest_2y.py`（2Y 多币组合、真实顺序）
+## 目录
 
-## 2. 项目结构
+- [1. 能力概览](#1-能力概览)
+- [2. 仓库结构](#2-仓库结构)
+- [3. 快速开始](#3-快速开始)
+- [4. 交易与风控模型](#4-交易与风控模型)
+- [5. 多策略档案与投票](#5-多策略档案与投票)
+- [6. 回测与研究](#6-回测与研究)
+- [7. 台账、对账与复盘](#7-台账对账与复盘)
+- [8. 开发与自检](#8-开发与自检)
+- [9. 相关文档](#9-相关文档)
 
-- `okx_auto_trader.py`: 统一入口（调用 `okx_trader.main`）。
-- `okx_auto_trader.env`: 实盘配置（含密钥，勿外传）。
-- `okx_auto_trader.env.example`: 配置模板。
-- `run_interleaved_backtest_2y.py`: 2Y 组合回测主脚本。
-- `scripts/`: 脚本分层目录（统一入口）。
-  - `scripts/live/`: 实盘启停类脚本。
-  - `scripts/ops/`: 日报与 cron 安装脚本。
-  - `scripts/backtest/`: 回测批处理脚本。
-  - `scripts/utils/`: 工具脚本。
-- `scripts/backtest/run_backtest_batch_levels.sh`: L2/L3 批量回测脚本。
-- `scripts/backtest/run_backtest_2y_cached.sh`: 2Y 缓存回测脚本。
-- `scripts/ops/run_daily_recap.sh` / `scripts/ops/setup_daily_recap_cron.sh` / `scripts/live/restart_live_trader.sh` / `scripts/live/restart_binance_trader.sh`: 实盘运维脚本。
-- `okx_trader/`: 核心包（信号、执行、风控、回测、状态、告警）。
-  - `runtime.py`: 运行循环与心跳/状态汇总。
-  - `runtime_run_once_for_inst.py`: 单币种轮询主流程（取数/投票/持仓检查）。
-  - `runtime_execute_decision.py`: 下单与持仓管理执行层。
-- `runtime.log` / `logs/binance_runtime.log`: OKX / Binance 实盘运行日志。
-- `alerts.log`: 本地提醒日志。
-- `trade_journal.csv` / `logs/binance_trade_journal.csv`: OKX / Binance 逐笔交易台账。
-- `trade_journal_order_links.csv` / `logs/binance_trade_journal_order_links.csv`: 订单关联台账（复盘/对账用）。
+## 1. 能力概览
 
-## 3. 快速启动
+| 模块 | 当前能力 |
+|---|---|
+| 交易所 | `EXCHANGE_PROVIDER=okx` / `binance` |
+| 标的 | 多币种轮询：`OKX_INST_IDS` / `BINANCE_INST_IDS` |
+| 信号 | 4H / 1H / 15m 三层信号 + 多策略档案 + 同币投票 |
+| 执行 | `market` / `limit` / `auto`，支持 `L1/L2/L3` 分级覆盖 |
+| 持仓管理 | TP1 分批、TP2、保本止损、移动止损、交易所原生 TP/SL 与脚本 fallback |
+| 风控 | 日亏熔断、止损冷却、连亏冻结、风险开仓上限、单实例锁 |
+| 运行可靠性 | `clOrdId` 幂等、状态持久化、心跳日志、台账、订单关联台账 |
+| 复盘研究 | 单路径回测、2Y 组合回测、回测快照、日报/周报、账单对账 |
 
-1. 准备配置
+**交易所侧重点**
+
+- **OKX**：支持私有 WS 快速 TP1/BE 管理；支持原生多 TP 优先、脚本 fallback。
+- **Binance**：支持 `fapi / papi` 自动识别；公共 REST 有多域 fallback 与最近 K 线缓存兜底；条件止损支持“接管已有单 / 修复数量 / 清理重复单”。
+
+## 2. 仓库结构
+
+**核心入口**
+
+- `okx_auto_trader.py`：统一 CLI 入口。
+- `okx_auto_trader.env.example`：配置模板。
+- `run_interleaved_backtest_2y.py`：2Y 组合回测主脚本。
+
+**核心包**
+
+- `okx_trader/runtime.py`：主轮询循环、心跳与状态汇总。
+- `okx_trader/runtime_run_once_for_inst.py`：单币种一次轮询流程。
+- `okx_trader/runtime_execute_decision.py`：执行层，负责开平仓、止损、TP 管理。
+- `okx_trader/okx_client.py`：OKX 客户端。
+- `okx_trader/binance_um_client.py`：Binance USDⓈ-M / USDC 永续客户端。
+- `okx_trader/backtest.py`：回测引擎。
+- `okx_trader/README.md`：模块级说明。
+
+**脚本目录**
+
+- `scripts/live/`：实盘启停脚本。
+- `scripts/backtest/`：回测脚本。
+- `scripts/ops/`：日报、周报、cron 安装等运维脚本。
+
+**运行产物**
+
+- `runtime.log`：OKX 运行日志。
+- `logs/binance_runtime.log`：Binance 运行日志。
+- `trade_journal.csv` / `logs/binance_trade_journal.csv`：交易台账。
+- `trade_journal_order_links.csv` / `logs/binance_trade_journal_order_links.csv`：订单关联台账。
+- `logs/backtest_snapshots/`：回测快照与索引。
+- `logs/daily_recap/`、`logs/weekly_recap/`：日报与周报产物。
+
+## 3. 快速开始
+
+### 3.1 准备配置
+
+建议先定义根目录变量：
 
 ```bash
-cp okx_auto_trader.env.example okx_auto_trader.env
+ROOT="/home/dandan/Workspace/test/okx_trade_suite"
+```
+
+**OKX**
+
+```bash
+cp "$ROOT/okx_auto_trader.env.example" "$ROOT/okx_auto_trader.env"
 # 然后填写 OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE
 ```
 
-2. 安全自检（仅跑一轮，不下单）
+**Binance**
+
+仓库里目前没有单独的 Binance 模板，通常做法是复制一份 env 再改 provider：
 
 ```bash
-OKX_DRY_RUN=1 ALERT_ONLY_MODE=1 \
-python3 -u okx_auto_trader.py --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env --once
+cp "$ROOT/okx_auto_trader.env.example" "$ROOT/binance_auto_trader.env"
 ```
 
-3. nohup 实盘启动
+最少需要把下面几项改成 Binance 版本：
 
-```bash
-nohup python3 -u /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.py \
-  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
-  > /home/dandan/Workspace/test/okx_trade_suite/runtime.log 2>&1 &
+```env
+EXCHANGE_PROVIDER=binance
+BINANCE_API_KEY=...
+BINANCE_SECRET_KEY=...
+BINANCE_INST_IDS=BTC-USDT-SWAP,ETH-USDT-SWAP,SOL-USDT-SWAP
+BINANCE_PRIVATE_API_MODE=auto
+BINANCE_QUOTE_ASSET=USDC
 ```
 
-4. 查看日志
+### 3.2 安全自检
+
+先跑一次 dry-run / alert-only，确认配置、取数和轮询都正常：
 
 ```bash
-tail -f /home/dandan/Workspace/test/okx_trade_suite/runtime.log
+OKX_DRY_RUN=1 ALERT_ONLY_MODE=1 python3 -u "$ROOT/okx_auto_trader.py" --env "$ROOT/okx_auto_trader.env" --once
 ```
 
-5. 停止实盘
+如果要测 Binance，把 `--env` 换成 `"$ROOT/binance_auto_trader.env"` 即可。
+
+### 3.3 实盘启停
+
+**OKX**
 
 ```bash
-pkill -TERM -f "python3 -u /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.py"
-```
+# 重启并 tail
+"$ROOT/scripts/live/restart_live_trader.sh"
 
-6. 一键管理实盘（推荐）
-
-```bash
-# 一键重启（默认会 tail 日志）
-/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh
-
-# 仅查看状态
-/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh --status
+# 查看状态
+"$ROOT/scripts/live/restart_live_trader.sh" --status
 
 # 只重启不 tail
-/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh --no-tail
+"$ROOT/scripts/live/restart_live_trader.sh" --no-tail
 
-# 仅停止 / 仅启动
-/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh --stop
-/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh --start
-
-# 启动时关闭“开仓执行TG消息”（仅本次进程）
-/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh --start --no-open-tg
-
-# 启动 + 一键安装每天07:00的24h日报TG（含净收益/权益）
-/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_live_trader.sh \
-  --start --no-open-tg --setup-daily-recap-7am
+# 关闭“开仓执行 TG”后启动（仅本次进程）
+"$ROOT/scripts/live/restart_live_trader.sh" --start --no-open-tg
 ```
 
-
-Binance 启停（与 OKX 解耦）：
+**Binance**
 
 ```bash
-# 启动 / 查看状态
-/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_binance_trader.sh --start
-/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_binance_trader.sh --status
-
-# 只重启不 tail
-/home/dandan/Workspace/test/okx_trade_suite/scripts/live/restart_binance_trader.sh --no-tail
+# 启动 / 重启 / 查看状态
+"$ROOT/scripts/live/restart_binance_trader.sh" --start
+"$ROOT/scripts/live/restart_binance_trader.sh" --no-tail
+"$ROOT/scripts/live/restart_binance_trader.sh" --status
 ```
 
-7. 最小回归测试（本地无交易所依赖）
+### 3.4 日志查看
 
 ```bash
-cd /home/dandan/Workspace/test/okx_trade_suite
-python3 -m unittest discover -s tests -p "test_*.py"
+# OKX
+tail -f "$ROOT/runtime.log"
+
+# Binance
+tail -f "$ROOT/logs/binance_runtime.log"
+
+# 台账
+tail -f "$ROOT/trade_journal.csv"
+tail -f "$ROOT/trade_journal_order_links.csv"
 ```
 
-8. 提交前安全检查（推荐）
+## 4. 交易与风控模型
 
-```bash
-cd /home/dandan/Workspace/test/okx_trade_suite
-python3 -m pip install --user pre-commit
-pre-commit install
+### 4.1 交易所差异
 
-# 首次可全量跑一遍
-pre-commit run --all-files
-```
+| 项目 | OKX | Binance |
+|---|---|---|
+| `EXCHANGE_PROVIDER` | `okx` | `binance` |
+| 标的列表 | `OKX_INST_IDS` | `BINANCE_INST_IDS` |
+| 凭证 | `OKX_API_KEY / OKX_SECRET_KEY / OKX_PASSPHRASE` | `BINANCE_API_KEY / BINANCE_SECRET_KEY` |
+| 私有接口模式 | 固定 OKX | `BINANCE_PRIVATE_API_MODE=auto|fapi|papi` |
+| 私有 WS 快速 TP1/BE | 支持 | 当前不用，走轮询管理 |
+| 持仓模式 | 按 OKX 配置 | 当前 live 按 `OKX_POS_MODE=net`（one-way） |
 
-当前配置的 pre-commit 检查：
-- `secret-scan (local)`：扫描疑似密钥（含 `OKX_API_KEY/OKX_SECRET_KEY/OKX_PASSPHRASE` 等）。
-- `py-compile-staged (local)`：对变更的 `*.py` 做语法编译检查。
+### 4.2 仓位计算优先级
 
-## 4. 仓位计算优先级（非常重要）
+- `OKX_SIZING_MODE=margin` 且 `OKX_MARGIN_USDT > 0`
+  - 按固定保证金开仓。
+  - `STRAT_RISK_FRAC` 不参与仓位反推。
+- `OKX_SIZING_MODE=margin` 且 `OKX_MARGIN_USDT = 0`
+  - 按风险百分比开仓。
+  - 受 `STRAT_RISK_FRAC` 和 `STRAT_RISK_MAX_MARGIN_FRAC` 双重约束。
 
-- `OKX_SIZING_MODE=margin` 且 `OKX_MARGIN_USDT>0`：
-  - 按固定保证金开仓（每单保证金= `OKX_MARGIN_USDT`）。
-  - 此时 `STRAT_RISK_FRAC` 不参与计算。
-- `OKX_SIZING_MODE=margin` 且 `OKX_MARGIN_USDT=0`：
-  - 启用风险百分比开仓（按 `STRAT_RISK_FRAC` 结合止损距离反推仓位）。
-  - 同时受 `STRAT_RISK_MAX_MARGIN_FRAC` 硬上限保护。
+推荐把这两个值写成百分号格式，例如：`0.58%`、`30%`。
 
-推荐：`STRAT_RISK_FRAC` 和 `STRAT_RISK_MAX_MARGIN_FRAC` 使用百分号格式（如 `0.5%`、`30%`）。
+### 4.3 关键参数分组
 
-## 5. 关键风控开关
+**风险控制**
 
-- `STRAT_DAILY_LOSS_LIMIT_PCT`: 24h 风控阈值（当前按“已实现亏损 + 持仓潜在亏损 + 新单潜在亏损”预算）。
-- `STRAT_STOP_REENTRY_COOLDOWN_MINUTES`: 止损后同方向冷却。
-- `STRAT_STOP_STREAK_FREEZE_COUNT` + `STRAT_STOP_STREAK_FREEZE_HOURS`: 连续止损冻结。
-- `STRAT_STOP_STREAK_L2_ONLY`: 冻结期间仅禁 L3 或全禁。
-- `STRAT_ENABLE_CLOSE`: 是否允许脚本主动平仓（止盈/止损/反手）。
-- `STRAT_SIGNAL_EXIT_ENABLED`: 是否启用信号失效提前平仓（默认建议 `0`，更贴近当前回测口径）。
-- `STRAT_SPLIT_TP_ON_ENTRY`: 是否启用交易所原生 TP1/TP2 多目标止盈（建议 `1`；若账户角色不支持多 TP，会自动退回为“入场仅 attach 止损 + 独立 TP1/TP2”）。
-- `STRAT_ENTRY_EXEC_MODE`: 入场执行模式（`market` / `limit` / `auto`）。
-- `STRAT_ENTRY_AUTO_MARKET_LEVEL_MIN`: `auto` 下等级阈值（>= 阈值走市价）。
-- `STRAT_ENTRY_AUTO_MARKET_LEVEL_MAX`: `auto` 可选反向阈值（<= 阈值走市价，`0`=关闭，优先于 `..._MIN`）。
-- `STRAT_ENTRY_LIMIT_OFFSET_BPS`: 限价偏移基点（越大越容易成交，价格通常更差）。
-- `STRAT_ENTRY_LIMIT_TTL_SEC`: 限价等待秒数（超时后按 fallback 处理）。
-- `STRAT_ENTRY_L1/L2/L3_EXEC_MODE`: 进阶版分级执行覆盖（留空=继承全局，支持 `market` / `limit` / `auto`）。
-- `STRAT_ENTRY_L1/L2/L3_LIMIT_TTL_SEC`: 进阶版分级限价等待秒数（`-1`=继承全局）。
-- `STRAT_ENTRY_LIMIT_REPRICE_MAX`: 限价超时后重挂次数（建议先 `0`）。
-- `STRAT_ENTRY_LIMIT_FALLBACK_MODE`: 限价未成交回退（`market` / `skip`）。
-- `STRAT_ENTRY_L1/L2/L3_LIMIT_FALLBACK_MODE`: 进阶版分级未成交回退（留空=继承全局）。
-- `STRAT_SKIP_ON_FOREIGN_MGNMODE_POS`: 是否因异保证金模式仓位而跳过该币种。
-- `OKX_SINGLE_INSTANCE_LOCK`: 是否启用单实例锁（默认 `1`）。
-- `OKX_INSTANCE_LOCK_FILE`: 单实例锁文件路径（默认 `${OKX_STATE_FILE}.lock`）。
-- `OKX_WS_TP1_BE_ENABLED`: 是否启用私有 WS 快速管理（TP1 成交后尽快推保本止损）。
-- `OKX_WS_PRIVATE_URL`: 私有 WS 地址（实盘/模拟盘请按账户环境填写）。
-- `OKX_WS_RECONNECT_SECONDS`: 私有 WS 断线重连间隔。
+- `STRAT_DAILY_LOSS_LIMIT_PCT`：日亏熔断阈值。
+- `STRAT_STOP_REENTRY_COOLDOWN_MINUTES`：止损后同方向冷却。
+- `STRAT_STOP_STREAK_FREEZE_COUNT` + `STRAT_STOP_STREAK_FREEZE_HOURS`：连续止损冻结。
+- `STRAT_STOP_STREAK_L2_ONLY`：冻结期间只禁 L3，还是全禁。
+- `STRAT_SKIP_ON_FOREIGN_MGNMODE_POS`：若存在异保证金模式仓位，是否跳过该币种。
 
-## 6. 多策略档案与投票
+**入场执行**
 
-推荐：按“策略 -> 币种”分组绑定档案：
+- `STRAT_ENTRY_EXEC_MODE`：`market` / `limit` / `auto`。
+- `STRAT_ENTRY_AUTO_MARKET_LEVEL_MIN`：`auto` 下，等级大于等于该值走市价。
+- `STRAT_ENTRY_AUTO_MARKET_LEVEL_MAX`：`auto` 下，等级小于等于该值走市价；优先于 `..._MIN`。
+- `STRAT_ENTRY_LIMIT_OFFSET_BPS`：限价偏移基点。
+- `STRAT_ENTRY_LIMIT_TTL_SEC`：限价等待秒数。
+- `STRAT_ENTRY_LIMIT_REPRICE_MAX`：限价超时后的重挂次数。
+- `STRAT_ENTRY_LIMIT_FALLBACK_MODE`：超时后 `market` 或 `skip`。
+- `STRAT_ENTRY_L1/L2/L3_*`：按等级分别覆盖 `exec_mode / ttl / fallback_mode`。
+
+**持仓管理**
+
+- `STRAT_ENABLE_CLOSE`：是否允许脚本主动平仓。
+- `STRAT_SIGNAL_EXIT_ENABLED`：是否允许信号失效提前平仓。
+- `STRAT_SPLIT_TP_ON_ENTRY`：优先尝试交易所原生 TP1/TP2；不支持时自动 fallback 到脚本管理 TP1/TP2。
+- `OKX_WS_TP1_BE_ENABLED`：OKX 私有 WS 快速管理开关。
+- `OKX_WS_PRIVATE_URL`、`OKX_WS_RECONNECT_SECONDS`：私有 WS 连接参数。
+
+**运行安全**
+
+- `OKX_SINGLE_INSTANCE_LOCK=1`：开启单实例锁，防止重复启动实盘进程。
+- `OKX_INSTANCE_LOCK_FILE`：锁文件路径，默认 `${OKX_STATE_FILE}.lock`。
+- `LOG_HEARTBEAT_SECONDS`：心跳汇总日志周期。
+
+## 5. 多策略档案与投票
+
+### 5.1 推荐写法：按“策略 -> 币种”分组
 
 ```env
 STRAT_PROFILE_INST_GROUPS=BTCETH:BTC-USDT-SWAP;ALT:SOL-USDT-SWAP,DOGE-USDT-SWAP
@@ -189,14 +226,14 @@ STRAT_PROFILE_BTCETH_VARIANT=btceth_smc_a2
 STRAT_PROFILE_ALT_VARIANT=classic
 ```
 
-兼容旧写法（按“币种 -> 策略”）：
+### 5.2 兼容旧写法：按“币种 -> 策略”绑定
 
 ```env
 STRAT_PROFILE_MAP=BTC-USDT-SWAP:BTCETH
 STRAT_PROFILE_BTCETH_VARIANT=btceth_smc_a2
 ```
 
-同币多策略投票（最终只下 1 个单）推荐分组写法：
+### 5.3 同币多策略投票
 
 ```env
 STRAT_PROFILE_VOTE_INST_GROUPS=BTCETH+ELDER:BTC-USDT-SWAP;DEFAULT+ELDERALT:SOL-USDT-SWAP,DOGE-USDT-SWAP
@@ -206,7 +243,7 @@ STRAT_PROFILE_VOTE_SCORE_MAP=BTCETH=0.154,ELDER=0.057
 STRAT_PROFILE_VOTE_LEVEL_WEIGHT=0.01
 ```
 
-可选：按档案覆盖杠杆（用于如 XAU 单独杠杆）：
+### 5.4 按档案覆盖杠杆
 
 ```env
 OKX_LEVERAGE=10
@@ -214,142 +251,98 @@ STRAT_PROFILE_INST_GROUPS=BTCETH:BTC-USDT-SWAP;XAU:XAU-USDT-SWAP
 STRAT_PROFILE_XAU_LEVERAGE=25
 ```
 
-兼容旧写法：
+## 6. 回测与研究
 
-```env
-STRAT_PROFILE_VOTE_MAP=BTC-USDT-SWAP:BTCETH+ELDER
-STRAT_PROFILE_VOTE_MODE=any
-STRAT_PROFILE_VOTE_MIN_AGREE=1
-STRAT_PROFILE_VOTE_SCORE_MAP=BTCETH=0.154,ELDER=0.057
-STRAT_PROFILE_VOTE_LEVEL_WEIGHT=0.01
-```
+### 6.1 场景等级
 
-## 7. 回测常用命令
-
-统一场景命名（建议以后都用这个）：
-
-| 标准名 | 旧习惯叫法 | fee_rate | slippage_bps | stop_extra_r | tp_haircut_r | miss_prob |
+| 标准名 | 含义 | fee_rate | slippage_bps | stop_extra_r | tp_haircut_r | miss_prob |
 |---|---|---:|---:|---:|---:|---:|
-| `S1-OPTIMISTIC` | 乐观 | 0.0006 | 1.0 | 0.02 | 0.01 | 0.01 |
+| `S1-OPTIMISTIC` | 乐观边界 | 0.0006 | 1.0 | 0.02 | 0.01 | 0.01 |
 | `S2-MID_PESS` | 中等悲观 | 0.0008 | 1.5 | 0.03 | 0.02 | 0.03 |
-| `S3-LIVE_FIT` | 贴近实盘/实盘拟合 | 0.0010 | 3.0 | 0.05 | 0.04 | 0.06 |
+| `S3-LIVE_FIT` | 贴近实盘 | 0.0010 | 3.0 | 0.05 | 0.04 | 0.06 |
 | `S4-STRICT_PESS` | 严格悲观 | 0.0012 | 5.0 | 0.08 | 0.06 | 0.10 |
 | `S5-EXTREME_STRESS` | 极端压力 | 0.0016 | 8.0 | 0.12 | 0.10 | 0.15 |
 
-说明：
-- `S2/S3/S4` 参数来自你实际常用/已验证口径。
-- `S1/S5` 是边界参考，不建议直接拿来做实盘收益预期。
+说明：`S2 / S3 / S4` 是更常用的实战口径，`S1 / S5` 更适合拿来做边界参考。
 
-2Y 组合回测（以 `S2-MID_PESS` 为例）：
+### 6.2 常用命令
 
-```bash
-ENV="/home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env"
-
-python3 -u /home/dandan/Workspace/test/okx_trade_suite/run_interleaved_backtest_2y.py \
-  --env "$ENV" \
-  --bars 70080 \
-  --risk-frac 0.005 \
-  --managed-exit \
-  --fee-rate 0.0008 \
-  --slippage-bps 1.5 \
-  --stop-extra-r 0.03 \
-  --tp-haircut-r 0.02 \
-  --miss-prob 0.03 \
-  --title "2Y ManagedExit S2-MID_PESS"
-```
-
-推荐脚本（默认只用本地缓存，缓存不足直接退出）：
+先定义通用变量：
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/backtest/run_backtest_2y_cached.sh \
-  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
-  --inst-ids BTC-USDT-SWAP,SOL-USDT-SWAP,DOGE-USDT-SWAP,SUI-USDT-SWAP,BCH-USDT-SWAP,LTC-USDT-SWAP,NEAR-USDT-SWAP,FIL-USDT-SWAP,UNI-USDT-SWAP \
-  --bars 70080 \
-  --risk-frac 0.005 \
-  --scenario s2
+ROOT="/home/dandan/Workspace/test/okx_trade_suite"
+ENV="$ROOT/okx_auto_trader.env"
+BASE="$ROOT/scripts/backtest/run_backtest_2y_cached.sh --env $ENV --bars 70080 --risk-frac 0.005"
 ```
 
-入场执行模式对比（market vs auto）：
+**标准 2Y 组合回测**
+
+```bash
+$BASE --scenario s2
+```
+
+**执行模式对比**
 
 ```bash
 # 基线：全 market
-/home/dandan/Workspace/test/okx_trade_suite/scripts/backtest/run_backtest_2y_cached.sh \
-  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
-  --bars 70080 \
-  --risk-frac 0.005 \
-  --scenario s3 \
+$BASE --scenario s3 \
   --entry-exec-mode market \
   --title "2Y ManagedExit S3-LIVE_FIT MKT"
 
-# 自动：L3 走 market，L1/L2 优先 limit，未成交回退 market
-/home/dandan/Workspace/test/okx_trade_suite/scripts/backtest/run_backtest_2y_cached.sh \
-  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
-  --bars 70080 \
-  --risk-frac 0.005 \
-  --scenario s3 \
+# auto：高等级市价，其余优先限价
+$BASE --scenario s3 \
   --entry-exec-mode auto \
   --entry-auto-market-level-min 3 \
   --entry-limit-fallback-mode market \
   --title "2Y ManagedExit S3-LIVE_FIT AUTO"
 
-# 反向自动：L1/L2 走 market，L3 优先 limit（未成交回退 market）
-/home/dandan/Workspace/test/okx_trade_suite/scripts/backtest/run_backtest_2y_cached.sh \
-  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
-  --bars 70080 \
-  --risk-frac 0.005 \
-  --scenario s3 \
+# AUTO_REV：L1/L2 市价，L3 优先限价
+$BASE --scenario s3 \
   --entry-exec-mode auto \
   --entry-auto-market-level-max 2 \
   --entry-limit-fallback-mode market \
   --title "2Y ManagedExit S3-LIVE_FIT AUTO_REV"
 ```
 
-保存“经典回测快照”（避免每次重跑后找不到历史结果）：
+**保存经典回测快照**
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/backtest/run_backtest_2y_cached.sh \
-  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
-  --bars 70080 \
-  --risk-frac 0.005 \
-  --scenario s3 \
-  --save-tag classic_livefit
+$BASE --scenario s3 --save-tag classic_livefit
 ```
 
-快照产物默认落在：
-- `logs/backtest_snapshots/<timestamp>_<tag>.log`（完整结果日志）
-- `logs/backtest_snapshots/<timestamp>_<tag>_trades.csv`（交易明细）
-- `logs/backtest_snapshots/index.csv`（汇总索引，含 `avg_r`/`payoff_r`/`profit_factor_r`）
+快照产物在：
 
-查看最近快照：
+- `logs/backtest_snapshots/<timestamp>_<tag>.log`
+- `logs/backtest_snapshots/<timestamp>_<tag>_trades.csv`
+- `logs/backtest_snapshots/index.csv`
+
+**单路径回测**
 
 ```bash
-tail -n 5 /home/dandan/Workspace/test/okx_trade_suite/logs/backtest_snapshots/index.csv
+python3 -u "$ROOT/okx_auto_trader.py" --env "$ENV" --backtest
 ```
 
-如果你明确允许脚本在线补拉缺失历史：
+**严格检查最近 N 小时到底有没有信号**
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/backtest/run_backtest_2y_cached.sh --allow-fetch ...
-```
-
-严格检查“最近20小时到底有没有信号”（同一共同终点窗口，口径对齐当前策略+投票）：
-
-```bash
-python3 -u /home/dandan/Workspace/test/okx_trade_suite/check_recent_signals_strict.py \
-  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
+python3 -u "$ROOT/check_recent_signals_strict.py" \
+  --env "$ENV" \
   --hours 20 \
   --no-cache \
   --show-events 50
 ```
 
-说明：
-- `--no-cache` 表示强制实时拉取；去掉该参数则优先用本地缓存。
-- 输出分为 `raw`（策略原始信号）和 `decision`（投票+等级后可执行信号）。
-- 采用“所有币共同可用的最新K线终点”回看 `N` 小时，避免各币数据不同步导致误判。
+**允许在线补拉历史数据**
 
-## 8. 交易台账（两个月后统计就看它）
+```bash
+$BASE --allow-fetch --scenario s2
+```
 
-配置：
+## 7. 台账、对账与复盘
+
+### 7.1 交易台账
+
+典型配置：
 
 ```env
 TRADE_JOURNAL_ENABLED=1
@@ -358,67 +351,48 @@ TRADE_ORDER_LINK_ENABLED=1
 TRADE_ORDER_LINK_PATH=/home/dandan/Workspace/test/okx_trade_suite/trade_journal_order_links.csv
 ```
 
-查看：
+主要字段包括：`event_type`、`trade_id`、`inst_id`、`side`、`size`、`entry_price`、`exit_price`、`reason`、`pnl_usdt`、`profile_id`、`strategy_variant`、`vote_*`。
+
+订单关联台账额外会记录：`entry_ord_id`、`entry_cl_ord_id`、`event_ord_id`、`event_cl_ord_id`。
+
+### 7.2 交易所账单对账
+
+用于核算“真实净收益（含手续费 / 资金费）”：
 
 ```bash
-tail -f /home/dandan/Workspace/test/okx_trade_suite/trade_journal.csv
-tail -f /home/dandan/Workspace/test/okx_trade_suite/trade_journal_order_links.csv
-```
-
-字段包含：`event_type`、`trade_id`、`inst_id`、`side`、`size`、`entry_price`、`exit_price`、`reason`、`pnl_usdt`、`profile_id`、`strategy_variant`、`vote_*` 等。
-订单关联台账额外包含：`entry_ord_id`、`entry_cl_ord_id`、`event_ord_id`、`event_cl_ord_id`。
-
-实盘“净收益”对账（含手续费/资金费）：
-
-```bash
-cd /home/dandan/Workspace/test/okx_trade_suite
+cd "$ROOT"
 NOW_UTC="$(date -u '+%Y-%m-%d %H:%M:%S')"
 
 python3 reconcile_okx_bills.py \
-  --env /home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env \
+  --env "$ROOT/okx_auto_trader.env" \
   --start "2026-02-22 00:00:00" \
   --end "$NOW_UTC" \
   --trade-filter-mode merge \
   --trade-clord-prefix AT \
-  --order-link-path /home/dandan/Workspace/test/okx_trade_suite/trade_journal_order_links.csv \
+  --order-link-path "$ROOT/trade_journal_order_links.csv" \
   --show-trade-ids 20 \
-  --dump-trade-id-csv /home/dandan/Workspace/test/okx_trade_suite/logs/trade_id_reconcile.csv \
+  --dump-trade-id-csv "$ROOT/logs/trade_id_reconcile.csv" \
   --funding-scope matched-trade-inst
 ```
 
-说明：
-- `trade_net = sum(pnl + fee)`（type=2，支持 `clOrdId` 前缀 + 订单关联台账双重过滤）
-- `funding_net = sum(balChg)`（type=8，默认只统计“脚本实际交易过的币种”）
+核心口径：
+
+- `trade_net = sum(pnl + fee)`
+- `funding_net = sum(balChg)`
 - `recommended_net = trade_net + funding_net`
-- `raw_balChg_all` 仅作账户流水参考，不能直接当策略净收益（会混入逐仓保证金进出）
-- `--show-trade-ids` 会打印按 `trade_id` 聚合后的 top/bottom（`bill_net`、`journal_pnl`、delta）。
-- `--dump-trade-id-csv` 会导出逐 `trade_id` 对账明细，便于月度复盘。
 
-## 9. 每日复盘（自动化）
+### 7.3 每日复盘
 
-手动生成今日复盘（默认 `+08:00`）：
+**手动日报**
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh
+"$ROOT/scripts/ops/run_daily_recap.sh"
 ```
 
-口径说明（重要）：
-- `run_daily_recap.sh` 默认主口径为 `exchange_first`（交易所 `positions-history` 优先）。
-- 当交易所口径可用时，平仓胜负/连亏/净收益主摘要以交易所为准；台账口径仍保留用于辅助排查。
-- 可手动切回：`--primary-source journal` 或 `--primary-source bills_auto`。
-
-指定日期复盘：
+**过去 24h 滚动窗口（推荐给 07:00 定时报）**
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh \
-  --date 2026-02-23 \
-  --tz-offset +08:00
-```
-
-按“过去 24 小时滚动窗口”复盘（推荐用于 07:00 定时报）：
-
-```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh \
+"$ROOT/scripts/ops/run_daily_recap.sh" \
   --rolling-hours 24 \
   --primary-source exchange_first \
   --with-bills \
@@ -427,57 +401,36 @@ python3 reconcile_okx_bills.py \
   --telegram
 ```
 
-附带账单对账（含手续费/资金费）：
+**常见附加项**
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh --with-bills
+# 指定日期
+"$ROOT/scripts/ops/run_daily_recap.sh" --date 2026-02-23 --tz-offset +08:00
+
+# 附带账单对账
+"$ROOT/scripts/ops/run_daily_recap.sh" --with-bills
+
+# 附带交易所已平仓历史
+"$ROOT/scripts/ops/run_daily_recap.sh" --with-exchange-history
+
+# 附带当前权益
+"$ROOT/scripts/ops/run_daily_recap.sh" --with-equity
 ```
 
-对账质量硬指标（默认已启用）：
-- `unmapped_ratio > 35%`：净收益口径自动回退到 `journal`（避免账单映射不完整时误判）。
-- `selected_trade_rows >= 20` 且 `unmapped_ratio >= 50%`：标记 `ALERT`，在日报/TG/rollup 明确提示。
-- 可通过参数覆盖：
+**日报输出位置**
+
+- `logs/daily_recap/YYYY-MM-DD.md`
+- `logs/daily_recap/YYYY-MM-DD.json`
+- `logs/daily_recap/index.log`
+
+**安装 cron**
 
 ```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh \
-  --with-bills \
-  --bills-unmapped-max-ratio 0.35 \
-  --bills-alert-unmapped-ratio 0.50 \
-  --bills-alert-min-selected 20
-```
+# 每天 00:10
+"$ROOT/scripts/ops/setup_daily_recap_cron.sh" --time 00:10
 
-附带交易所已平仓历史口径（用于核对“连亏笔数”）：
-
-```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh --with-exchange-history
-```
-
-附带当前账户权益（用于“本金还有多少”）：
-
-```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_daily_recap.sh --with-equity
-```
-
-默认输出位置：
-- `logs/daily_recap/YYYY-MM-DD.md`（日报）
-- `logs/daily_recap/YYYY-MM-DD.json`（结构化结果）
-- `logs/daily_recap/index.log`（每日一行滚动摘要）
-
-日报新增“批次/并发风险”统计：
-- 批次按 `signal_ts + side` 聚合（用于观察“同一批开仓”的连胜/连败），并输出批次级当前/最大连亏。
-- 同向并发输出 `max_long/max_short/max_same_side`（用于观察相关币同时同向持仓拥挤度）。
-- `batch_pnl` 仅统计“窗口内 OPEN 的批次”最终平仓结果；与 `journal close` 口径不同属正常。
-
-安装每天定时任务（默认每天 `00:10`）：
-
-```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/setup_daily_recap_cron.sh --time 00:10
-```
-
-安装“每天 07:00 推送过去 24h 汇总到 Telegram”（含账单净值、交易所口径和权益）：
-
-```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/setup_daily_recap_cron.sh \
+# 每天 07:00 推送过去 24h 到 Telegram
+"$ROOT/scripts/ops/setup_daily_recap_cron.sh" \
   --time 07:00 \
   --rolling-hours 24 \
   --with-bills \
@@ -486,51 +439,25 @@ python3 reconcile_okx_bills.py \
   --telegram
 ```
 
-如你只想保留“日报 TG”，关闭“开仓执行 TG”，在 `okx_auto_trader.env` 设置：
-
-```env
-ALERT_TG_ENABLED=1
-ALERT_TG_TRADE_EXEC_ENABLED=0
-```
-
-安装后可检查：
+### 7.4 每周复盘
 
 ```bash
-crontab -l | grep OKX_DAILY_RECAP
-```
-
-如只想先看要写入的 cron 行，不立即安装：
-
-```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/setup_daily_recap_cron.sh --print-only
-```
-
-## 10. 每周复盘（自动化）
-
-手动生成过去 7 天周报（滚动 168h）：
-
-```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_weekly_recap.sh \
+# 手动生成过去 7 天周报
+"$ROOT/scripts/ops/run_weekly_recap.sh" \
   --primary-source exchange_first \
   --with-bills \
   --with-exchange-history \
   --with-equity
-```
 
-周报推送到 Telegram：
-
-```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/run_weekly_recap.sh \
+# 推送到 Telegram
+"$ROOT/scripts/ops/run_weekly_recap.sh" \
   --with-bills \
   --with-exchange-history \
   --with-equity \
   --telegram
-```
 
-安装每周定时任务（默认每周一 07:05）：
-
-```bash
-/home/dandan/Workspace/test/okx_trade_suite/scripts/ops/setup_weekly_recap_cron.sh \
+# 安装每周一 07:05 cron
+"$ROOT/scripts/ops/setup_weekly_recap_cron.sh" \
   --time 07:05 \
   --dow 1 \
   --with-bills \
@@ -540,146 +467,36 @@ crontab -l | grep OKX_DAILY_RECAP
 ```
 
 周报输出位置：
+
 - `logs/weekly_recap/YYYY-MM-DD.md`
 - `logs/weekly_recap/YYYY-MM-DD.json`
 - `logs/weekly_recap/index.log`
 
-检查安装结果：
+## 8. 开发与自检
+
+### 8.1 单元测试
 
 ```bash
-crontab -l | grep OKX_WEEKLY_RECAP
+cd "$ROOT"
+python3 -m unittest discover -s tests -p "test_*.py"
 ```
 
-## 11. 重大更新记录（持续维护）
+### 8.2 pre-commit
 
-> 约定：每次“影响实盘行为、风控、仓位或回测口径”的更新，都要在这里追加一条。
-
-### 2026-02-21
-
-- 新增 `range_reversion_v1` 策略插件（区间支撑阻力均值回归，含 L1/L2/L3 分级）。
-- 新增同币多策略投票执行（含 `any/majority/unanimous`）。
-- 新增投票加权机制（`STRAT_PROFILE_VOTE_SCORE_MAP` + `STRAT_PROFILE_VOTE_LEVEL_WEIGHT`）。
-- 新增交易台账 `trade_journal.csv`（开仓/部分平仓/平仓/外部平仓事件）。
-- 新增“连续无开仓超时提醒”（`ALERT_NO_OPEN_HOURS` / `ALERT_NO_OPEN_COOLDOWN_HOURS`，支持 Telegram）。
-- 启动日志新增投票配置与台账配置展示，便于排查运行参数。
-- 重构策略变体层：`okx_trader/strategy_variant.py` 改为“注册/分发层”，原实现迁移至 `okx_trader/strategy_variant_legacy.py`，实盘逻辑不变（已做回归验证）。
-- 策略调用入口统一为 `VariantSignalInputs` 上下文对象（`strategy_contract.py`），`signals/backtest` 已接入，便于后续扩展多策略且不改行为。
-- 新增下单 `clOrdId` 生成与幂等恢复（遇到重复 `clOrdId` 自动查询并复用已有订单）。
-- 新增主进程单实例锁（防止重复启动多个实盘脚本）。
-- 新增最小回归测试集（策略分发、投票逻辑、单实例锁、订单号规则）。
-- 扩展最小回归测试集（Managed Exit 行为、OKX API 重试与 `clOrdId` 幂等恢复）。
-- 新增策略插件目录 `okx_trader/strategies/`（自动发现并注册，便于后续批量扩展策略）。
-- 运行时拆层：`runtime.py` 保留调度，`run_once_for_inst` 已迁移到独立模块，后续新增策略与风控逻辑更易维护。
-- 配置层新增“策略分组写法”：`STRAT_PROFILE_INST_GROUPS` 与 `STRAT_PROFILE_VOTE_INST_GROUPS`（并保持旧 `..._MAP` 兼容，且旧写法优先）。
-- 新增 `check_recent_signals_strict.py`：严格最近 N 小时信号检查（共同终点窗口、`raw` vs `decision` 分层统计、可选实时拉取）。
-
-### 2026-02-22
-
-- 实盘管理新增“私有 WS 快速通道”：订阅 `positions` 后，TP1 成交可不等 15m 收线，尽快推进剩余仓位保本止损。
-- 新增 WS 相关配置：`OKX_WS_TP1_BE_ENABLED`、`OKX_WS_PRIVATE_URL`、`OKX_WS_RECONNECT_SECONDS`。
-- 新增 `amend-order` 失败回退 `amend-algos`，提高“修改交易所止损”成功率（典型处理母单已完成/取消场景）。
-- 修复拆分下单场景的 TP1->BE 止损推进稳定性：开仓时为附带 TP/SL 预写 `attachAlgoClOrdId` 并持久化到运行态，避免后续误改“已成交主单”触发 `51503`。
-- 日亏风控升级为“预计亏损预算”：
-  - 开仓前校验 `已实现亏损 + 当前持仓潜在亏损 + 新单潜在亏损 <= 日亏上限`，
-  - 不再仅依赖“亏损发生后”才熔断，避免同一时刻过多风险暴露。
-- 2Y 组合回测同步同口径风控（projected loss guard），减少实盘/回测偏差。
-- 新增最小回归测试：`tests/test_ws_tp1_be.py`、`tests/test_projected_open_risk.py`。
-
-### 2026-02-23
-
-- `scripts/backtest/run_backtest_2y_cached.sh` 新增回测快照功能：
-  - `--save-tag`：自动保存本次回测日志、交易CSV并写入 `logs/backtest_snapshots/index.csv`。
-  - `--save-dir`：可自定义快照目录。
-
-### 2026-02-24
-
-- 新增周报自动化脚本：
-  - `scripts/ops/run_weekly_recap.sh`（默认 168h 滚动窗口）
-  - `scripts/ops/setup_weekly_recap_cron.sh`（默认周一 07:05）
-- 周报输出与日报分离到 `logs/weekly_recap/`。
-- `daily_recap.py` 新增“账单映射质量硬指标”：
-  - 输出 `bills_quality`（`ok/warn/alert`）到日报、rollup、TG 摘要；
-  - `unmapped_ratio > 35%` 时自动回退 `journal` 口径；
-  - 样本量足够且 `unmapped_ratio >= 50%` 时触发 `ALERT` 提示。
-- `scripts/ops/run_daily_recap.sh` 新增参数：
-  - `--bills-unmapped-max-ratio`
-  - `--bills-alert-unmapped-ratio`
-  - `--bills-alert-min-selected`
-- `logs/backtest_snapshots/index.csv` 自动记录关键摘要和 `payoff_r` / `profit_factor_r`，便于横向比较经典结果。
-- 复盘链路增强：
-  - 新增 `trade_journal_order_links.csv`，按 `trade_id` 记录开平仓事件关联的 `ordId/clOrdId`。
-  - 执行层平仓事件补写订单回执，便于后续按订单ID做净值核算。
-  - `reconcile_okx_bills.py` 新增 `--trade-filter-mode`（`prefix/order-link/merge/none`）与 `--order-link-path`，对账可直接结合订单关联台账。
-- 新增每日复盘工具链：
-  - `daily_recap.py`：按日期/滚动窗口汇总 `trade_journal.csv` + `runtime.log`，输出胜负统计、原因分布、连亏/连赢与运行健康指标。
-  - `scripts/ops/run_daily_recap.sh`：一键生成日报（支持 `--rolling-hours` / `--with-bills` / `--with-exchange-history` / `--with-equity` / `--telegram`）。
-  - `scripts/ops/setup_daily_recap_cron.sh`：一键安装 cron 定时任务。
-- Telegram 通道拆分：
-  - 新增 `ALERT_TG_TRADE_EXEC_ENABLED`，可只关闭“开仓执行”消息，不影响日报 Telegram 推送。
-- 日报增强：
-  - 支持 `--rolling-hours`（如 24h 滚动窗口）和 `--with-equity`（带当前账户权益）。
-  - `--telegram` 内容升级为 24h 汇总（开仓次数、胜负、净收益、当前权益/基准本金）。
-- 修复拆分双腿场景的外部平仓台账：
-  - 以“未结清仓位(open_size-realized_size)”计算最终 EXTERNAL_CLOSE 尺寸，避免“只记录半仓/漏记”。
-  - 平仓时引入 `positions-history` 对齐（同币种/方向/时间窗），优先使用交易所实际 `closeAvgPx/realizedPnl` 兜底。
-
-### 2026-02-26
-
-- `daily_recap.py` 新增“批次级风控画像”：
-  - 按 `signal_ts + side` 聚合开仓批次，输出批次胜负、批次连亏/连赢、最大批次亏损/盈利。
-  - 追加同向并发统计（`max_long/max_short/max_same_side/max_total`）及峰值时刻币种清单。
-- 日报 Markdown / Telegram / rollup 一并输出批次连亏与同向并发峰值，便于快速判断“连败是否批次相关”。
-- 单测新增覆盖：批次统计与“窗口前已开仓”并发计数，避免回归。
-
-### 2026-02-27
-
-- 新增“入场执行模式”：
-  - 实盘支持 `market / limit / auto`（`STRAT_ENTRY_EXEC_MODE`）。
-  - `auto` 可按等级阈值切分：低等级优先限价，高等级直接市价（`STRAT_ENTRY_AUTO_MARKET_LEVEL_MIN`）。
-  - 新增限价行为参数：`STRAT_ENTRY_LIMIT_OFFSET_BPS`、`STRAT_ENTRY_LIMIT_TTL_SEC`、`STRAT_ENTRY_LIMIT_POLL_MS`、`STRAT_ENTRY_LIMIT_REPRICE_MAX`、`STRAT_ENTRY_LIMIT_FALLBACK_MODE`。
-- 新增“限价取消后状态复核”安全保护：
-  - 若取消未确认且订单仍 `live/partially_filled`，阻断 fallback 市价，避免重复补单导致过量开仓。
-- 2Y 组合回测同步新增入场执行口径：
-  - 支持 `--entry-exec-mode` 及相关参数；
-  - 输出 `entry_modes`（market/limit/fallback）分布，便于对比与参数调优。
-- 日报增强：
-  - 从 runtime 日志解析 `entry_exec=`，新增入场执行统计（market/limit/fallback 比例）。
-- 近期实盘推荐默认（当前 env）：
-  - `auto + L3市价`，`limit_ttl=5s`，`reprice=0`，`fallback=market`。
-- 新增“进阶版”分级执行覆盖：
-  - 可按 `L1/L2/L3` 单独指定 `exec_mode / limit_ttl / fallback_mode`；
-  - 典型用法：`L1=market`、`L2=limit(2s后market)`、`L3=limit(4~5s后skip)`。
-- 新增实验策略 `xau_sibi_v1`（SIBI/FVG 回踩做空，含 strict/soft 失衡区近似与 one-touch 约束）：
-  - 仅用于回测实验，未加入当前实盘配置。
-  - 关键快照（S3, risk=0.4%）：
-    - `xau_only_s3_r004_classic`: `final=1032.96`, `avgR=0.036`
-    - `xau_only_s3_r004_sibi_relax2`: `final=889.39`, `avgR=-0.364`
-    - `full_s3_r004_xau_sibi_relax2`: `final=31406.56`（基线 `baseline_s3_r004_rightrev_cmp` 为 `35962.14`）
-  - 结论：当前参数下收益劣于 `XAU classic`，暂不启用到实盘，仅保留代码与快照作为历史研究记录。
-
-### 2026-02-28
-
-- 2Y 组合回测交易明细 CSV 增强（`run_interleaved_backtest_2y.py`）：
-  - 新增导出字段：`entry_px`、`stop_px`、`tp1_px`、`tp2_px`、`risk_px`，便于后续做“止损后路径/触发质量”复盘分析。
-- 新增实时执行优化开关（默认关闭，保持旧行为）：
-  - `OKX_FAST_LTF_GATE=1` 时，先只检查 `LTF` 是否有新收线；仅在有新收线时才拉取 `HTF/LOC` 并计算信号/执行。
-  - 目标：降低多币种串行轮询时的 REST 压力与空转延迟，不改变策略/风控/下单逻辑。
-- 入场执行 `auto` 模式新增反向阈值：
-  - 新增 `STRAT_ENTRY_AUTO_MARKET_LEVEL_MAX` / `--entry-auto-market-level-max`（`1~3`）；
-  - 当该值>0时，`auto` 按“`level <= max` 走市价，否则走限价”决策（优先于 `..._MIN`），支持 `L1/L2` 市价、`L3` 限价。
-- 日报/周报摘要增强（`daily_recap.py`，周报复用 rolling_168h）：
-  - 顶部与 Telegram 摘要新增入场执行统计：`limit_fill` / `fallback_market` 及 `limit_fill_rate` / `fb_rate`。
-  - `index.log` 一行汇总新增 `entry_legs`、`entry_fb`、`entry_limfill`，便于长期跟踪限价回退率。
-- 实盘风险系数更新（当前 env）：
-  - `STRAT_RISK_FRAC` 调整为 `0.58%`（即 `risk_frac=0.0058`），并已重启实盘进程生效。
-
-## 12. 后续更新模板（复制追加）
-
-```md
-### YYYY-MM-DD
-
-- [新增] ...
-- [变更] ...
-- [修复] ...
-- [注意] 对实盘/回测口径的影响：...
+```bash
+cd "$ROOT"
+python3 -m pip install --user pre-commit
+pre-commit install
+pre-commit run --all-files
 ```
+
+当前本地钩子主要检查：
+
+- `secret-scan (local)`：扫描疑似密钥。
+- `py-compile-staged (local)`：编译检查已变更的 Python 文件。
+
+## 9. 相关文档
+
+- `okx_trader/README.md`：模块职责与实现说明。
+- `CHANGELOG.md`：历史更新记录与模板。
+- `scripts/README.md`：脚本层目录说明。
