@@ -162,6 +162,68 @@ def _managed_target_px(trade: Dict[str, Any], stage: str) -> float:
     return _safe_float(trade.get(f"managed_{stage_norm}_target_px", trade.get(f"exchange_{stage_norm}_px", 0.0)), 0.0)
 
 
+def _managed_live_size(trade: Dict[str, Any]) -> float:
+    return max(0.0, _safe_float(trade.get("remaining_size", trade.get("open_size", 0.0)), 0.0))
+
+
+def _managed_size_tolerance(client: OKXClient, inst_id: str, basis: float = 0.0) -> float:
+    lot_sz = 0.0
+    try:
+        info = client.get_instrument(inst_id)
+        lot_sz = _safe_float(info.get("lotSz", 0.0), 0.0)
+    except Exception:
+        lot_sz = 0.0
+    return max((lot_sz * 0.5) if lot_sz > 0 else 0.0, abs(float(basis or 0.0)) * 1e-6, 1e-9)
+
+
+def _normalize_reduce_only_size(client: OKXClient, inst_id: str, size: float) -> float:
+    qty = max(0.0, float(size or 0.0))
+    if qty <= 0:
+        return 0.0
+    try:
+        normalized, _ = client.normalize_order_size(inst_id, qty, reduce_only=True)
+        return max(0.0, float(normalized or 0.0))
+    except Exception:
+        return qty
+
+
+def _resolve_managed_target_size(
+    *,
+    cfg: Config,
+    client: OKXClient,
+    inst_id: str,
+    trade: Dict[str, Any],
+    stage: str,
+) -> tuple[float, bool]:
+    stage_norm = str(stage or "").strip().lower()
+    target_size = max(0.0, float(_managed_target_size(trade, stage_norm) or 0.0))
+    current_size = _managed_live_size(trade)
+    if current_size <= 0:
+        return target_size, False
+
+    tol = _managed_size_tolerance(client, inst_id, basis=max(target_size, current_size))
+    corrected_size = target_size
+    if stage_norm == "tp1":
+        tp1_pct = min(max(_safe_float(getattr(cfg.params, "tp1_close_pct", 0.0), 0.0), 0.0), 1.0)
+        split_target = 0.0
+        if 0.0 < tp1_pct < 1.0:
+            split_target = _normalize_reduce_only_size(client, inst_id, current_size * tp1_pct)
+            if split_target >= current_size - tol:
+                split_target = 0.0
+        if split_target > 0:
+            corrected_size = split_target
+        elif corrected_size <= 0 or corrected_size > current_size + tol:
+            corrected_size = min(current_size, corrected_size if corrected_size > 0 else current_size)
+    else:
+        if corrected_size <= 0 or corrected_size > current_size + tol:
+            corrected_size = current_size
+        corrected_size = min(corrected_size, current_size)
+
+    corrected_size = _normalize_reduce_only_size(client, inst_id, corrected_size)
+    changed = abs(corrected_size - target_size) > tol
+    return corrected_size, changed
+
+
 def _ensure_managed_tp_limit_order(
     *,
     cfg: Config,
@@ -191,9 +253,38 @@ def _ensure_managed_tp_limit_order(
     if target_px <= 0:
         return False, f"invalid_{stage_norm}_px"
 
-    target_size = _managed_target_size(trade, stage_norm)
+    target_size, target_size_corrected = _resolve_managed_target_size(
+        cfg=cfg,
+        client=client,
+        inst_id=inst_id,
+        trade=trade,
+        stage=stage_norm,
+    )
     if target_size <= 0:
         return False, "no_remaining_size" if stage_norm == "tp2" else f"invalid_{stage_norm}_size"
+    stored_target_size = max(
+        0.0,
+        float(trade.get(f"managed_{stage_norm}_target_size", trade.get(f"exchange_{stage_norm}_size", 0.0)) or 0.0),
+    )
+    size_sync_needed = abs(stored_target_size - target_size) > _managed_size_tolerance(
+        client,
+        inst_id,
+        basis=max(stored_target_size, target_size),
+    )
+    if target_size_corrected or size_sync_needed:
+        prev_target_size = stored_target_size
+        current_size = _managed_live_size(trade)
+        trade[f"managed_{stage_norm}_target_size"] = float(target_size)
+        trade[f"exchange_{stage_norm}_size"] = float(target_size)
+        if stage_norm == "tp1" and bool(trade.get("managed_tp2_enabled", False)) and current_size > target_size:
+            rem_size = _normalize_reduce_only_size(client, inst_id, current_size - target_size)
+            if rem_size > 0:
+                trade["managed_tp2_target_size"] = float(rem_size)
+                trade["exchange_tp2_size"] = float(rem_size)
+        log(
+            f"[{inst_id}] Managed {stage_norm.upper()} size corrected: "
+            f"target={round_size(prev_target_size)} -> {round_size(target_size)} live_pos={round_size(current_size)}"
+        )
 
     ord_id = str(trade.get(f"managed_{stage_norm}_ord_id", "") or "").strip()
     cl_ord_id = str(trade.get(f"managed_{stage_norm}_cl_ord_id", "") or "").strip()

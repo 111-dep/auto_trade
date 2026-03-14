@@ -1709,6 +1709,38 @@ class BinanceUMClient:
             return {}
         return dict(rows[0])
 
+    def cancel_pending_stop_loss_orders(
+        self,
+        *,
+        inst_id: str,
+        side: str = "",
+        max_cancel: int = 20,
+    ) -> int:
+        limit = int(max(0, max_cancel))
+        if limit <= 0:
+            return 0
+        rows = self.list_pending_stop_loss_orders(inst_id=inst_id, side=side)
+        canceled = 0
+        for row in rows:
+            if canceled >= limit:
+                break
+            row_algo_id = str(row.get("attachAlgoId", row.get("ordId", "")) or "").strip()
+            row_algo_cl_id = str(row.get("attachAlgoClOrdId", row.get("clOrdId", "")) or "").strip()
+            try:
+                if self._private_api_mode() == "papi":
+                    self._cancel_papi_conditional_order(
+                        inst_id=inst_id,
+                        strategy_id=row_algo_id,
+                        client_strategy_id=row_algo_cl_id,
+                    )
+                else:
+                    self.cancel_order(inst_id=inst_id, ord_id=row_algo_id, cl_ord_id=row_algo_cl_id)
+            except Exception as e:
+                log(f"[{inst_id}] Binance pending stop cleanup warning: {e}", level="WARN")
+                break
+            canceled += 1
+        return canceled
+
     def cleanup_pending_stop_loss_orders(
         self,
         *,

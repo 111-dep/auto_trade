@@ -683,6 +683,50 @@ class BinanceConfigAndClientTests(unittest.TestCase):
         post_params = calls[-1][2] or {}
         self.assertEqual(post_params.get("quantity"), "0.5")
 
+    def test_cancel_pending_stop_loss_orders_cancels_single_live_stop(self) -> None:
+        cfg = self._build_cfg({"BINANCE_PRIVATE_API_MODE": "papi", "OKX_DRY_RUN": "0"})
+        client = BinanceUMClient(cfg)
+        client._binance_private_api_mode = "papi"
+        self._prime_btc_usdc(client)
+        calls: list[tuple[str, str, dict[str, str] | None]] = []
+
+        def fake_request(method: str, path: str, params=None, *, signed: bool = False, base_url: str = ""):
+            calls.append((method, path, dict(params or {})))
+            if (method, path) == ("GET", "/papi/v1/um/conditional/openOrders"):
+                return [
+                    {
+                        "strategyId": 101,
+                        "newClientStrategyId": "sl-live",
+                        "strategyStatus": "NEW",
+                        "strategyType": "STOP_MARKET",
+                        "side": "SELL",
+                        "stopPrice": "95",
+                        "origQty": "0.5",
+                        "reduceOnly": True,
+                    }
+                ]
+            if (method, path) == ("DELETE", "/papi/v1/um/conditional/order"):
+                return {
+                    "strategyId": params.get("strategyId", "101"),
+                    "newClientStrategyId": params.get("newClientStrategyId", "sl-live"),
+                    "strategyStatus": "CANCELED",
+                    "side": "SELL",
+                    "stopPrice": "95",
+                }
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+        with patch.object(client, "_request", side_effect=fake_request):
+            canceled = client.cancel_pending_stop_loss_orders(
+                inst_id="BTC-USDT-SWAP",
+                side="long",
+                max_cancel=4,
+            )
+
+        self.assertEqual(canceled, 1)
+        delete_calls = [item for item in calls if item[1] == "/papi/v1/um/conditional/order"]
+        self.assertEqual(len(delete_calls), 1)
+        self.assertEqual((delete_calls[0][2] or {}).get("strategyId"), "101")
+
     def test_cleanup_pending_stop_loss_orders_keeps_best_and_cancels_one_extra(self) -> None:
         cfg = self._build_cfg({"BINANCE_PRIVATE_API_MODE": "papi", "OKX_DRY_RUN": "0"})
         client = BinanceUMClient(cfg)

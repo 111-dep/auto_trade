@@ -152,6 +152,21 @@ def execute_decision(
             return s
         return ""
 
+    def cleanup_flat_pending_stops(prev_side: str, *, reason: str) -> None:
+        cleanup_stop_fn = getattr(client, "cancel_pending_stop_loss_orders", None)
+        if not callable(cleanup_stop_fn):
+            return
+        side_txt = _side_key(prev_side)
+        try:
+            canceled = int(cleanup_stop_fn(inst_id=inst_id, side=side_txt, max_cancel=8) or 0)
+        except Exception as e:
+            log(f"[{inst_id}] Pending stop cleanup warning ({reason}): {e}", level="WARN")
+            return
+        if canceled > 0:
+            log(
+                f"[{inst_id}] Pending stop cleanup: canceled={canceled} side={side_txt or 'all'} reason={reason}"
+            )
+
     def _stop_guard_root() -> Dict[str, Any]:
         root = state.get("stop_guard")
         if not isinstance(root, dict):
@@ -1134,6 +1149,36 @@ def execute_decision(
             return None
         return float(tp1_size), float(tp2_size)
 
+    def rebase_entry_attach_meta(actual_size: float, meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        out = dict(meta or {})
+        actual_open_size = max(0.0, float(actual_size or 0.0))
+        if actual_open_size <= 0 or not out:
+            return out
+        if not (
+            bool(out.get("exchange_split_tp_enabled", False))
+            or bool(out.get("managed_tp1_enabled", False))
+            or bool(out.get("managed_tp2_enabled", False))
+        ):
+            return out
+        leg_sizes = calc_split_entry_sizes(actual_open_size)
+        if not leg_sizes:
+            return out
+        tp1_size, tp2_size = leg_sizes
+        prev_tp1 = float(out.get("exchange_tp1_size", 0.0) or 0.0)
+        prev_tp2 = float(out.get("exchange_tp2_size", 0.0) or 0.0)
+        out["exchange_tp1_size"] = float(tp1_size)
+        out["exchange_tp2_size"] = float(tp2_size)
+        if bool(out.get("managed_tp1_enabled", False)):
+            out["managed_tp1_target_size"] = float(tp1_size)
+        if bool(out.get("managed_tp2_enabled", False)):
+            out["managed_tp2_target_size"] = float(tp2_size)
+        if abs(prev_tp1 - float(tp1_size)) > 1e-9 or abs(prev_tp2 - float(tp2_size)) > 1e-9:
+            log(
+                f"[{inst_id}] Entry TP sizes rebased to actual fill: open={round_size(actual_open_size)} "
+                f"tp1={round_size(tp1_size)} tp2={round_size(tp2_size)}"
+            )
+        return out
+
     def extract_order_meta(order_resp: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         if not isinstance(order_resp, dict):
@@ -1660,6 +1705,7 @@ def execute_decision(
         nonlocal entry_order_meta, entry_order_resp
         side_upper = "LONG" if entry_side == "long" else "SHORT"
         mark_open_entry()
+        meta = rebase_entry_attach_meta(opened_size, meta)
         entry_order_meta = dict(meta)
         entry_order_meta["planned_stop"] = float(planned_stop)
         entry_order_resp = resp
@@ -2133,6 +2179,7 @@ def execute_decision(
 
     if pos.side == "flat":
         prev_trade = state.get("trade") if isinstance(state.get("trade"), dict) else None
+        prev_side = ""
         if is_script_trade_state(prev_trade):
             prev_side = str(prev_trade.get("side", "")).strip().lower()
             try:
@@ -2229,7 +2276,8 @@ def execute_decision(
                     is_stop_event=bool(stop_hit),
                     reason="external_close_or_attached_tpsl",
                 )
-        clear_trade_state()
+        cleanup_flat_pending_stops(prev_side, reason="pos_flat")
+        clear_trade_state(reason="pos_flat")
         if exec_long_entry:
             opened_size = open_long()
             if opened_size > 0:
