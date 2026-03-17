@@ -521,6 +521,8 @@ def execute_decision(
         direction = str(side or "").strip().lower()
         if direction not in {"long", "short"}:
             return None
+        if str(getattr(cfg, "exchange_provider", "okx") or "okx").strip().lower() != "okx":
+            return None
         try:
             payload = client._request(
                 "GET",

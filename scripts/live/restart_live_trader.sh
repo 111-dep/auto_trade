@@ -215,12 +215,19 @@ start_trader() {
 
   mkdir -p "$(dirname "${LOG_FILE}")"
   echo "Starting trader..."
+
+  local -a start_cmd
   if [[ -n "${TG_TRADE_EXEC_OVERRIDE}" ]]; then
     echo "Start override: ALERT_TG_TRADE_EXEC_ENABLED=${TG_TRADE_EXEC_OVERRIDE}"
-    nohup env "ALERT_TG_TRADE_EXEC_ENABLED=${TG_TRADE_EXEC_OVERRIDE}" \
-      python3 -u "${TRADER}" --env "${ENV_FILE}" > "${LOG_FILE}" 2>&1 &
+    start_cmd=(env "ALERT_TG_TRADE_EXEC_ENABLED=${TG_TRADE_EXEC_OVERRIDE}" python3 -u "${TRADER}" --env "${ENV_FILE}")
   else
-    nohup python3 -u "${TRADER}" --env "${ENV_FILE}" > "${LOG_FILE}" 2>&1 &
+    start_cmd=(python3 -u "${TRADER}" --env "${ENV_FILE}")
+  fi
+
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup "${start_cmd[@]}" > "${LOG_FILE}" 2>&1 < /dev/null &
+  else
+    nohup "${start_cmd[@]}" > "${LOG_FILE}" 2>&1 < /dev/null &
   fi
   local new_pid=$!
   sleep 1
