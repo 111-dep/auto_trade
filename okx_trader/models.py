@@ -61,6 +61,7 @@ class StrategyParams:
     be_trigger_r_mult: float
     be_offset_pct: float
     be_fee_buffer_pct: float
+    auto_tighten_stop: bool
     trail_atr_mult: float
     trail_after_tp1: bool
     max_open_entries: int

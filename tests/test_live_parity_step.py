@@ -20,6 +20,7 @@ def _params() -> SimpleNamespace:
         be_trigger_r_mult=1.0,
         be_offset_pct=0.0,
         be_fee_buffer_pct=0.0,
+        auto_tighten_stop=True,
         trail_after_tp1=True,
         trail_atr_mult=1.5,
     )
@@ -54,6 +55,40 @@ class LiveParityStepTests(unittest.TestCase):
         self.assertAlmostEqual(out["short_stop"], 105.0, places=6)
         self.assertTrue(out["short_exit"] is False)
         self.assertTrue(out["long_exit"] is True)
+
+    def test_disable_auto_tighten_stop_keeps_live_position_open_before_tp1(self) -> None:
+        params = _params()
+        params.auto_tighten_stop = False
+        long_decision = EntryDecision(
+            side="LONG",
+            level=2,
+            entry=100.0,
+            stop=95.0,
+            risk=5.0,
+            tp1=107.5,
+            tp2=112.5,
+        )
+        pos = _new_sim_position(decision=long_decision, entry_ts=1, entry_i=1, risk_amt=10.0)
+
+        res = _simulate_live_position_step(
+            pos=pos,
+            sig={
+                "close": 101.0,
+                "high": 101.0,
+                "low": 99.5,
+                "atr": 1.0,
+                "long_stop": 102.0,
+                "short_stop": 98.0,
+                "long_exit": False,
+                "short_exit": False,
+            },
+            params=params,
+            decision=None,
+            allow_reverse=False,
+            managed_exit=True,
+        )
+        self.assertFalse(res["closed"])
+        self.assertAlmostEqual(pos["hard_stop"], 95.0, places=6)
 
     def test_swapped_reverse_long_take_hits_one_r(self) -> None:
         params = _params()

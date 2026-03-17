@@ -279,6 +279,7 @@ def main() -> int:
             f"daily_loss_mode={cfg.params.daily_loss_base_mode} "
             f"tp2_close_rest={cfg.params.tp2_close_rest} "
             f"be_fee_buf={cfg.params.be_fee_buffer_pct} "
+            f"auto_tighten_stop={cfg.params.auto_tighten_stop} "
             f"stop_cooldown={cfg.params.stop_reentry_cooldown_minutes}m "
             f"stop_freeze={cfg.params.stop_streak_freeze_count}/{cfg.params.stop_streak_freeze_hours}h "
             f"stop_l2_only={cfg.params.stop_streak_l2_only} "

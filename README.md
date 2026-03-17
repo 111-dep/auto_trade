@@ -207,6 +207,7 @@ tail -f "$ROOT/trade_journal_order_links.csv"
 - `STRAT_ENABLE_CLOSE`：是否允许脚本主动平仓。
 - `STRAT_SIGNAL_EXIT_ENABLED`：是否允许信号失效提前平仓。
 - `STRAT_SPLIT_TP_ON_ENTRY`：优先尝试交易所原生 TP1/TP2；不支持时自动 fallback 到脚本管理 TP1/TP2。
+- `STRAT_MGMT_AUTO_TIGHTEN_STOP`：是否启用自动收紧止损；关闭后仅保留 `TP1 -> 保本`。
 - `OKX_WS_TP1_BE_ENABLED`：OKX 私有 WS 快速管理开关。
 - `OKX_WS_PRIVATE_URL`、`OKX_WS_RECONNECT_SECONDS`：私有 WS 连接参数。
 

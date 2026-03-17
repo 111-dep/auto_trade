@@ -64,6 +64,7 @@ def _simulate_live_managed_step(
     be_trigger_r_mult: float,
     be_offset_pct: float,
     be_fee_buffer_pct: float,
+    auto_tighten_stop: bool,
     trail_after_tp1: bool,
     trail_atr_mult: float,
     signal_exit_enabled: bool,
@@ -144,16 +145,20 @@ def _simulate_live_managed_step(
 
             peak = max(float(pos.get("peak_price", entry) or entry), close)
             pos["peak_price"] = peak
-            if (not be_armed) and close >= entry + risk * be_trigger_r:
+            if bool(auto_tighten_stop) and (not be_armed) and close >= entry + risk * be_trigger_r:
                 be_armed = True
 
-            next_stop = max(active_stop, float(sig.get("long_stop", active_stop) or active_stop))
-            if be_armed:
+            next_stop = float(active_stop)
+            if bool(auto_tighten_stop):
+                next_stop = max(next_stop, float(sig.get("long_stop", active_stop) or active_stop))
+                if be_armed:
+                    next_stop = max(next_stop, entry * (1.0 + be_total_offset))
+                if (not bool(trail_after_tp1)) or tp1_done:
+                    atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
+                    trail_stop = peak - atr_v * float(trail_atr_mult)
+                    next_stop = max(next_stop, trail_stop)
+            elif be_armed:
                 next_stop = max(next_stop, entry * (1.0 + be_total_offset))
-            if (not bool(trail_after_tp1)) or tp1_done:
-                atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
-                trail_stop = peak - atr_v * float(trail_atr_mult)
-                next_stop = max(next_stop, trail_stop)
 
             _finalize_open_state(
                 next_qty=qty_rem,
@@ -176,7 +181,7 @@ def _simulate_live_managed_step(
         peak = max(float(pos.get("peak_price", entry) or entry), close)
         pos["peak_price"] = peak
 
-        if (not be_armed) and close >= entry + risk * be_trigger_r:
+        if bool(auto_tighten_stop) and (not be_armed) and close >= entry + risk * be_trigger_r:
             be_armed = True
             pos["be_armed"] = True
 
@@ -209,13 +214,17 @@ def _simulate_live_managed_step(
                 pos["realized_r"] = realized_r
                 return {"closed": True, "outcome": "TP2", "r_raw": float(realized_r), "is_stop": False}
 
-        dynamic_stop = max(hard_stop, float(sig.get("long_stop", hard_stop) or hard_stop))
-        if be_armed:
+        dynamic_stop = float(hard_stop)
+        if bool(auto_tighten_stop):
+            dynamic_stop = max(dynamic_stop, float(sig.get("long_stop", hard_stop) or hard_stop))
+            if be_armed:
+                dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
+            if (not bool(trail_after_tp1)) or tp1_done:
+                atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
+                trail_stop = peak - atr_v * float(trail_atr_mult)
+                dynamic_stop = max(dynamic_stop, trail_stop)
+        elif be_armed:
             dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
-        if (not bool(trail_after_tp1)) or tp1_done:
-            atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
-            trail_stop = peak - atr_v * float(trail_atr_mult)
-            dynamic_stop = max(dynamic_stop, trail_stop)
 
         stop_hit = close <= dynamic_stop
         long_exit = bool(sig.get("long_exit", False)) if signal_exit_enabled else False
@@ -282,16 +291,20 @@ def _simulate_live_managed_step(
 
         trough = min(float(pos.get("trough_price", entry) or entry), close)
         pos["trough_price"] = trough
-        if (not be_armed) and close <= entry - risk * be_trigger_r:
+        if bool(auto_tighten_stop) and (not be_armed) and close <= entry - risk * be_trigger_r:
             be_armed = True
 
-        next_stop = min(active_stop, float(sig.get("short_stop", active_stop) or active_stop))
-        if be_armed:
+        next_stop = float(active_stop)
+        if bool(auto_tighten_stop):
+            next_stop = min(next_stop, float(sig.get("short_stop", active_stop) or active_stop))
+            if be_armed:
+                next_stop = min(next_stop, entry * (1.0 - be_total_offset))
+            if (not bool(trail_after_tp1)) or tp1_done:
+                atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
+                trail_stop = trough + atr_v * float(trail_atr_mult)
+                next_stop = min(next_stop, trail_stop)
+        elif be_armed:
             next_stop = min(next_stop, entry * (1.0 - be_total_offset))
-        if (not bool(trail_after_tp1)) or tp1_done:
-            atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
-            trail_stop = trough + atr_v * float(trail_atr_mult)
-            next_stop = min(next_stop, trail_stop)
 
         _finalize_open_state(
             next_qty=qty_rem,
@@ -347,13 +360,17 @@ def _simulate_live_managed_step(
             pos["realized_r"] = realized_r
             return {"closed": True, "outcome": "TP2", "r_raw": float(realized_r), "is_stop": False}
 
-    dynamic_stop = min(hard_stop, float(sig.get("short_stop", hard_stop) or hard_stop))
-    if be_armed:
+    dynamic_stop = float(hard_stop)
+    if bool(auto_tighten_stop):
+        dynamic_stop = min(dynamic_stop, float(sig.get("short_stop", hard_stop) or hard_stop))
+        if be_armed:
+            dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
+        if (not bool(trail_after_tp1)) or tp1_done:
+            atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
+            trail_stop = trough + atr_v * float(trail_atr_mult)
+            dynamic_stop = min(dynamic_stop, trail_stop)
+    elif be_armed:
         dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
-    if (not bool(trail_after_tp1)) or tp1_done:
-        atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
-        trail_stop = trough + atr_v * float(trail_atr_mult)
-        dynamic_stop = min(dynamic_stop, trail_stop)
 
     stop_hit = close >= dynamic_stop
     short_exit = bool(sig.get("short_exit", False)) if signal_exit_enabled else False
@@ -395,6 +412,7 @@ def eval_signal_outcome(
     be_fee_buffer_pct: float = 0.0,
     signal_lookup: Optional[Callable[[int], Optional[Dict[str, Any]]]] = None,
     trail_after_tp1: bool = True,
+    auto_tighten_stop: bool = True,
     trail_atr_mult: float = 0.0,
     signal_exit_enabled: bool = False,
     split_tp_enabled: bool = False,
@@ -547,6 +565,7 @@ def eval_signal_outcome(
                 be_offset_pct=be_offset_pct,
                 be_fee_buffer_pct=be_fee_buffer_pct,
                 trail_after_tp1=trail_after_tp1,
+                auto_tighten_stop=auto_tighten_stop,
                 trail_atr_mult=trail_atr_mult,
                 signal_exit_enabled=signal_exit_enabled,
                 split_tp_enabled=split_tp_enabled,
@@ -616,7 +635,7 @@ def eval_signal_outcome(
 
         if side_u == "LONG":
             peak = max(float(peak), float(sig_close))
-            if (not be_armed) and hi >= entry + risk * be_trigger:
+            if bool(auto_tighten_stop) and (not be_armed) and hi >= entry + risk * be_trigger:
                 be_armed = True
             if be_armed:
                 dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
@@ -648,12 +667,15 @@ def eval_signal_outcome(
                         break
                     continue
                 else:
-                    dynamic_stop = max(dynamic_stop, sig_long_stop)
-                    if be_armed:
+                    if bool(auto_tighten_stop):
+                        dynamic_stop = max(dynamic_stop, sig_long_stop)
+                        if be_armed:
+                            dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
+                        if (not bool(trail_after_tp1)) or tp1_done:
+                            trail_stop = peak - sig_atr * float(trail_atr_mult)
+                            dynamic_stop = max(dynamic_stop, trail_stop)
+                    elif be_armed:
                         dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
-                    if (not bool(trail_after_tp1)) or tp1_done:
-                        trail_stop = peak - sig_atr * float(trail_atr_mult)
-                        dynamic_stop = max(dynamic_stop, trail_stop)
                     stop_hit_close = sig_close <= dynamic_stop
                     if sig_long_exit or stop_hit_close:
                         realized_r += qty_rem * ((sig_close - entry) / risk)
@@ -684,12 +706,15 @@ def eval_signal_outcome(
                     outcome = "TP2"
                     exit_idx = i
                     break
-                dynamic_stop = max(dynamic_stop, sig_long_stop)
-                if be_armed:
+                if bool(auto_tighten_stop):
+                    dynamic_stop = max(dynamic_stop, sig_long_stop)
+                    if be_armed:
+                        dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
+                    if (not bool(trail_after_tp1)) or tp1_done:
+                        trail_stop = peak - sig_atr * float(trail_atr_mult)
+                        dynamic_stop = max(dynamic_stop, trail_stop)
+                elif be_armed:
                     dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
-                if (not bool(trail_after_tp1)) or tp1_done:
-                    trail_stop = peak - sig_atr * float(trail_atr_mult)
-                    dynamic_stop = max(dynamic_stop, trail_stop)
                 stop_hit_close = sig_close <= dynamic_stop
                 if sig_long_exit or stop_hit_close:
                     realized_r += qty_rem * ((sig_close - entry) / risk)
@@ -699,7 +724,7 @@ def eval_signal_outcome(
                     break
         else:
             trough = min(float(trough), float(sig_close))
-            if (not be_armed) and lo <= entry - risk * be_trigger:
+            if bool(auto_tighten_stop) and (not be_armed) and lo <= entry - risk * be_trigger:
                 be_armed = True
             if be_armed:
                 dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
@@ -731,12 +756,15 @@ def eval_signal_outcome(
                         break
                     continue
                 else:
-                    dynamic_stop = min(dynamic_stop, sig_short_stop)
-                    if be_armed:
+                    if bool(auto_tighten_stop):
+                        dynamic_stop = min(dynamic_stop, sig_short_stop)
+                        if be_armed:
+                            dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
+                        if (not bool(trail_after_tp1)) or tp1_done:
+                            trail_stop = trough + sig_atr * float(trail_atr_mult)
+                            dynamic_stop = min(dynamic_stop, trail_stop)
+                    elif be_armed:
                         dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
-                    if (not bool(trail_after_tp1)) or tp1_done:
-                        trail_stop = trough + sig_atr * float(trail_atr_mult)
-                        dynamic_stop = min(dynamic_stop, trail_stop)
                     stop_hit_close = sig_close >= dynamic_stop
                     if sig_short_exit or stop_hit_close:
                         realized_r += qty_rem * ((entry - sig_close) / risk)
@@ -767,12 +795,15 @@ def eval_signal_outcome(
                     outcome = "TP2"
                     exit_idx = i
                     break
-                dynamic_stop = min(dynamic_stop, sig_short_stop)
-                if be_armed:
+                if bool(auto_tighten_stop):
+                    dynamic_stop = min(dynamic_stop, sig_short_stop)
+                    if be_armed:
+                        dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
+                    if (not bool(trail_after_tp1)) or tp1_done:
+                        trail_stop = trough + sig_atr * float(trail_atr_mult)
+                        dynamic_stop = min(dynamic_stop, trail_stop)
+                elif be_armed:
                     dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
-                if (not bool(trail_after_tp1)) or tp1_done:
-                    trail_stop = trough + sig_atr * float(trail_atr_mult)
-                    dynamic_stop = min(dynamic_stop, trail_stop)
                 stop_hit_close = sig_close >= dynamic_stop
                 if sig_short_exit or stop_hit_close:
                     realized_r += qty_rem * ((entry - sig_close) / risk)
@@ -1553,6 +1584,7 @@ def run_backtest(
                                     be_fee_buffer_pct=inst_params.be_fee_buffer_pct,
                                     signal_lookup=_signal_lookup if bt_managed_exit else None,
                                     trail_after_tp1=inst_params.trail_after_tp1,
+                                    auto_tighten_stop=inst_params.auto_tighten_stop,
                                     trail_atr_mult=inst_params.trail_atr_mult,
                                     signal_exit_enabled=inst_params.signal_exit_enabled,
                                     split_tp_enabled=bt_live_split_tp,

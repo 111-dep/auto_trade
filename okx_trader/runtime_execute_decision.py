@@ -2491,7 +2491,7 @@ def execute_decision(
             if not ok_tp1 and err_tp1 not in {"filled", "live", "partially_filled", "tp1_already_done"}:
                 log(f"[{inst_id}] Managed TP1 ensure warning (long loop): {err_tp1}", level="WARN")
 
-        if (not trade_state.get("be_armed", False)) and float(sig["close"]) >= entry + risk * cfg.params.be_trigger_r_mult:
+        if cfg.params.auto_tighten_stop and (not trade_state.get("be_armed", False)) and float(sig["close"]) >= entry + risk * cfg.params.be_trigger_r_mult:
             trade_state["be_armed"] = True
             log("Management: BE armed (long).")
 
@@ -2643,13 +2643,17 @@ def execute_decision(
                 return
 
         dynamic_stop = float(trade_state.get("hard_stop", sig["long_stop"]))
-        dynamic_stop = max(dynamic_stop, float(sig["long_stop"]))
-        if trade_state.get("be_armed", False):
+        if cfg.params.auto_tighten_stop:
+            dynamic_stop = max(dynamic_stop, float(sig["long_stop"]))
+            if trade_state.get("be_armed", False):
+                be_total_offset = max(0.0, float(cfg.params.be_offset_pct) + float(cfg.params.be_fee_buffer_pct))
+                dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
+            if (not cfg.params.trail_after_tp1) or trade_state.get("tp1_done", False):
+                trail_stop = peak - float(sig["atr"]) * cfg.params.trail_atr_mult
+                dynamic_stop = max(dynamic_stop, trail_stop)
+        elif trade_state.get("be_armed", False):
             be_total_offset = max(0.0, float(cfg.params.be_offset_pct) + float(cfg.params.be_fee_buffer_pct))
             dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
-        if (not cfg.params.trail_after_tp1) or trade_state.get("tp1_done", False):
-            trail_stop = peak - float(sig["atr"]) * cfg.params.trail_atr_mult
-            dynamic_stop = max(dynamic_stop, trail_stop)
         trade_state["hard_stop"] = dynamic_stop
         sync_exchange_attached_sl(
             trade_state,
@@ -2820,7 +2824,7 @@ def execute_decision(
             if not ok_tp1 and err_tp1 not in {"filled", "live", "partially_filled", "tp1_already_done"}:
                 log(f"[{inst_id}] Managed TP1 ensure warning (short loop): {err_tp1}", level="WARN")
 
-        if (not trade_state.get("be_armed", False)) and float(sig["close"]) <= entry - risk * cfg.params.be_trigger_r_mult:
+        if cfg.params.auto_tighten_stop and (not trade_state.get("be_armed", False)) and float(sig["close"]) <= entry - risk * cfg.params.be_trigger_r_mult:
             trade_state["be_armed"] = True
             log("Management: BE armed (short).")
 
@@ -2972,13 +2976,17 @@ def execute_decision(
                 return
 
         dynamic_stop = float(trade_state.get("hard_stop", sig["short_stop"]))
-        dynamic_stop = min(dynamic_stop, float(sig["short_stop"]))
-        if trade_state.get("be_armed", False):
+        if cfg.params.auto_tighten_stop:
+            dynamic_stop = min(dynamic_stop, float(sig["short_stop"]))
+            if trade_state.get("be_armed", False):
+                be_total_offset = max(0.0, float(cfg.params.be_offset_pct) + float(cfg.params.be_fee_buffer_pct))
+                dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
+            if (not cfg.params.trail_after_tp1) or trade_state.get("tp1_done", False):
+                trail_stop = trough + float(sig["atr"]) * cfg.params.trail_atr_mult
+                dynamic_stop = min(dynamic_stop, trail_stop)
+        elif trade_state.get("be_armed", False):
             be_total_offset = max(0.0, float(cfg.params.be_offset_pct) + float(cfg.params.be_fee_buffer_pct))
             dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
-        if (not cfg.params.trail_after_tp1) or trade_state.get("tp1_done", False):
-            trail_stop = trough + float(sig["atr"]) * cfg.params.trail_atr_mult
-            dynamic_stop = min(dynamic_stop, trail_stop)
         trade_state["hard_stop"] = dynamic_stop
         sync_exchange_attached_sl(
             trade_state,

@@ -46,6 +46,42 @@ class ManagedExitTests(unittest.TestCase):
         self.assertEqual(held, 2)
         self.assertEqual(exit_idx, 2)
 
+    def test_live_style_disable_auto_tighten_keeps_initial_stop_until_tp1(self) -> None:
+        candles = [
+            _c(0, 100, 100, 100, 100),
+            _c(1, 100, 101, 99.5, 101),
+            _c(2, 101, 101, 93.5, 94),
+        ]
+        signal_map = {
+            1: {"close": 101.0, "high": 101.0, "low": 99.5, "atr": 1.0, "long_stop": 102.0},
+            2: {"close": 94.0, "high": 101.0, "low": 93.5, "atr": 1.0, "long_stop": 93.0},
+        }
+        outcome, r_value, held, exit_idx = eval_signal_outcome(
+            side="LONG",
+            entry=100.0,
+            stop=95.0,
+            tp1=107.5,
+            tp2=112.5,
+            ltf_candles=candles,
+            start_idx=0,
+            horizon_bars=3,
+            managed_exit=True,
+            tp1_close_pct=0.5,
+            tp2_close_rest=True,
+            be_trigger_r_mult=1.0,
+            be_offset_pct=0.0,
+            be_fee_buffer_pct=0.0,
+            signal_lookup=lambda idx: signal_map.get(idx),
+            trail_after_tp1=True,
+            auto_tighten_stop=False,
+            trail_atr_mult=0.0,
+            signal_exit_enabled=False,
+        )
+        self.assertEqual(outcome, "STOP")
+        self.assertAlmostEqual(r_value, -1.2, places=6)
+        self.assertEqual(held, 2)
+        self.assertEqual(exit_idx, 2)
+
     def test_live_style_without_split_ignores_intrabar_tp1_wick(self) -> None:
         candles = [
             _c(0, 100, 100, 100, 100),
