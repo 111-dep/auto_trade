@@ -1451,19 +1451,23 @@ class BinanceUMClient:
         fallback_side: str = "",
     ) -> Dict[str, Any]:
         row = dict(raw or {})
-        ord_id = str(raw.get("strategyId", raw.get("orderId", raw.get("ordId", ""))) or "").strip()
+        ord_id = str(raw.get("algoId", raw.get("strategyId", raw.get("orderId", raw.get("ordId", "")))) or "").strip()
         cl_ord_id = str(
             raw.get(
-                "newClientStrategyId",
+                "clientAlgoId",
                 raw.get(
-                    "clientStrategyId",
-                    raw.get("clientOrderId", raw.get("origClientOrderId", fallback_cl_ord_id)),
+                    "newClientStrategyId",
+                    raw.get(
+                        "clientStrategyId",
+                        raw.get("clientOrderId", raw.get("origClientOrderId", fallback_cl_ord_id)),
+                    ),
                 ),
             ) or fallback_cl_ord_id
         ).strip()
-        status = str(raw.get("strategyStatus", raw.get("status", raw.get("state", ""))) or "").strip().upper()
+        status = str(raw.get("algoStatus", raw.get("strategyStatus", raw.get("status", raw.get("state", "")))) or "").strip().upper()
         state_map = {
             "NEW": "live",
+            "WORKING": "live",
             "PARTIALLY_FILLED": "partially_filled",
             "FILLED": "filled",
             "TRIGGERED": "filled",
@@ -1479,18 +1483,61 @@ class BinanceUMClient:
             row["clOrdId"] = cl_ord_id
         if state:
             row["state"] = state
-        executed_qty = raw.get("executedQty", raw.get("cumQty", raw.get("accFillSz", raw.get("origQty", "0"))))
+        order_type = str(raw.get("orderType", raw.get("strategyType", raw.get("type", raw.get("origType", "")))) or "").strip().upper()
+        if order_type:
+            row["type"] = order_type
+            row["origType"] = order_type
+            row["strategyType"] = order_type
+            row["orderType"] = order_type
+        executed_qty = raw.get(
+            "executedQty",
+            raw.get("actualQty", raw.get("cumQty", raw.get("accFillSz", raw.get("origQty", raw.get("quantity", "0"))))),
+        )
         row["accFillSz"] = str(executed_qty or "0")
+        quantity_txt = str(raw.get("quantity", raw.get("origQty", raw.get("origSz", ""))) or "").strip()
+        if quantity_txt:
+            row["origQty"] = quantity_txt
+            row["quantity"] = quantity_txt
         side_txt = str(raw.get("side", fallback_side) or fallback_side).strip().lower()
         if side_txt:
             row["side"] = side_txt
-        stop_px = self._to_float(raw.get("stopPrice", raw.get("triggerPrice", raw.get("slTriggerPx", 0.0))))
+        stop_px = self._to_float(raw.get("triggerPrice", raw.get("stopPrice", raw.get("slTriggerPx", 0.0))))
         if stop_px > 0:
             row["slTriggerPx"] = self._fmt_price(stop_px)
+            row["triggerPrice"] = self._fmt_price(stop_px)
+            row["stopPrice"] = self._fmt_price(stop_px)
+        if "reduceOnly" in raw:
+            row["reduceOnly"] = raw.get("reduceOnly")
         row["attachAlgoId"] = ord_id
         if cl_ord_id:
             row["attachAlgoClOrdId"] = cl_ord_id
         return row
+
+    def _get_fapi_algo_order(
+        self,
+        *,
+        algo_id: str = "",
+        client_algo_id: str = "",
+    ) -> Dict[str, Any]:
+        algo_id_txt = str(algo_id or "").strip()
+        client_algo_id_txt = str(client_algo_id or "").strip()
+        if not algo_id_txt and not client_algo_id_txt:
+            raise RuntimeError("algo_id or client_algo_id is required")
+        params: Dict[str, str] = {}
+        if algo_id_txt:
+            params["algoId"] = algo_id_txt
+        if client_algo_id_txt:
+            params["clientAlgoId"] = client_algo_id_txt
+        raw = self._request(
+            "GET",
+            "/fapi/v1/algoOrder",
+            params=params,
+            signed=True,
+            base_url=self._fapi_private_base_url,
+        )
+        if isinstance(raw, dict):
+            return self._normalize_stop_order_row(raw, fallback_cl_ord_id=client_algo_id_txt)
+        return {}
 
     def _get_papi_conditional_order(
         self,
@@ -1524,7 +1571,7 @@ class BinanceUMClient:
     def _is_live_pending_stop_order_row(row: Dict[str, Any]) -> bool:
         if not isinstance(row, dict) or not row:
             return False
-        strategy_type = str(row.get("strategyType", row.get("type", row.get("origType", ""))) or "").strip().upper()
+        strategy_type = str(row.get("strategyType", row.get("orderType", row.get("type", row.get("origType", "")))) or "").strip().upper()
         if strategy_type and strategy_type != "STOP_MARKET":
             return False
         if not str(row.get("slTriggerPx", "") or "").strip():
@@ -1547,7 +1594,7 @@ class BinanceUMClient:
     def _pending_stop_sort_key(row: Dict[str, Any]) -> Tuple[int, int, int]:
         qty_rank = 1 if bool(row.get("_qty_match", False)) else 0
         stop_rank = 1 if bool(row.get("_stop_match", False)) else 0
-        raw_id = str(row.get("strategyId", row.get("attachAlgoId", row.get("ordId", ""))) or "").strip()
+        raw_id = str(row.get("algoId", row.get("strategyId", row.get("attachAlgoId", row.get("ordId", "")))) or "").strip()
         try:
             numeric_id = int(raw_id)
         except Exception:
@@ -1617,8 +1664,8 @@ class BinanceUMClient:
         want_close_side = self._pending_stop_close_side(side)
         raw = self._request(
             "GET",
-            "/fapi/v1/openOrders",
-            params={"symbol": symbol},
+            "/fapi/v1/openAlgoOrders",
+            params={"symbol": symbol, "algoType": "CONDITIONAL"},
             signed=True,
             base_url=self._fapi_private_base_url,
         )
@@ -1627,7 +1674,7 @@ class BinanceUMClient:
         for item in rows:
             if not isinstance(item, dict):
                 continue
-            row = self._normalize_order_row(item)
+            row = self._normalize_stop_order_row(item)
             if not self._is_live_pending_stop_order_row(row):
                 continue
             if want_close_side and str(row.get("side", "") or "").strip().lower() != want_close_side:
@@ -1683,7 +1730,7 @@ class BinanceUMClient:
                         client_strategy_id=algo_cl_id_txt,
                     )
                 else:
-                    row = self.get_order(inst_id=inst_id, ord_id=algo_id_txt, cl_ord_id=algo_cl_id_txt)
+                    row = self._get_fapi_algo_order(algo_id=algo_id_txt, client_algo_id=algo_cl_id_txt)
             except Exception:
                 row = {}
             if not self._is_live_pending_stop_order_row(row):
@@ -1734,7 +1781,7 @@ class BinanceUMClient:
                         client_strategy_id=row_algo_cl_id,
                     )
                 else:
-                    self.cancel_order(inst_id=inst_id, ord_id=row_algo_id, cl_ord_id=row_algo_cl_id)
+                    self._cancel_fapi_algo_order(algo_id=row_algo_id, client_algo_id=row_algo_cl_id)
             except Exception as e:
                 log(f"[{inst_id}] Binance pending stop cleanup warning: {e}", level="WARN")
                 break
@@ -1781,12 +1828,44 @@ class BinanceUMClient:
                         client_strategy_id=row_algo_cl_id,
                     )
                 else:
-                    self.cancel_order(inst_id=inst_id, ord_id=row_algo_id, cl_ord_id=row_algo_cl_id)
+                    self._cancel_fapi_algo_order(algo_id=row_algo_id, client_algo_id=row_algo_cl_id)
             except Exception as e:
                 log(f"[{inst_id}] Binance duplicate stop cleanup warning: {e}", level="WARN")
                 break
             canceled += 1
         return canceled
+
+    def _cancel_fapi_algo_order(
+        self,
+        *,
+        algo_id: str = "",
+        client_algo_id: str = "",
+    ) -> Dict[str, Any]:
+        algo_id_txt = str(algo_id or "").strip()
+        client_algo_id_txt = str(client_algo_id or "").strip()
+        if not algo_id_txt and not client_algo_id_txt:
+            raise RuntimeError("algo_id or client_algo_id is required")
+        params: Dict[str, str] = {}
+        if algo_id_txt:
+            params["algoId"] = algo_id_txt
+        if client_algo_id_txt:
+            params["clientAlgoId"] = client_algo_id_txt
+        if self.cfg.dry_run:
+            log(f"[DRY-RUN] binance fapi cancel_stop payload={json.dumps(params, ensure_ascii=False)}")
+            return {"data": [{"ordId": algo_id_txt or "DRY_RUN_STOP", "clOrdId": client_algo_id_txt, "state": "canceled"}]}
+        raw = self._request(
+            "DELETE",
+            "/fapi/v1/algoOrder",
+            params=params,
+            signed=True,
+            base_url=self._fapi_private_base_url,
+        )
+        if isinstance(raw, dict):
+            row = self._normalize_stop_order_row(raw, fallback_cl_ord_id=client_algo_id_txt)
+            if not str(row.get("state", "") or "").strip():
+                row["state"] = "canceled"
+            return {"data": [row]}
+        return {"data": []}
 
     def _cancel_papi_conditional_order(
         self,
@@ -1880,20 +1959,29 @@ class BinanceUMClient:
             if "side" not in row:
                 row["side"] = close_side.lower()
             return {"data": [row]}
+        stop_size = float(size or 0.0)
+        if stop_size <= 0:
+            pos_state = self.parse_position(self.get_positions(inst_id), "net")
+            stop_size = float(pos_state.size or 0.0)
+        if stop_size <= 0:
+            raise RuntimeError(f"[{inst_id}] Binance FAPI algo stop order requires positive position size")
+        _, stop_size_txt = self.normalize_order_size(inst_id, float(stop_size), reduce_only=True)
         params = {
+            "algoType": "CONDITIONAL",
             "symbol": symbol,
             "side": close_side,
             "type": "STOP_MARKET",
-            "stopPrice": self._normalize_price(inst_id, float(stop_price)),
-            "closePosition": "true",
+            "quantity": stop_size_txt,
+            "reduceOnly": "true",
+            "triggerPrice": self._normalize_price(inst_id, float(stop_price)),
             "workingType": self._working_type(),
             "priceProtect": "FALSE",
             "newOrderRespType": "ACK",
         }
         if cl_ord_id_txt:
-            params["newClientOrderId"] = cl_ord_id_txt
+            params["clientAlgoId"] = cl_ord_id_txt
         if self.cfg.dry_run:
-            log(f"[DRY-RUN] binance place_stop payload={json.dumps(params, ensure_ascii=False)}")
+            log(f"[DRY-RUN] binance fapi place_stop payload={json.dumps(params, ensure_ascii=False)}")
             row = {
                 "ordId": "DRY_RUN_STOP",
                 "clOrdId": cl_ord_id_txt,
@@ -1904,8 +1992,8 @@ class BinanceUMClient:
                 "side": close_side.lower(),
             }
             return {"data": [row]}
-        raw = self._request("POST", "/fapi/v1/order", params=params, signed=True, base_url=self._fapi_private_base_url)
-        row = self._normalize_order_row(raw, fallback_cl_ord_id=cl_ord_id_txt)
+        raw = self._request("POST", "/fapi/v1/algoOrder", params=params, signed=True, base_url=self._fapi_private_base_url)
+        row = self._normalize_stop_order_row(raw, fallback_cl_ord_id=cl_ord_id_txt, fallback_side=close_side)
         row["attachAlgoId"] = str(row.get("ordId", "") or "").strip()
         row["attachAlgoClOrdId"] = str(row.get("clOrdId", cl_ord_id_txt) or cl_ord_id_txt).strip()
         row["slTriggerPx"] = self._fmt_price(float(stop_price))
@@ -1974,7 +2062,7 @@ class BinanceUMClient:
             )
         current: Dict[str, Any] = {}
         try:
-            current = self.get_order(inst_id=inst_id, ord_id=algo_id_txt, cl_ord_id=algo_cl_id_txt)
+            current = self._get_fapi_algo_order(algo_id=algo_id_txt, client_algo_id=algo_cl_id_txt)
         except Exception:
             current = {}
         close_side = str(current.get("side", "") or "").strip().lower()
@@ -1983,7 +2071,7 @@ class BinanceUMClient:
         use_cl_ord_id = algo_cl_id_txt or str(current.get("clOrdId", "") or "").strip()
         use_ord_id = algo_id_txt or str(current.get("ordId", "") or "").strip()
         try:
-            self.cancel_order(inst_id=inst_id, ord_id=use_ord_id, cl_ord_id=use_cl_ord_id)
+            self._cancel_fapi_algo_order(algo_id=use_ord_id, client_algo_id=use_cl_ord_id)
         except Exception as e:
             msg = str(e).lower()
             if ("unknown order" not in msg) and ("does not exist" not in msg) and ("order not found" not in msg):
