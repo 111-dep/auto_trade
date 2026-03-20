@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-import bisect
 import datetime as dt
+import hashlib
+import json
 import math
+import os
+import pickle
 import time
 from collections import deque
+from dataclasses import asdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .backtest_report import (
@@ -48,6 +52,177 @@ def _signal_high_low(sig: Dict[str, Any], close_px: float) -> Tuple[float, float
     if hi < lo:
         hi, lo = lo, hi
     return hi, lo
+
+
+
+_LIVE_WINDOW_TABLE_CACHE_VERSION = "live_window_tables_v1"
+_LIVE_WINDOW_TABLE_CACHE_CODE_FILES = (
+    "backtest.py",
+    "decision_core.py",
+    "indicators.py",
+    "profile_vote.py",
+    "signals.py",
+    "strategy_contract.py",
+    "strategy_variant.py",
+    "strategy_variant_legacy.py",
+    "strategies/elder_tss_v1_plugin.py",
+)
+
+
+def _backtest_live_table_cache_enabled() -> bool:
+    raw = str(os.getenv("OKX_BACKTEST_LIVE_TABLE_CACHE_ENABLED", "1") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _backtest_live_table_cache_dir(cfg: Config) -> str:
+    override = str(os.getenv("OKX_BACKTEST_LIVE_TABLE_CACHE_DIR", "") or "").strip()
+    if override:
+        return override
+    hist_dir = str(getattr(cfg, "history_cache_dir", "") or "").strip()
+    if hist_dir:
+        return os.path.join(os.path.dirname(os.path.abspath(hist_dir.rstrip(os.sep))), "backtest_live_tables")
+    return os.path.join(os.getcwd(), ".cache", "backtest_live_tables")
+
+
+def _backtest_live_table_code_signature() -> str:
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    parts: List[str] = []
+    for rel in _LIVE_WINDOW_TABLE_CACHE_CODE_FILES:
+        full = os.path.join(pkg_dir, rel)
+        try:
+            st = os.stat(full)
+            parts.append(f"{rel}:{st.st_mtime_ns}:{st.st_size}")
+        except OSError:
+            parts.append(f"{rel}:missing")
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def _hash_candles_for_live_table_cache(candles: List[Candle]) -> str:
+    h = hashlib.sha256()
+    h.update(str(len(candles)).encode("utf-8"))
+    for c in candles:
+        h.update(
+            (
+                f"{int(c.ts_ms)}|{repr(float(c.open))}|{repr(float(c.high))}|{repr(float(c.low))}|"
+                f"{repr(float(c.close))}|{1 if bool(c.confirm) else 0}|{repr(float(getattr(c, 'volume', 0.0) or 0.0))};"
+            ).encode("utf-8")
+        )
+    return h.hexdigest()
+
+
+def _build_backtest_live_table_cache_key(
+    *,
+    cfg: Config,
+    inst_id: str,
+    profile_id: str,
+    ordered_profile_ids: List[str],
+    profile_params: Dict[str, StrategyParams],
+    htf_candles: List[Candle],
+    loc_candles: List[Candle],
+    ltf_candles: List[Candle],
+    max_level: int,
+    min_level: int,
+    exact_level: int,
+    tp1_only: bool,
+    start_idx: int,
+    live_signal_window_limit: int,
+) -> str:
+    payload = {
+        "version": _LIVE_WINDOW_TABLE_CACHE_VERSION,
+        "code_sig": _backtest_live_table_code_signature(),
+        "exchange_provider": str(getattr(cfg, "exchange_provider", "") or ""),
+        "inst_id": str(inst_id),
+        "profile_id": str(profile_id),
+        "ordered_profile_ids": list(ordered_profile_ids),
+        "profile_params": {pid: asdict(profile_params[pid]) for pid in ordered_profile_ids},
+        "profile_vote_mode": str(getattr(cfg, "strategy_profile_vote_mode", "") or ""),
+        "profile_vote_min_agree": int(getattr(cfg, "strategy_profile_vote_min_agree", 0) or 0),
+        "profile_vote_score_map": dict(getattr(cfg, "strategy_profile_vote_score_map", {}) or {}),
+        "profile_vote_level_weight": float(getattr(cfg, "strategy_profile_vote_level_weight", 0.0) or 0.0),
+        "profile_vote_fallback_profiles": list(getattr(cfg, "strategy_profile_vote_fallback_profiles", []) or []),
+        "bars": {
+            "htf": str(getattr(cfg, "htf_bar", "") or ""),
+            "loc": str(getattr(cfg, "loc_bar", "") or ""),
+            "ltf": str(getattr(cfg, "ltf_bar", "") or ""),
+        },
+        "max_level": int(max_level),
+        "min_level": int(min_level),
+        "exact_level": int(exact_level),
+        "tp1_only": bool(tp1_only),
+        "start_idx": int(start_idx),
+        "live_signal_window_limit": int(live_signal_window_limit),
+        "htf_sig": _hash_candles_for_live_table_cache(htf_candles),
+        "loc_sig": _hash_candles_for_live_table_cache(loc_candles),
+        "ltf_sig": _hash_candles_for_live_table_cache(ltf_candles),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _backtest_live_table_cache_path(cfg: Config, inst_id: str, cache_key: str) -> str:
+    root = _backtest_live_table_cache_dir(cfg)
+    safe_inst = str(inst_id).replace("/", "_").replace("-", "_")
+    return os.path.join(root, f"{safe_inst}__{cache_key}.pkl")
+
+
+def _load_backtest_live_table_cache(cache_path: str, cache_key: str, *, inst_id: str) -> Optional[Dict[str, Any]]:
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "rb") as fh:
+            payload = pickle.load(fh)
+    except Exception as e:
+        log(f"[{inst_id}] live-window table cache load failed: {e}", level="WARN")
+        return None
+    if not isinstance(payload, dict) or payload.get("cache_key") != cache_key:
+        return None
+    table_bundle = payload.get("table_bundle")
+    if not isinstance(table_bundle, dict):
+        return None
+    signal_table = table_bundle.get("signal_table")
+    decision_table = table_bundle.get("decision_table")
+    if not isinstance(signal_table, list) or not isinstance(decision_table, list):
+        return None
+    log(
+        f"[{inst_id}] live-window table cache hit | rows={len(signal_table)} key={cache_key[:12]} path={cache_path}"
+    )
+    return table_bundle
+
+
+def _save_backtest_live_table_cache(cache_path: str, cache_key: str, *, inst_id: str, table_bundle: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = f"{cache_path}.tmp"
+        payload = {
+            "cache_key": cache_key,
+            "table_bundle": table_bundle,
+        }
+        with open(tmp_path, "wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, cache_path)
+        log(
+            f"[{inst_id}] live-window table cache save | rows={len(table_bundle.get('signal_table', []))} key={cache_key[:12]} path={cache_path}"
+        )
+    except Exception as e:
+        log(f"[{inst_id}] live-window table cache save failed: {e}", level="WARN")
+
+
+def resolve_backtest_split_tp_enabled(
+    *,
+    attach_tpsl_on_entry: bool,
+    enable_close: bool,
+    split_tp_on_entry: bool,
+    tp1_close_pct: float,
+    force_managed_tp_fallback: bool = False,
+) -> bool:
+    if bool(force_managed_tp_fallback):
+        return False
+    return bool(
+        bool(attach_tpsl_on_entry)
+        and bool(enable_close)
+        and bool(split_tp_on_entry)
+        and 0.0 < float(tp1_close_pct or 0.0) < 1.0
+    )
 
 
 def _simulate_live_managed_step(
@@ -169,14 +344,17 @@ def _simulate_live_managed_step(
             )
 
             long_exit = bool(sig.get("long_exit", False)) if signal_exit_enabled else False
-            stop_hit = close <= next_stop
-            if long_exit or stop_hit:
+            if long_exit:
                 realized_r += qty_rem * _close_remaining_r("LONG", entry, risk, close)
                 pos["qty_rem"] = 0.0
                 pos["realized_r"] = realized_r
-                outcome = "TP1" if tp1_done else ("STOP" if stop_hit else "EXIT")
-                return {"closed": True, "outcome": str(outcome), "r_raw": float(realized_r), "is_stop": bool(stop_hit)}
+                outcome = "TP1" if tp1_done else "EXIT"
+                return {"closed": True, "outcome": str(outcome), "r_raw": float(realized_r), "is_stop": False}
             return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False}
+
+        active_stop = float(hard_stop)
+        if low <= active_stop:
+            return _close_now(outcome="TP1" if tp1_done else "STOP", close_px=active_stop, is_stop=True)
 
         peak = max(float(pos.get("peak_price", entry) or entry), close)
         pos["peak_price"] = peak
@@ -226,7 +404,6 @@ def _simulate_live_managed_step(
         elif be_armed:
             dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
 
-        stop_hit = close <= dynamic_stop
         long_exit = bool(sig.get("long_exit", False)) if signal_exit_enabled else False
         pos["qty_rem"] = qty_rem
         pos["realized_r"] = realized_r
@@ -234,17 +411,12 @@ def _simulate_live_managed_step(
         pos["be_armed"] = be_armed
         pos["hard_stop"] = dynamic_stop
 
-        if long_exit or stop_hit:
+        if long_exit:
             realized_r += qty_rem * _close_remaining_r("LONG", entry, risk, close)
             pos["qty_rem"] = 0.0
             pos["realized_r"] = realized_r
-            if tp1_done:
-                outcome = "TP1"
-            elif stop_hit:
-                outcome = "STOP"
-            else:
-                outcome = "EXIT"
-            return {"closed": True, "outcome": str(outcome), "r_raw": float(realized_r), "is_stop": bool(stop_hit)}
+            outcome = "TP1" if tp1_done else "EXIT"
+            return {"closed": True, "outcome": str(outcome), "r_raw": float(realized_r), "is_stop": False}
         return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False}
 
     if split_tp_enabled:
@@ -315,14 +487,17 @@ def _simulate_live_managed_step(
         )
 
         short_exit = bool(sig.get("short_exit", False)) if signal_exit_enabled else False
-        stop_hit = close >= next_stop
-        if short_exit or stop_hit:
+        if short_exit:
             realized_r += qty_rem * _close_remaining_r("SHORT", entry, risk, close)
             pos["qty_rem"] = 0.0
             pos["realized_r"] = realized_r
-            outcome = "TP1" if tp1_done else ("STOP" if stop_hit else "EXIT")
-            return {"closed": True, "outcome": str(outcome), "r_raw": float(realized_r), "is_stop": bool(stop_hit)}
+            outcome = "TP1" if tp1_done else "EXIT"
+            return {"closed": True, "outcome": str(outcome), "r_raw": float(realized_r), "is_stop": False}
         return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False}
+
+    active_stop = float(hard_stop)
+    if high >= active_stop:
+        return _close_now(outcome="TP1" if tp1_done else "STOP", close_px=active_stop, is_stop=True)
 
     trough = min(float(pos.get("trough_price", entry) or entry), close)
     pos["trough_price"] = trough
@@ -372,7 +547,6 @@ def _simulate_live_managed_step(
     elif be_armed:
         dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
 
-    stop_hit = close >= dynamic_stop
     short_exit = bool(sig.get("short_exit", False)) if signal_exit_enabled else False
     pos["qty_rem"] = qty_rem
     pos["realized_r"] = realized_r
@@ -380,18 +554,12 @@ def _simulate_live_managed_step(
     pos["be_armed"] = be_armed
     pos["hard_stop"] = dynamic_stop
 
-    if short_exit or stop_hit:
+    if short_exit:
         realized_r += qty_rem * _close_remaining_r("SHORT", entry, risk, close)
         pos["qty_rem"] = 0.0
         pos["realized_r"] = realized_r
-        if tp1_done:
-            outcome = "TP1"
-        elif stop_hit:
-            outcome = "STOP"
-        else:
-            outcome = "EXIT"
-        return {"closed": True, "outcome": str(outcome), "r_raw": float(realized_r), "is_stop": bool(stop_hit)}
-
+        outcome = "TP1" if tp1_done else "EXIT"
+        return {"closed": True, "outcome": str(outcome), "r_raw": float(realized_r), "is_stop": False}
     return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False}
 
 
@@ -676,11 +844,10 @@ def eval_signal_outcome(
                             dynamic_stop = max(dynamic_stop, trail_stop)
                     elif be_armed:
                         dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
-                    stop_hit_close = sig_close <= dynamic_stop
-                    if sig_long_exit or stop_hit_close:
+                    if sig_long_exit:
                         realized_r += qty_rem * ((sig_close - entry) / risk)
                         qty_rem = 0.0
-                        outcome = "STOP" if stop_hit_close else "EXIT"
+                        outcome = "EXIT"
                         exit_idx = i
                         break
                     continue
@@ -715,11 +882,10 @@ def eval_signal_outcome(
                         dynamic_stop = max(dynamic_stop, trail_stop)
                 elif be_armed:
                     dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
-                stop_hit_close = sig_close <= dynamic_stop
-                if sig_long_exit or stop_hit_close:
+                if sig_long_exit:
                     realized_r += qty_rem * ((sig_close - entry) / risk)
                     qty_rem = 0.0
-                    outcome = "TP1" if tp1_done else ("STOP" if stop_hit_close else "EXIT")
+                    outcome = "TP1" if tp1_done else "EXIT"
                     exit_idx = i
                     break
         else:
@@ -765,11 +931,10 @@ def eval_signal_outcome(
                             dynamic_stop = min(dynamic_stop, trail_stop)
                     elif be_armed:
                         dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
-                    stop_hit_close = sig_close >= dynamic_stop
-                    if sig_short_exit or stop_hit_close:
+                    if sig_short_exit:
                         realized_r += qty_rem * ((entry - sig_close) / risk)
                         qty_rem = 0.0
-                        outcome = "STOP" if stop_hit_close else "EXIT"
+                        outcome = "EXIT"
                         exit_idx = i
                         break
                     continue
@@ -804,11 +969,10 @@ def eval_signal_outcome(
                         dynamic_stop = min(dynamic_stop, trail_stop)
                 elif be_armed:
                     dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
-                stop_hit_close = sig_close >= dynamic_stop
-                if sig_short_exit or stop_hit_close:
+                if sig_short_exit:
                     realized_r += qty_rem * ((entry - sig_close) / risk)
                     qty_rem = 0.0
-                    outcome = "TP1" if tp1_done else ("STOP" if stop_hit_close else "EXIT")
+                    outcome = "TP1" if tp1_done else "EXIT"
                     exit_idx = i
                     break
 
@@ -1136,7 +1300,22 @@ def _build_backtest_signal_fast(
     pb_low = pre["pullback_low"][i]
     pb_high = pre["pullback_high"][i]
     width = pre["bb_width"][i]
-    if None in {em, r, mh, a, upper, lower, mid, hhv, llv, exl, exh, pb_low, pb_high, width}:
+    if (
+        em is None
+        or r is None
+        or mh is None
+        or a is None
+        or upper is None
+        or lower is None
+        or mid is None
+        or hhv is None
+        or llv is None
+        or exl is None
+        or exh is None
+        or pb_low is None
+        or pb_high is None
+        or width is None
+    ):
         return None
 
     width_avg = float(pre["bb_width_avg"][i])
@@ -1225,6 +1404,225 @@ def _build_backtest_signal_fast(
     }
 
 
+def _build_backtest_signal_live_window(
+    *,
+    htf_candles: List[Candle],
+    loc_candles: List[Candle],
+    ltf_candles: List[Candle],
+    p: StrategyParams,
+    hi: int,
+    li: int,
+    i: int,
+    candle_limit: int,
+) -> Optional[Dict[str, Any]]:
+    limit = max(1, int(candle_limit))
+    if hi <= 0 or li <= 0 or i < 0:
+        return None
+
+    h_start = max(0, hi - limit)
+    l_start = max(0, li - limit)
+    t_end = i + 1
+    t_start = max(0, t_end - limit)
+
+    htf_slice = htf_candles[h_start:hi]
+    loc_slice = loc_candles[l_start:li]
+    ltf_slice = ltf_candles[t_start:t_end]
+    try:
+        return build_signals(htf_slice, loc_slice, ltf_slice, p)
+    except Exception:
+        return None
+
+
+def _build_backtest_alignment_counts(
+    htf_ts: List[int],
+    loc_ts: List[int],
+    ltf_ts: List[int],
+    *,
+    start_idx: int = 0,
+) -> Tuple[List[int], List[int]]:
+    htf_counts: List[int] = [0] * len(ltf_ts)
+    loc_counts: List[int] = [0] * len(ltf_ts)
+    hi = 0
+    li = 0
+    htf_n = len(htf_ts)
+    loc_n = len(loc_ts)
+    start = max(0, int(start_idx))
+    for i, ts in enumerate(ltf_ts):
+        ts_i = int(ts)
+        while hi < htf_n and int(htf_ts[hi]) <= ts_i:
+            hi += 1
+        while li < loc_n and int(loc_ts[li]) <= ts_i:
+            li += 1
+        if i >= start:
+            htf_counts[i] = hi
+            loc_counts[i] = li
+    return htf_counts, loc_counts
+
+
+def _build_backtest_signal_decision_tables(
+    *,
+    cfg: Config,
+    inst_id: str,
+    profile_id: str,
+    inst_profile_ids: List[str],
+    params_by_profile: Dict[str, StrategyParams],
+    pre_by_profile: Dict[str, Dict[str, Any]],
+    htf_candles: List[Candle],
+    loc_candles: List[Candle],
+    ltf_candles: List[Candle],
+    htf_ts: List[int],
+    loc_ts: List[int],
+    ltf_ts: List[int],
+    max_level: int,
+    min_level: int,
+    exact_level: int,
+    tp1_only: bool,
+    start_idx: int = 0,
+    live_signal_window_limit: int = 0,
+) -> Dict[str, Any]:
+    ordered_profile_ids = list(inst_profile_ids)
+    if profile_id not in ordered_profile_ids:
+        ordered_profile_ids.insert(0, profile_id)
+    elif ordered_profile_ids and ordered_profile_ids[0] != profile_id:
+        ordered_profile_ids = [profile_id] + [pid for pid in ordered_profile_ids if pid != profile_id]
+
+    profile_params: Dict[str, StrategyParams] = {}
+    profile_exec_max: Dict[str, int] = {}
+    for pid in ordered_profile_ids:
+        p = params_by_profile.get(pid, cfg.strategy_profiles.get(pid, cfg.params))
+        profile_params[pid] = p
+        profile_exec_max[pid] = min(max_level, resolve_exec_max_level(p, inst_id))
+
+    cache_path: Optional[str] = None
+    cache_key: Optional[str] = None
+    if int(live_signal_window_limit or 0) > 0 and _backtest_live_table_cache_enabled():
+        cache_key = _build_backtest_live_table_cache_key(
+            cfg=cfg,
+            inst_id=inst_id,
+            profile_id=profile_id,
+            ordered_profile_ids=ordered_profile_ids,
+            profile_params=profile_params,
+            htf_candles=htf_candles,
+            loc_candles=loc_candles,
+            ltf_candles=ltf_candles,
+            max_level=max_level,
+            min_level=min_level,
+            exact_level=exact_level,
+            tp1_only=tp1_only,
+            start_idx=start_idx,
+            live_signal_window_limit=live_signal_window_limit,
+        )
+        cache_path = _backtest_live_table_cache_path(cfg, inst_id, cache_key)
+        cached_bundle = _load_backtest_live_table_cache(cache_path, cache_key, inst_id=inst_id)
+        if cached_bundle is not None:
+            if not str(cached_bundle.get("table_cache_key", "") or ""):
+                cached_bundle["table_cache_key"] = str(cache_key)
+            return cached_bundle
+
+    primary_params = profile_params[profile_id]
+    primary_exec_max = profile_exec_max[profile_id]
+    vote_enabled = len(ordered_profile_ids) > 1
+    htf_counts, loc_counts = _build_backtest_alignment_counts(
+        htf_ts,
+        loc_ts,
+        ltf_ts,
+        start_idx=start_idx,
+    )
+    signal_table: List[Optional[Dict[str, Any]]] = [None] * len(ltf_ts)
+    decision_table: List[Optional[Any]] = [None] * len(ltf_ts)
+
+    def _build_signal_for_profile(pid: str, hi_val: int, li_val: int, ltf_i: int) -> Optional[Dict[str, Any]]:
+        p = profile_params[pid]
+        if int(live_signal_window_limit or 0) > 0:
+            return _build_backtest_signal_live_window(
+                htf_candles=htf_candles,
+                loc_candles=loc_candles,
+                ltf_candles=ltf_candles,
+                p=p,
+                hi=hi_val,
+                li=li_val,
+                i=ltf_i,
+                candle_limit=int(live_signal_window_limit),
+            )
+        return _build_backtest_signal_fast(pre_by_profile[pid], p, hi_val, li_val, ltf_i)
+
+    for i in range(max(0, int(start_idx)), len(ltf_ts)):
+        hi = htf_counts[i]
+        li = loc_counts[i]
+        if hi <= 0 or li <= 0:
+            continue
+
+        sig_local = _build_signal_for_profile(profile_id, hi, li, i)
+        if sig_local is None:
+            continue
+
+        if vote_enabled:
+            signals_by_profile: Dict[str, Dict[str, Any]] = {profile_id: sig_local}
+            decisions_by_profile: Dict[str, Optional[Any]] = {
+                profile_id: resolve_entry_decision(
+                    sig_local,
+                    max_level=primary_exec_max,
+                    min_level=min_level,
+                    exact_level=exact_level,
+                    tp1_r=primary_params.tp1_r_mult,
+                    tp2_r=primary_params.tp2_r_mult,
+                    tp1_only=tp1_only,
+                )
+            }
+            for pid in ordered_profile_ids:
+                if pid == profile_id:
+                    continue
+                if int(live_signal_window_limit or 0) <= 0 and pid not in pre_by_profile:
+                    continue
+                other_params = profile_params[pid]
+                other_sig = _build_signal_for_profile(pid, hi, li, i)
+                if other_sig is None:
+                    continue
+                signals_by_profile[pid] = other_sig
+                decisions_by_profile[pid] = resolve_entry_decision(
+                    other_sig,
+                    max_level=profile_exec_max[pid],
+                    min_level=min_level,
+                    exact_level=exact_level,
+                    tp1_r=other_params.tp1_r_mult,
+                    tp2_r=other_params.tp2_r_mult,
+                    tp1_only=tp1_only,
+                )
+            sig_local, _vote_meta = merge_entry_votes(
+                base_signal=sig_local,
+                profile_ids=[pid for pid in ordered_profile_ids if pid in signals_by_profile],
+                signals_by_profile=signals_by_profile,
+                decisions_by_profile=decisions_by_profile,
+                mode=cfg.strategy_profile_vote_mode,
+                min_agree=cfg.strategy_profile_vote_min_agree,
+                enforce_max_level=primary_exec_max,
+                profile_score_map=cfg.strategy_profile_vote_score_map,
+                level_weight=cfg.strategy_profile_vote_level_weight,
+            )
+
+        signal_table[i] = sig_local
+        decision_table[i] = resolve_entry_decision(
+            sig_local,
+            max_level=primary_exec_max,
+            min_level=min_level,
+            exact_level=exact_level,
+            tp1_r=primary_params.tp1_r_mult,
+            tp2_r=primary_params.tp2_r_mult,
+            tp1_only=tp1_only,
+        )
+
+    table_bundle = {
+        "htf_counts": htf_counts,
+        "loc_counts": loc_counts,
+        "signal_table": signal_table,
+        "decision_table": decision_table,
+        "table_cache_key": str(cache_key or ""),
+    }
+    if cache_path and cache_key:
+        _save_backtest_live_table_cache(cache_path, cache_key, inst_id=inst_id, table_bundle=table_bundle)
+    return table_bundle
+
+
 def _new_level_perf() -> Dict[int, Dict[str, float]]:
     return new_level_perf()
 
@@ -1255,6 +1653,8 @@ def run_backtest(
     bt_require_tp_sl: bool = False,
     bt_tp1_only: bool = False,
     bt_managed_exit: bool = False,
+    bt_force_managed_tp_fallback: bool = False,
+    bt_live_window_signals: bool = False,
     history_cache: Optional[Dict[str, Tuple[List[Candle], List[Candle], List[Candle]]]] = None,
 ) -> Dict[str, Any]:
     bars = max(300, int(bars))
@@ -1271,6 +1671,8 @@ def run_backtest(
     bt_require_tp_sl = bool(bt_require_tp_sl)
     bt_tp1_only = bool(bt_tp1_only)
     bt_managed_exit = bool(bt_managed_exit)
+    bt_force_managed_tp_fallback = bool(bt_force_managed_tp_fallback)
+    bt_live_window_signals = bool(bt_live_window_signals)
     ltf_s = bar_to_seconds(cfg.ltf_bar)
     loc_s = bar_to_seconds(cfg.loc_bar)
     htf_s = bar_to_seconds(cfg.htf_bar)
@@ -1307,7 +1709,8 @@ def run_backtest(
         f"Backtest start | insts={','.join(inst_ids)} htf={cfg.htf_bar} loc={cfg.loc_bar} ltf={cfg.ltf_bar} "
         f"bars={bars} horizon={horizon_desc} max_level={max_level} min_level={min_level} exact_level={exact_level} "
         f"min_gap={bt_min_open_interval_minutes}m day_cap={bt_max_opens_per_day} "
-        f"require_tp_sl={bt_require_tp_sl} tp1_only={bt_tp1_only} managed_exit={bt_managed_exit}"
+        f"require_tp_sl={bt_require_tp_sl} tp1_only={bt_tp1_only} managed_exit={bt_managed_exit} "
+        f"live_window_signals={bt_live_window_signals}"
     )
     bt_start = time.monotonic()
     inst_total = max(1, len(inst_ids))
@@ -1397,15 +1800,78 @@ def run_backtest(
             log(f"[{inst_id}] history ready | htf={len(htf)} loc={len(loc)} ltf={len(ltf)}")
 
         pre_by_profile: Dict[str, Dict[str, Any]] = {}
+        if not bt_live_window_signals:
+            try:
+                pre_by_profile[profile_id] = _build_backtest_precalc(htf, loc, ltf, inst_params)
+                for pid in inst_profile_ids:
+                    if pid == profile_id:
+                        continue
+                    p = cfg.strategy_profiles.get(pid, cfg.params)
+                    pre_by_profile[pid] = _build_backtest_precalc(htf, loc, ltf, p)
+            except Exception as e:
+                msg = f"precalc failed: {e}"
+                log(f"[{inst_id}] Backtest {msg}")
+                per_inst.append(
+                    {
+                        "inst_id": inst_id,
+                        "status": "error",
+                        "error": msg,
+                        "signals": 0,
+                        "tp1": 0,
+                        "tp2": 0,
+                        "stop": 0,
+                        "none": 0,
+                        "avg_r": 0.0,
+                        "by_level": {1: 0, 2: 0, 3: 0},
+                        "by_side": {"LONG": 0, "SHORT": 0},
+                        "level_perf": _finalize_level_perf(_new_level_perf()),
+                        "elapsed_s": float(time.monotonic() - inst_start),
+                    }
+                )
+                continue
+
+        start_idx = max(0, len(ltf) - bars)
+        bt_live_split_tp = bool(
+            bt_managed_exit
+            and resolve_backtest_split_tp_enabled(
+                attach_tpsl_on_entry=bool(getattr(cfg, "attach_tpsl_on_entry", False)),
+                enable_close=bool(getattr(inst_params, "enable_close", False)),
+                split_tp_on_entry=bool(getattr(inst_params, "split_tp_on_entry", False)),
+                tp1_close_pct=float(getattr(inst_params, "tp1_close_pct", 0.0) or 0.0),
+                force_managed_tp_fallback=bt_force_managed_tp_fallback,
+            )
+        )
+        htf_ts = [c.ts_ms for c in htf]
+        loc_ts = [c.ts_ms for c in loc]
+        ltf_ts = [c.ts_ms for c in ltf]
+        params_by_profile: Dict[str, StrategyParams] = {profile_id: inst_params}
+        for pid in inst_profile_ids:
+            if pid == profile_id:
+                continue
+            params_by_profile[pid] = cfg.strategy_profiles.get(pid, cfg.params)
         try:
-            pre_by_profile[profile_id] = _build_backtest_precalc(htf, loc, ltf, inst_params)
-            for pid in inst_profile_ids:
-                if pid == profile_id:
-                    continue
-                p = cfg.strategy_profiles.get(pid, cfg.params)
-                pre_by_profile[pid] = _build_backtest_precalc(htf, loc, ltf, p)
+            table_bundle = _build_backtest_signal_decision_tables(
+                cfg=cfg,
+                inst_id=inst_id,
+                profile_id=profile_id,
+                inst_profile_ids=inst_profile_ids,
+                params_by_profile=params_by_profile,
+                pre_by_profile=pre_by_profile,
+                htf_candles=htf,
+                loc_candles=loc,
+                ltf_candles=ltf,
+                htf_ts=htf_ts,
+                loc_ts=loc_ts,
+                ltf_ts=ltf_ts,
+                max_level=max_level,
+                min_level=min_level,
+                exact_level=exact_level,
+                tp1_only=bt_tp1_only,
+                start_idx=start_idx,
+                live_signal_window_limit=cfg.candle_limit if bt_live_window_signals else 0,
+            )
         except Exception as e:
-            msg = f"precalc failed: {e}"
+            msg = f"table build failed: {e}"
             log(f"[{inst_id}] Backtest {msg}")
             per_inst.append(
                 {
@@ -1425,103 +1891,13 @@ def run_backtest(
                 }
             )
             continue
-
-        htf_ts = [c.ts_ms for c in htf]
-        loc_ts = [c.ts_ms for c in loc]
-        ltf_ts = [c.ts_ms for c in ltf]
-
-        start_idx = max(0, len(ltf) - bars)
-        bt_live_split_tp = bool(
-            bt_managed_exit
-            and bool(getattr(cfg, "attach_tpsl_on_entry", False))
-            and bool(getattr(inst_params, "enable_close", False))
-            and bool(getattr(inst_params, "split_tp_on_entry", False))
-            and 0.0 < float(getattr(inst_params, "tp1_close_pct", 0.0) or 0.0) < 1.0
-        )
-        signal_decision_cache: Dict[int, Tuple[Optional[Dict[str, Any]], Optional[Any]]] = {}
-
-        def _signal_and_decision_at(ltf_i: int) -> Tuple[Optional[Dict[str, Any]], Optional[Any]]:
-            cached_pair = signal_decision_cache.get(ltf_i)
-            if cached_pair is not None:
-                return cached_pair
-
-            ts_i = ltf_ts[ltf_i]
-            hi = bisect.bisect_right(htf_ts, ts_i)
-            li = bisect.bisect_right(loc_ts, ts_i)
-            if hi <= 0 or li <= 0:
-                result = (None, None)
-                signal_decision_cache[ltf_i] = result
-                return result
-
-            sig_local = _build_backtest_signal_fast(pre_by_profile[profile_id], inst_params, hi, li, ltf_i)
-            if sig_local is None:
-                result = (None, None)
-                signal_decision_cache[ltf_i] = result
-                return result
-
-            if vote_enabled:
-                signals_by_profile: Dict[str, Dict[str, Any]] = {profile_id: sig_local}
-                decisions_by_profile: Dict[str, Optional[Any]] = {}
-                primary_exec_max = min(max_level, resolve_exec_max_level(inst_params, inst_id))
-                decisions_by_profile[profile_id] = resolve_entry_decision(
-                    sig_local,
-                    max_level=primary_exec_max,
-                    min_level=min_level,
-                    exact_level=exact_level,
-                    tp1_r=inst_params.tp1_r_mult,
-                    tp2_r=inst_params.tp2_r_mult,
-                    tp1_only=bt_tp1_only,
-                )
-                for pid in inst_profile_ids:
-                    if pid == profile_id:
-                        continue
-                    p = cfg.strategy_profiles.get(pid, cfg.params)
-                    pre_other = pre_by_profile.get(pid)
-                    if pre_other is None:
-                        continue
-                    other_sig = _build_backtest_signal_fast(pre_other, p, hi, li, ltf_i)
-                    if other_sig is None:
-                        continue
-                    signals_by_profile[pid] = other_sig
-                    other_exec_max = min(max_level, resolve_exec_max_level(p, inst_id))
-                    decisions_by_profile[pid] = resolve_entry_decision(
-                        other_sig,
-                        max_level=other_exec_max,
-                        min_level=min_level,
-                        exact_level=exact_level,
-                        tp1_r=p.tp1_r_mult,
-                        tp2_r=p.tp2_r_mult,
-                        tp1_only=bt_tp1_only,
-                    )
-                sig_local, _vote_meta = merge_entry_votes(
-                    base_signal=sig_local,
-                    profile_ids=[pid for pid in inst_profile_ids if pid in signals_by_profile],
-                    signals_by_profile=signals_by_profile,
-                    decisions_by_profile=decisions_by_profile,
-                    mode=cfg.strategy_profile_vote_mode,
-                    min_agree=cfg.strategy_profile_vote_min_agree,
-                    enforce_max_level=primary_exec_max,
-                    profile_score_map=cfg.strategy_profile_vote_score_map,
-                    level_weight=cfg.strategy_profile_vote_level_weight,
-                )
-
-            decision_local = resolve_entry_decision(
-                sig_local,
-                max_level=min(max_level, resolve_exec_max_level(inst_params, inst_id)),
-                min_level=min_level,
-                exact_level=exact_level,
-                tp1_r=inst_params.tp1_r_mult,
-                tp2_r=inst_params.tp2_r_mult,
-                tp1_only=bt_tp1_only,
-            )
-            result = (sig_local, decision_local)
-            signal_decision_cache[ltf_i] = result
-            return result
+        signal_table = table_bundle["signal_table"]
+        decision_table = table_bundle["decision_table"]
 
         def _signal_lookup(ltf_i: int) -> Optional[Dict[str, Any]]:
             if ltf_i < 0 or ltf_i >= len(ltf):
                 return None
-            return _signal_and_decision_at(ltf_i)[0]
+            return signal_table[ltf_i]
         sig_n = 0
         sum_r = 0.0
         tp1_n = 0
@@ -1543,7 +1919,8 @@ def run_backtest(
         for step_idx, i in enumerate(range(start_idx, len(ltf) - 1), 1):
             ts = ltf_ts[i]
             if i >= next_open_i:
-                sig, decision = _signal_and_decision_at(i)
+                sig = signal_table[i]
+                decision = decision_table[i]
                 if sig is not None and decision is not None:
                     side = decision.side
                     level = int(decision.level)
@@ -1703,6 +2080,7 @@ def run_backtest(
         "bt_require_tp_sl": bt_require_tp_sl,
         "bt_tp1_only": bt_tp1_only,
         "bt_managed_exit": bt_managed_exit,
+        "bt_live_window_signals": bt_live_window_signals,
         "elapsed_s": elapsed_total,
         "per_inst": per_inst,
     }
@@ -1741,6 +2119,7 @@ def run_backtest_compare(
     bt_require_tp_sl: bool = False,
     bt_tp1_only: bool = False,
     bt_managed_exit: bool = False,
+    bt_live_window_signals: bool = False,
 ) -> List[Dict[str, Any]]:
     picked = [lv for lv in levels if 1 <= int(lv) <= 3]
     if not picked:
@@ -1765,6 +2144,7 @@ def run_backtest_compare(
             bt_require_tp_sl=bt_require_tp_sl,
             bt_tp1_only=bt_tp1_only,
             bt_managed_exit=bt_managed_exit,
+            bt_live_window_signals=bt_live_window_signals,
             history_cache=cache,
         )
         results.append(one)

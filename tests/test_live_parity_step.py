@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 from okx_trader.decision_core import EntryDecision
 from run_interleaved_backtest_2y import (
+    _apply_cached_trade_trajectory_step,
+    _build_interleaved_trade_trajectory,
     _invert_signal_symmetric,
     _new_sim_position,
     _simulate_live_position_step,
@@ -350,7 +352,7 @@ class LiveParityStepTests(unittest.TestCase):
         self.assertTrue(res["is_stop"])
         self.assertAlmostEqual(res["r_raw"], -1.0, places=6)
 
-    def test_split_tp_intrabar_then_close_below_be_closes_remainder(self) -> None:
+    def test_split_tp_intrabar_then_close_below_be_arms_next_bar_stop(self) -> None:
         params = _params()
         long_decision = EntryDecision(
             side="LONG",
@@ -381,10 +383,141 @@ class LiveParityStepTests(unittest.TestCase):
             allow_reverse=False,
             managed_exit=True,
         )
+        self.assertFalse(res["closed"])
+        self.assertTrue(pos["tp1_done"])
+        self.assertTrue(pos["be_armed"])
+        self.assertAlmostEqual(pos["realized_r"], 0.75, places=6)
+        self.assertAlmostEqual(pos["hard_stop"], 100.0, places=6)
+
+    def test_managed_exit_without_split_stops_on_intrabar_touch(self) -> None:
+        params = _params()
+        params.auto_tighten_stop = False
+        long_decision = EntryDecision(
+            side="LONG",
+            level=2,
+            entry=100.0,
+            stop=95.0,
+            risk=5.0,
+            tp1=107.5,
+            tp2=112.5,
+        )
+        pos = _new_sim_position(decision=long_decision, entry_ts=1, entry_i=1, risk_amt=10.0)
+
+        res = _simulate_live_position_step(
+            pos=pos,
+            sig={
+                "close": 108.0,
+                "high": 108.0,
+                "low": 94.0,
+                "atr": 1.0,
+                "long_stop": 95.0,
+                "short_stop": 103.0,
+                "long_exit": False,
+                "short_exit": False,
+            },
+            params=params,
+            decision=None,
+            allow_reverse=False,
+            managed_exit=True,
+        )
         self.assertTrue(res["closed"])
-        self.assertEqual(res["outcome"], "TP1")
+        self.assertEqual(res["outcome"], "STOP")
         self.assertTrue(res["is_stop"])
-        self.assertAlmostEqual(res["r_raw"], 0.65, places=6)
+        self.assertAlmostEqual(res["r_raw"], -1.0, places=6)
+
+    def test_cached_trade_trajectory_replays_managed_exit_path(self) -> None:
+        params = _params()
+        params.auto_tighten_stop = False
+        long_decision = EntryDecision(
+            side="LONG",
+            level=2,
+            entry=100.0,
+            stop=95.0,
+            risk=5.0,
+            tp1=107.5,
+            tp2=112.5,
+        )
+        ltf_ts = [0, 1, 2, 3, 4]
+        signal_table = [
+            None,
+            {
+                "close": 100.0,
+                "high": 100.5,
+                "low": 99.5,
+                "atr": 1.0,
+                "long_exit": False,
+                "short_exit": False,
+            },
+            {
+                "close": 108.0,
+                "high": 108.2,
+                "low": 99.8,
+                "atr": 1.0,
+                "long_exit": False,
+                "short_exit": False,
+            },
+            {
+                "close": 99.6,
+                "high": 100.2,
+                "low": 99.4,
+                "atr": 1.0,
+                "long_exit": False,
+                "short_exit": False,
+            },
+            None,
+        ]
+        decision_table = [None] * len(signal_table)
+        trajectory = _build_interleaved_trade_trajectory(
+            ltf_ts=ltf_ts,
+            signal_table=signal_table,
+            decision_table=decision_table,
+            params=params,
+            entry_i=1,
+            decision=long_decision,
+            managed_exit=True,
+            use_signal_exit=True,
+            exit_model="standard",
+            split_tp_enabled=False,
+        )
+
+        live_pos = _new_sim_position(decision=long_decision, entry_ts=1, entry_i=1, risk_amt=10.0)
+        live_pos["exchange_split_tp_enabled"] = False
+        replay_pos = _new_sim_position(decision=long_decision, entry_ts=1, entry_i=1, risk_amt=10.0)
+        replay_pos["exchange_split_tp_enabled"] = False
+        replay_pos["_trajectory_events"] = trajectory
+        replay_pos["_trajectory_ptr"] = 0
+
+        for idx in (2, 3):
+            sig = signal_table[idx]
+            direct = _simulate_live_position_step(
+                pos=live_pos,
+                sig=sig,
+                params=params,
+                decision=None,
+                allow_reverse=False,
+                managed_exit=True,
+                use_signal_exit=True,
+            )
+            replay = _apply_cached_trade_trajectory_step(
+                pos=replay_pos,
+                current_i=idx,
+                decision=None,
+                allow_reverse=False,
+            )
+            self.assertAlmostEqual(replay_pos["qty_rem"], live_pos["qty_rem"], places=6)
+            self.assertAlmostEqual(replay_pos["realized_r"], live_pos["realized_r"], places=6)
+            self.assertEqual(replay_pos["tp1_done"], live_pos["tp1_done"])
+            self.assertEqual(replay_pos["be_armed"], live_pos["be_armed"])
+            self.assertAlmostEqual(replay_pos["hard_stop"], live_pos["hard_stop"], places=6)
+            self.assertEqual(replay["closed"], direct["closed"])
+            self.assertEqual(replay["outcome"], direct["outcome"])
+            self.assertEqual(replay["is_stop"], direct["is_stop"])
+            self.assertAlmostEqual(replay["r_raw"], direct["r_raw"], places=6)
+            if direct["closed"]:
+                break
+
+        self.assertTrue(direct["closed"])
+        self.assertEqual(replay_pos["_trajectory_ptr"], len(trajectory))
 
 
 if __name__ == "__main__":

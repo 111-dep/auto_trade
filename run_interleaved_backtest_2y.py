@@ -2,19 +2,25 @@
 from __future__ import annotations
 
 import argparse
-import bisect
 import csv
 import datetime as dt
 import hashlib
+import json
 import math
 import os
+import pickle
 import time
 import traceback
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from okx_trader.alerts import send_telegram
-from okx_trader.backtest import _build_backtest_precalc, _build_backtest_signal_fast
+from okx_trader.backtest import (
+    _build_backtest_precalc,
+    _build_backtest_signal_decision_tables,
+    _simulate_live_managed_step,
+    resolve_backtest_split_tp_enabled,
+)
 from okx_trader.backtest_report import (
     finalize_level_perf,
     format_backtest_result_line,
@@ -38,7 +44,6 @@ from okx_trader.entry_exec_policy import (
     resolve_entry_exec_mode,
     resolve_entry_limit_fallback_mode_for_params,
 )
-from okx_trader.profile_vote import merge_entry_votes
 from okx_trader.risk_guard import (
     is_open_limit_reached,
     min_open_gap_remaining_minutes,
@@ -70,6 +75,249 @@ def stable_u01(key: str) -> float:
     h = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
     n = int.from_bytes(h, byteorder="big", signed=False)
     return n / float(2**64)
+
+
+_INTERLEAVED_TRACE_CACHE_VERSION = "interleaved_trace_v1"
+
+
+def _interleaved_trace_cache_enabled() -> bool:
+    raw = str(os.getenv("OKX_BACKTEST_INTERLEAVED_TRACE_CACHE_ENABLED", "1") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _interleaved_trace_cache_dir(cfg: Any) -> str:
+    override = str(os.getenv("OKX_BACKTEST_INTERLEAVED_TRACE_CACHE_DIR", "") or "").strip()
+    if override:
+        return override
+    hist_dir = str(getattr(cfg, "history_cache_dir", "") or "").strip()
+    if hist_dir:
+        return os.path.join(os.path.dirname(os.path.abspath(hist_dir.rstrip(os.sep))), "backtest_interleaved_traces")
+    return os.path.join(os.getcwd(), ".cache", "backtest_interleaved_traces")
+
+
+def _interleaved_trace_cache_key(
+    *,
+    table_cache_key: str,
+    params: Any,
+    managed_exit: bool,
+    use_signal_exit: bool,
+    exit_model: str,
+    split_tp_enabled: bool,
+) -> str:
+    payload = {
+        "version": _INTERLEAVED_TRACE_CACHE_VERSION,
+        "table_cache_key": str(table_cache_key or ""),
+        "managed_exit": bool(managed_exit),
+        "use_signal_exit": bool(use_signal_exit),
+        "exit_model": str(exit_model or "standard"),
+        "split_tp_enabled": bool(split_tp_enabled),
+        "params": {
+            "tp1_close_pct": float(getattr(params, "tp1_close_pct", 0.0) or 0.0),
+            "tp2_close_rest": bool(getattr(params, "tp2_close_rest", False)),
+            "be_trigger_r_mult": float(getattr(params, "be_trigger_r_mult", 0.0) or 0.0),
+            "be_offset_pct": float(getattr(params, "be_offset_pct", 0.0) or 0.0),
+            "be_fee_buffer_pct": float(getattr(params, "be_fee_buffer_pct", 0.0) or 0.0),
+            "auto_tighten_stop": bool(getattr(params, "auto_tighten_stop", False)),
+            "trail_after_tp1": bool(getattr(params, "trail_after_tp1", False)),
+            "trail_atr_mult": float(getattr(params, "trail_atr_mult", 0.0) or 0.0),
+        },
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _interleaved_trace_cache_path(cfg: Any, inst_id: str, trace_cache_key: str) -> str:
+    root = _interleaved_trace_cache_dir(cfg)
+    safe_inst = str(inst_id).replace("/", "_").replace("-", "_")
+    return os.path.join(root, f"{safe_inst}__{trace_cache_key}.pkl")
+
+
+def _load_interleaved_trace_cache(path: str, trace_cache_key: str, *, inst_id: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "rb") as fh:
+            payload = pickle.load(fh)
+    except Exception as e:
+        print(f"[{inst_id}] trace cache load failed: {e}", flush=True)
+        return {}
+    if not isinstance(payload, dict) or payload.get("trace_cache_key") != trace_cache_key:
+        return {}
+    data = payload.get("trajectories")
+    if not isinstance(data, dict):
+        return {}
+    print(f"[{inst_id}] trace cache hit | items={len(data)} key={trace_cache_key[:12]} path={path}", flush=True)
+    return data
+
+
+def _save_interleaved_trace_cache(path: str, trace_cache_key: str, *, inst_id: str, trajectories: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "wb") as fh:
+            pickle.dump({
+                "trace_cache_key": trace_cache_key,
+                "trajectories": trajectories,
+            }, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, path)
+        print(f"[{inst_id}] trace cache save | items={len(trajectories)} key={trace_cache_key[:12]} path={path}", flush=True)
+    except Exception as e:
+        print(f"[{inst_id}] trace cache save failed: {e}", flush=True)
+
+
+def _trajectory_candidate_key(*, entry_i: int, decision: Any, exit_model: str, split_tp_enabled: bool) -> str:
+    raw = (
+        f"{int(entry_i)}|{str(getattr(decision, 'side', '')).upper()}|{int(getattr(decision, 'level', 0) or 0)}|"
+        f"{repr(float(getattr(decision, 'entry', 0.0) or 0.0))}|{repr(float(getattr(decision, 'stop', 0.0) or 0.0))}|"
+        f"{repr(float(getattr(decision, 'tp1', 0.0) or 0.0))}|{repr(float(getattr(decision, 'tp2', 0.0) or 0.0))}|"
+        f"{str(exit_model or 'standard')}|{1 if bool(split_tp_enabled) else 0}"
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _tracked_position_state(pos: Dict[str, Any]) -> Tuple[float, float, bool, bool, float]:
+    return (
+        float(pos.get("qty_rem", 0.0) or 0.0),
+        float(pos.get("realized_r", 0.0) or 0.0),
+        bool(pos.get("tp1_done", False)),
+        bool(pos.get("be_armed", False)),
+        float(pos.get("hard_stop", pos.get("stop", 0.0)) or 0.0),
+    )
+
+
+def _build_interleaved_trade_trajectory(
+    *,
+    ltf_ts: List[int],
+    signal_table: List[Optional[Dict[str, Any]]],
+    decision_table: List[Optional[Any]],
+    params: Any,
+    entry_i: int,
+    decision: Any,
+    managed_exit: bool,
+    use_signal_exit: bool,
+    exit_model: str,
+    split_tp_enabled: bool,
+    swap_stop_r_mult: float = 0.0,
+) -> List[Dict[str, Any]]:
+    pos = _new_sim_position(
+        decision=decision,
+        entry_ts=int(ltf_ts[entry_i]),
+        entry_i=int(entry_i),
+        risk_amt=1.0,
+        exit_model=exit_model,
+        swap_stop_r_mult=float(swap_stop_r_mult),
+    )
+    pos["exchange_split_tp_enabled"] = bool(split_tp_enabled)
+    out: List[Dict[str, Any]] = []
+    for i in range(int(entry_i) + 1, max(int(entry_i) + 1, len(signal_table) - 1)):
+        sig = signal_table[i]
+        if sig is None:
+            continue
+        before = _tracked_position_state(pos)
+        res = _simulate_live_position_step(
+            pos=pos,
+            sig=sig,
+            params=params,
+            decision=decision_table[i],
+            allow_reverse=False,
+            managed_exit=managed_exit,
+            use_signal_exit=use_signal_exit,
+        )
+        after = _tracked_position_state(pos)
+        if bool(res.get("closed", False)) or after != before:
+            out.append(
+                {
+                    "i": int(i),
+                    "qty_rem": float(pos.get("qty_rem", 0.0) or 0.0),
+                    "realized_r": float(pos.get("realized_r", 0.0) or 0.0),
+                    "tp1_done": bool(pos.get("tp1_done", False)),
+                    "be_armed": bool(pos.get("be_armed", False)),
+                    "hard_stop": float(pos.get("hard_stop", pos.get("stop", 0.0)) or 0.0),
+                    "closed": bool(res.get("closed", False)),
+                    "outcome": str(res.get("outcome", "NONE") or "NONE"),
+                    "r_raw": float(res.get("r_raw", 0.0) or 0.0),
+                    "is_stop": bool(res.get("is_stop", False)),
+                }
+            )
+        if bool(res.get("closed", False)):
+            break
+    return out
+
+
+def _apply_cached_trade_trajectory_step(*, pos: Dict[str, Any], current_i: int, decision: Optional[Any], allow_reverse: bool) -> Dict[str, Any]:
+    events = pos.get("_trajectory_events")
+    if not isinstance(events, list):
+        return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
+    ptr = int(pos.get("_trajectory_ptr", 0) or 0)
+    if ptr >= len(events):
+        return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
+    ev = events[ptr]
+    if int(ev.get("i", -1) or -1) != int(current_i):
+        return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
+
+    pos["qty_rem"] = float(ev.get("qty_rem", pos.get("qty_rem", 0.0)) or 0.0)
+    pos["realized_r"] = float(ev.get("realized_r", pos.get("realized_r", 0.0)) or 0.0)
+    pos["tp1_done"] = bool(ev.get("tp1_done", pos.get("tp1_done", False)))
+    pos["be_armed"] = bool(ev.get("be_armed", pos.get("be_armed", False)))
+    pos["hard_stop"] = float(ev.get("hard_stop", pos.get("hard_stop", pos.get("stop", 0.0))) or 0.0)
+    pos["_trajectory_ptr"] = ptr + 1
+
+    closed = bool(ev.get("closed", False))
+    reverse_decision = None
+    if closed and allow_reverse and (decision is not None):
+        side_u = str(pos.get("side", "")).strip().upper()
+        want_side = "SHORT" if side_u == "LONG" else "LONG"
+        if str(getattr(decision, "side", "")).upper() == want_side:
+            reverse_decision = decision
+    return {
+        "closed": closed,
+        "outcome": str(ev.get("outcome", "NONE") or "NONE"),
+        "r_raw": float(ev.get("r_raw", 0.0) or 0.0),
+        "is_stop": bool(ev.get("is_stop", False)),
+        "reverse_decision": reverse_decision,
+    }
+
+
+def _get_or_build_interleaved_trade_trajectory(
+    *,
+    row: Dict[str, Any],
+    entry_i: int,
+    decision: Any,
+    params: Any,
+    managed_exit: bool,
+    use_signal_exit: bool,
+    exit_model: str,
+    split_tp_enabled: bool,
+    swap_stop_r_mult: float = 0.0,
+) -> Optional[List[Dict[str, Any]]]:
+    trace_store = row.get("trace_cache_store")
+    if not isinstance(trace_store, dict):
+        return None
+    candidate_key = _trajectory_candidate_key(
+        entry_i=entry_i,
+        decision=decision,
+        exit_model=exit_model,
+        split_tp_enabled=split_tp_enabled,
+    )
+    cached = trace_store.get(candidate_key)
+    if isinstance(cached, list):
+        return cached
+    trajectory = _build_interleaved_trade_trajectory(
+        ltf_ts=row["ltf_ts"],
+        signal_table=row["signal_table"],
+        decision_table=row["decision_table"],
+        params=params,
+        entry_i=entry_i,
+        decision=decision,
+        managed_exit=managed_exit,
+        use_signal_exit=use_signal_exit,
+        exit_model=exit_model,
+        split_tp_enabled=split_tp_enabled,
+        swap_stop_r_mult=swap_stop_r_mult,
+    )
+    trace_store[candidate_key] = trajectory
+    row["trace_cache_dirty"] = True
+    return trajectory
 
 
 def apply_execution_penalty_r(
@@ -353,42 +601,18 @@ def _simulate_live_position_step(
     risk = max(1e-8, float(pos.get("risk", 0.0) or 0.0))
     tp1 = float(pos.get("tp1", entry))
     tp2 = float(pos.get("tp2", entry))
-    qty_rem = max(0.0, float(pos.get("qty_rem", 0.0) or 0.0))
-    realized_r = float(pos.get("realized_r", 0.0) or 0.0)
-    tp1_done = bool(pos.get("tp1_done", False))
-    be_armed = bool(pos.get("be_armed", False))
     hard_stop = float(pos.get("hard_stop", pos.get("stop", entry)) or entry)
-
-    be_total_offset = max(0.0, float(params.be_offset_pct) + float(params.be_fee_buffer_pct))
-    be_trigger_r = max(0.0, float(params.be_trigger_r_mult))
-    auto_tighten_stop = bool(getattr(params, "auto_tighten_stop", True))
-    split_tp_enabled = bool(pos.get("exchange_split_tp_enabled", False))
     high, low = _signal_high_low(sig, close)
 
-    def _close_now(*, outcome: str, close_px: float, is_stop: bool) -> Dict[str, Any]:
-        nonlocal realized_r
-        realized_r += qty_rem * _close_remaining_r(side_u, entry, risk, close_px)
-        pos["qty_rem"] = 0.0
-        pos["realized_r"] = realized_r
+    def _with_reverse(base: Dict[str, Any]) -> Dict[str, Any]:
         reverse_decision = None
-        if allow_reverse and (decision is not None):
+        if bool(base.get("closed", False)) and allow_reverse and (decision is not None):
             want_side = "SHORT" if side_u == "LONG" else "LONG"
             if str(getattr(decision, "side", "")).upper() == want_side:
                 reverse_decision = decision
-        return {
-            "closed": True,
-            "outcome": str(outcome),
-            "r_raw": float(realized_r),
-            "is_stop": bool(is_stop),
-            "reverse_decision": reverse_decision,
-        }
-
-    def _finalize_open_state(*, next_qty: float, next_realized_r: float, next_tp1_done: bool, next_be_armed: bool, next_hard_stop: float) -> None:
-        pos["qty_rem"] = max(0.0, float(next_qty))
-        pos["realized_r"] = float(next_realized_r)
-        pos["tp1_done"] = bool(next_tp1_done)
-        pos["be_armed"] = bool(next_be_armed)
-        pos["hard_stop"] = float(next_hard_stop)
+        out = dict(base)
+        out["reverse_decision"] = reverse_decision
+        return out
 
     exit_model = str(pos.get("exit_model", "standard") or "standard")
     if exit_model == "swapped_reverse":
@@ -400,474 +624,81 @@ def _simulate_live_position_step(
             tp_hit = high >= swap_take_px
             long_exit = bool(sig.get("long_exit", False)) if use_signal_exit else False
             if stop_hit and tp_hit:
-                return _close_now(outcome="STOP", close_px=swap_stop_px, is_stop=True)
+                return _with_reverse({"closed": True, "outcome": "STOP", "r_raw": _close_remaining_r(side_u, entry, risk, swap_stop_px), "is_stop": True})
             if stop_hit:
-                return _close_now(outcome="STOP", close_px=swap_stop_px, is_stop=True)
+                return _with_reverse({"closed": True, "outcome": "STOP", "r_raw": _close_remaining_r(side_u, entry, risk, swap_stop_px), "is_stop": True})
             if tp_hit:
-                return _close_now(outcome="TP1", close_px=swap_take_px, is_stop=False)
+                return _with_reverse({"closed": True, "outcome": "TP1", "r_raw": _close_remaining_r(side_u, entry, risk, swap_take_px), "is_stop": False})
             if long_exit:
-                return _close_now(outcome="EXIT", close_px=close, is_stop=False)
+                return _with_reverse({"closed": True, "outcome": "EXIT", "r_raw": _close_remaining_r(side_u, entry, risk, close), "is_stop": False})
             return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
 
         stop_hit = high >= swap_stop_px
         tp_hit = low <= swap_take_px
         short_exit = bool(sig.get("short_exit", False)) if use_signal_exit else False
         if stop_hit and tp_hit:
-            return _close_now(outcome="STOP", close_px=swap_stop_px, is_stop=True)
+            return _with_reverse({"closed": True, "outcome": "STOP", "r_raw": _close_remaining_r(side_u, entry, risk, swap_stop_px), "is_stop": True})
         if stop_hit:
-            return _close_now(outcome="STOP", close_px=swap_stop_px, is_stop=True)
+            return _with_reverse({"closed": True, "outcome": "STOP", "r_raw": _close_remaining_r(side_u, entry, risk, swap_stop_px), "is_stop": True})
         if tp_hit:
-            return _close_now(outcome="TP1", close_px=swap_take_px, is_stop=False)
+            return _with_reverse({"closed": True, "outcome": "TP1", "r_raw": _close_remaining_r(side_u, entry, risk, swap_take_px), "is_stop": False})
         if short_exit:
-            return _close_now(outcome="EXIT", close_px=close, is_stop=False)
+            return _with_reverse({"closed": True, "outcome": "EXIT", "r_raw": _close_remaining_r(side_u, entry, risk, close), "is_stop": False})
         return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
+
+    if managed_exit:
+        res = _simulate_live_managed_step(
+            side=side_u,
+            entry=entry,
+            risk=risk,
+            tp1=tp1,
+            tp2=tp2,
+            pos=pos,
+            sig=sig,
+            tp1_close_pct=float(params.tp1_close_pct),
+            tp2_close_rest=bool(params.tp2_close_rest),
+            be_trigger_r_mult=float(params.be_trigger_r_mult),
+            be_offset_pct=float(params.be_offset_pct),
+            be_fee_buffer_pct=float(params.be_fee_buffer_pct),
+            auto_tighten_stop=bool(getattr(params, "auto_tighten_stop", True)),
+            trail_after_tp1=bool(getattr(params, "trail_after_tp1", True)),
+            trail_atr_mult=float(getattr(params, "trail_atr_mult", 0.0)),
+            signal_exit_enabled=bool(use_signal_exit),
+            split_tp_enabled=bool(pos.get("exchange_split_tp_enabled", False)),
+        )
+        return _with_reverse(res)
 
     if side_u == "LONG":
-        if managed_exit and split_tp_enabled:
-            active_stop = float(hard_stop)
-            use_tp2 = bool(params.tp2_close_rest and float(params.tp1_close_pct) < 0.999)
-            tp1_pct = min(max(float(params.tp1_close_pct), 0.0), 1.0)
-
-            if not tp1_done:
-                stop_hit = low <= active_stop
-                tp1_hit = high >= tp1 and tp1_pct > 0.0
-                tp2_hit = use_tp2 and high >= tp2
-                if stop_hit and (tp1_hit or tp2_hit):
-                    return _close_now(outcome="STOP", close_px=active_stop, is_stop=True)
-                if stop_hit:
-                    return _close_now(outcome="STOP", close_px=active_stop, is_stop=True)
-                if tp1_hit:
-                    close_qty = qty_rem * tp1_pct
-                    if close_qty > 0:
-                        realized_r += close_qty * _close_remaining_r("LONG", entry, risk, tp1)
-                        qty_rem = max(0.0, qty_rem - close_qty)
-                    tp1_done = True
-                    be_armed = True
-                    if qty_rem <= 1e-9:
-                        pos["qty_rem"] = 0.0
-                        pos["realized_r"] = realized_r
-                        pos["tp1_done"] = True
-                        pos["be_armed"] = True
-                        return {
-                            "closed": True,
-                            "outcome": "TP1",
-                            "r_raw": float(realized_r),
-                            "is_stop": False,
-                            "reverse_decision": None,
-                        }
-                    if tp2_hit:
-                        realized_r += qty_rem * _close_remaining_r("LONG", entry, risk, tp2)
-                        qty_rem = 0.0
-                        pos["qty_rem"] = 0.0
-                        pos["realized_r"] = realized_r
-                        pos["tp1_done"] = True
-                        pos["be_armed"] = True
-                        return {
-                            "closed": True,
-                            "outcome": "TP2",
-                            "r_raw": float(realized_r),
-                            "is_stop": False,
-                            "reverse_decision": None,
-                        }
-
-            if tp1_done and qty_rem > 0:
-                stop_hit = low <= active_stop
-                tp2_hit = use_tp2 and high >= tp2
-                if stop_hit and tp2_hit:
-                    return _close_now(outcome="TP1", close_px=active_stop, is_stop=True)
-                if stop_hit:
-                    return _close_now(outcome="TP1", close_px=active_stop, is_stop=True)
-                if tp2_hit:
-                    return _close_now(outcome="TP2", close_px=tp2, is_stop=False)
-
-            peak = max(float(pos.get("peak_price", entry) or entry), close)
-            pos["peak_price"] = peak
-            if auto_tighten_stop and (not be_armed) and close >= entry + risk * be_trigger_r:
-                be_armed = True
-
-            next_stop = float(active_stop)
-            if auto_tighten_stop:
-                next_stop = max(next_stop, float(sig.get("long_stop", active_stop) or active_stop))
-                if be_armed:
-                    next_stop = max(next_stop, entry * (1.0 + be_total_offset))
-                if (not bool(params.trail_after_tp1)) or tp1_done:
-                    atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
-                    trail_stop = peak - atr_v * float(params.trail_atr_mult)
-                    next_stop = max(next_stop, trail_stop)
-            elif be_armed:
-                next_stop = max(next_stop, entry * (1.0 + be_total_offset))
-
-            _finalize_open_state(
-                next_qty=qty_rem,
-                next_realized_r=realized_r,
-                next_tp1_done=tp1_done,
-                next_be_armed=be_armed,
-                next_hard_stop=next_stop,
-            )
-
-            long_exit = bool(sig.get("long_exit", False)) if use_signal_exit else False
-            stop_hit = close <= next_stop
-            if long_exit or stop_hit:
-                realized_r += qty_rem * _close_remaining_r("LONG", entry, risk, close)
-                pos["qty_rem"] = 0.0
-                pos["realized_r"] = realized_r
-                outcome = "TP1" if tp1_done else ("STOP" if stop_hit else "EXIT")
-                reverse_decision = None
-                if allow_reverse and (decision is not None) and str(getattr(decision, "side", "")).upper() == "SHORT":
-                    reverse_decision = decision
-                return {
-                    "closed": True,
-                    "outcome": str(outcome),
-                    "r_raw": float(realized_r),
-                    "is_stop": bool(stop_hit),
-                    "reverse_decision": reverse_decision,
-                }
-            return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
-
-        if not managed_exit:
-            stop_hit = close <= float(pos.get("stop", entry) or entry)
-            tp_hit = close >= tp2
-            long_exit = bool(sig.get("long_exit", False)) if use_signal_exit else False
-            if stop_hit or tp_hit or long_exit:
-                realized_r += qty_rem * _close_remaining_r("LONG", entry, risk, close)
-                pos["qty_rem"] = 0.0
-                pos["realized_r"] = realized_r
-                outcome = "STOP" if stop_hit else ("TP2" if tp_hit else "EXIT")
-                reverse_decision = None
-                reverse_now = stop_hit or long_exit
-                if reverse_now and allow_reverse and (decision is not None) and str(getattr(decision, "side", "")).upper() == "SHORT":
-                    reverse_decision = decision
-                return {
-                    "closed": True,
-                    "outcome": str(outcome),
-                    "r_raw": float(realized_r),
-                    "is_stop": bool(stop_hit),
-                    "reverse_decision": reverse_decision,
-                }
-            return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
-
-        peak = max(float(pos.get("peak_price", entry) or entry), close)
-        pos["peak_price"] = peak
-
-        if auto_tighten_stop and (not be_armed) and close >= entry + risk * be_trigger_r:
-            be_armed = True
-            pos["be_armed"] = True
-
-        if (not tp1_done) and float(params.tp1_close_pct) > 0:
-            tp1_price = entry + risk * float(params.tp1_r_mult)
-            if close >= tp1_price:
-                pct = min(max(float(params.tp1_close_pct), 0.0), 1.0)
-                close_qty = qty_rem * pct
-                if close_qty >= qty_rem * 0.999:
-                    realized_r += qty_rem * _close_remaining_r("LONG", entry, risk, close)
-                    pos["qty_rem"] = 0.0
-                    pos["realized_r"] = realized_r
-                    return {
-                        "closed": True,
-                        "outcome": "TP1",
-                        "r_raw": float(realized_r),
-                        "is_stop": False,
-                        "reverse_decision": None,
-                    }
-                if close_qty > 0:
-                    realized_r += close_qty * _close_remaining_r("LONG", entry, risk, close)
-                    qty_rem = max(0.0, qty_rem - close_qty)
-                    tp1_done = True
-                    be_armed = True
-                    be_stop = entry * (1.0 + be_total_offset)
-                    hard_stop = max(hard_stop, be_stop)
-                    pos["qty_rem"] = qty_rem
-                    pos["realized_r"] = realized_r
-                    pos["tp1_done"] = True
-                    pos["be_armed"] = True
-                    pos["hard_stop"] = hard_stop
-                    return {
-                        "closed": False,
-                        "outcome": "NONE",
-                        "r_raw": 0.0,
-                        "is_stop": False,
-                        "reverse_decision": None,
-                    }
-
-        if bool(params.tp2_close_rest) and tp1_done and qty_rem > 0:
-            tp2_price = entry + risk * float(params.tp2_r_mult)
-            if close >= tp2_price:
-                realized_r += qty_rem * _close_remaining_r("LONG", entry, risk, close)
-                pos["qty_rem"] = 0.0
-                pos["realized_r"] = realized_r
-                return {
-                    "closed": True,
-                    "outcome": "TP2",
-                    "r_raw": float(realized_r),
-                    "is_stop": False,
-                    "reverse_decision": None,
-                }
-
-        dynamic_stop = float(hard_stop)
-        if auto_tighten_stop:
-            dynamic_stop = max(dynamic_stop, float(sig.get("long_stop", hard_stop) or hard_stop))
-            if be_armed:
-                dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
-            if (not bool(params.trail_after_tp1)) or tp1_done:
-                atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
-                trail_stop = peak - atr_v * float(params.trail_atr_mult)
-                dynamic_stop = max(dynamic_stop, trail_stop)
-        elif be_armed:
-            dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
-
-        stop_hit = close <= dynamic_stop
+        stop_hit = low <= hard_stop
+        tp2_hit = high >= tp2
+        tp1_hit = high >= tp1
         long_exit = bool(sig.get("long_exit", False)) if use_signal_exit else False
-
-        pos["qty_rem"] = qty_rem
-        pos["realized_r"] = realized_r
-        pos["tp1_done"] = tp1_done
-        pos["be_armed"] = be_armed
-        pos["hard_stop"] = dynamic_stop
-
-        if long_exit or stop_hit:
-            realized_r += qty_rem * _close_remaining_r("LONG", entry, risk, close)
-            pos["qty_rem"] = 0.0
-            pos["realized_r"] = realized_r
-            if tp1_done:
-                outcome = "TP1"
-            elif stop_hit:
-                outcome = "STOP"
-            else:
-                outcome = "EXIT"
-            reverse_decision = None
-            if allow_reverse and (decision is not None) and str(getattr(decision, "side", "")).upper() == "SHORT":
-                reverse_decision = decision
-            return {
-                "closed": True,
-                "outcome": str(outcome),
-                "r_raw": float(realized_r),
-                "is_stop": bool(stop_hit),
-                "reverse_decision": reverse_decision,
-            }
+        if stop_hit and (tp1_hit or tp2_hit):
+            return _with_reverse({"closed": True, "outcome": "STOP", "r_raw": _close_remaining_r(side_u, entry, risk, hard_stop), "is_stop": True})
+        if stop_hit:
+            return _with_reverse({"closed": True, "outcome": "STOP", "r_raw": _close_remaining_r(side_u, entry, risk, hard_stop), "is_stop": True})
+        if tp2_hit:
+            return _with_reverse({"closed": True, "outcome": "TP2", "r_raw": _close_remaining_r(side_u, entry, risk, tp2), "is_stop": False})
+        if tp1_hit:
+            return _with_reverse({"closed": True, "outcome": "TP1", "r_raw": _close_remaining_r(side_u, entry, risk, tp1), "is_stop": False})
+        if long_exit:
+            return _with_reverse({"closed": True, "outcome": "EXIT", "r_raw": _close_remaining_r(side_u, entry, risk, close), "is_stop": False})
         return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
 
-    if not managed_exit:
-        stop_hit = close >= float(pos.get("stop", entry) or entry)
-        tp_hit = close <= tp2
-        short_exit = bool(sig.get("short_exit", False)) if use_signal_exit else False
-        if stop_hit or tp_hit or short_exit:
-            realized_r += qty_rem * _close_remaining_r("SHORT", entry, risk, close)
-            pos["qty_rem"] = 0.0
-            pos["realized_r"] = realized_r
-            outcome = "STOP" if stop_hit else ("TP2" if tp_hit else "EXIT")
-            reverse_decision = None
-            reverse_now = stop_hit or short_exit
-            if reverse_now and allow_reverse and (decision is not None) and str(getattr(decision, "side", "")).upper() == "LONG":
-                reverse_decision = decision
-            return {
-                "closed": True,
-                "outcome": str(outcome),
-                "r_raw": float(realized_r),
-                "is_stop": bool(stop_hit),
-                "reverse_decision": reverse_decision,
-            }
-        return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
-
-    if split_tp_enabled:
-        active_stop = float(hard_stop)
-        use_tp2 = bool(params.tp2_close_rest and float(params.tp1_close_pct) < 0.999)
-        tp1_pct = min(max(float(params.tp1_close_pct), 0.0), 1.0)
-
-        if not tp1_done:
-            stop_hit = high >= active_stop
-            tp1_hit = low <= tp1 and tp1_pct > 0.0
-            tp2_hit = use_tp2 and low <= tp2
-            if stop_hit and (tp1_hit or tp2_hit):
-                return _close_now(outcome="STOP", close_px=active_stop, is_stop=True)
-            if stop_hit:
-                return _close_now(outcome="STOP", close_px=active_stop, is_stop=True)
-            if tp1_hit:
-                close_qty = qty_rem * tp1_pct
-                if close_qty > 0:
-                    realized_r += close_qty * _close_remaining_r("SHORT", entry, risk, tp1)
-                    qty_rem = max(0.0, qty_rem - close_qty)
-                tp1_done = True
-                be_armed = True
-                if qty_rem <= 1e-9:
-                    pos["qty_rem"] = 0.0
-                    pos["realized_r"] = realized_r
-                    pos["tp1_done"] = True
-                    pos["be_armed"] = True
-                    return {
-                        "closed": True,
-                        "outcome": "TP1",
-                        "r_raw": float(realized_r),
-                        "is_stop": False,
-                        "reverse_decision": None,
-                    }
-                if tp2_hit:
-                    realized_r += qty_rem * _close_remaining_r("SHORT", entry, risk, tp2)
-                    qty_rem = 0.0
-                    pos["qty_rem"] = 0.0
-                    pos["realized_r"] = realized_r
-                    pos["tp1_done"] = True
-                    pos["be_armed"] = True
-                    return {
-                        "closed": True,
-                        "outcome": "TP2",
-                        "r_raw": float(realized_r),
-                        "is_stop": False,
-                        "reverse_decision": None,
-                    }
-
-        if tp1_done and qty_rem > 0:
-            stop_hit = high >= active_stop
-            tp2_hit = use_tp2 and low <= tp2
-            if stop_hit and tp2_hit:
-                return _close_now(outcome="TP1", close_px=active_stop, is_stop=True)
-            if stop_hit:
-                return _close_now(outcome="TP1", close_px=active_stop, is_stop=True)
-            if tp2_hit:
-                return _close_now(outcome="TP2", close_px=tp2, is_stop=False)
-
-        trough = min(float(pos.get("trough_price", entry) or entry), close)
-        pos["trough_price"] = trough
-        if auto_tighten_stop and (not be_armed) and close <= entry - risk * be_trigger_r:
-            be_armed = True
-
-        next_stop = float(active_stop)
-        if auto_tighten_stop:
-            next_stop = min(next_stop, float(sig.get("short_stop", active_stop) or active_stop))
-            if be_armed:
-                next_stop = min(next_stop, entry * (1.0 - be_total_offset))
-            if (not bool(params.trail_after_tp1)) or tp1_done:
-                atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
-                trail_stop = trough + atr_v * float(params.trail_atr_mult)
-                next_stop = min(next_stop, trail_stop)
-        elif be_armed:
-            next_stop = min(next_stop, entry * (1.0 - be_total_offset))
-
-        _finalize_open_state(
-            next_qty=qty_rem,
-            next_realized_r=realized_r,
-            next_tp1_done=tp1_done,
-            next_be_armed=be_armed,
-            next_hard_stop=next_stop,
-        )
-
-        short_exit = bool(sig.get("short_exit", False)) if use_signal_exit else False
-        stop_hit = close >= next_stop
-        if short_exit or stop_hit:
-            realized_r += qty_rem * _close_remaining_r("SHORT", entry, risk, close)
-            pos["qty_rem"] = 0.0
-            pos["realized_r"] = realized_r
-            outcome = "TP1" if tp1_done else ("STOP" if stop_hit else "EXIT")
-            reverse_decision = None
-            if allow_reverse and (decision is not None) and str(getattr(decision, "side", "")).upper() == "LONG":
-                reverse_decision = decision
-            return {
-                "closed": True,
-                "outcome": str(outcome),
-                "r_raw": float(realized_r),
-                "is_stop": bool(stop_hit),
-                "reverse_decision": reverse_decision,
-            }
-        return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
-
-    trough = min(float(pos.get("trough_price", entry) or entry), close)
-    pos["trough_price"] = trough
-
-    if auto_tighten_stop and (not be_armed) and close <= entry - risk * be_trigger_r:
-        be_armed = True
-        pos["be_armed"] = True
-
-    if (not tp1_done) and float(params.tp1_close_pct) > 0:
-        tp1_price = entry - risk * float(params.tp1_r_mult)
-        if close <= tp1_price:
-            pct = min(max(float(params.tp1_close_pct), 0.0), 1.0)
-            close_qty = qty_rem * pct
-            if close_qty >= qty_rem * 0.999:
-                realized_r += qty_rem * _close_remaining_r("SHORT", entry, risk, close)
-                pos["qty_rem"] = 0.0
-                pos["realized_r"] = realized_r
-                return {
-                    "closed": True,
-                    "outcome": "TP1",
-                    "r_raw": float(realized_r),
-                    "is_stop": False,
-                    "reverse_decision": None,
-                }
-            if close_qty > 0:
-                realized_r += close_qty * _close_remaining_r("SHORT", entry, risk, close)
-                qty_rem = max(0.0, qty_rem - close_qty)
-                tp1_done = True
-                be_armed = True
-                be_stop = entry * (1.0 - be_total_offset)
-                hard_stop = min(hard_stop, be_stop)
-                pos["qty_rem"] = qty_rem
-                pos["realized_r"] = realized_r
-                pos["tp1_done"] = True
-                pos["be_armed"] = True
-                pos["hard_stop"] = hard_stop
-                return {
-                    "closed": False,
-                    "outcome": "NONE",
-                    "r_raw": 0.0,
-                    "is_stop": False,
-                    "reverse_decision": None,
-                }
-
-    if bool(params.tp2_close_rest) and tp1_done and qty_rem > 0:
-        tp2_price = entry - risk * float(params.tp2_r_mult)
-        if close <= tp2_price:
-            realized_r += qty_rem * _close_remaining_r("SHORT", entry, risk, close)
-            pos["qty_rem"] = 0.0
-            pos["realized_r"] = realized_r
-            return {
-                "closed": True,
-                "outcome": "TP2",
-                "r_raw": float(realized_r),
-                "is_stop": False,
-                "reverse_decision": None,
-            }
-
-    dynamic_stop = float(hard_stop)
-    if auto_tighten_stop:
-        dynamic_stop = min(dynamic_stop, float(sig.get("short_stop", hard_stop) or hard_stop))
-        if be_armed:
-            dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
-        if (not bool(params.trail_after_tp1)) or tp1_done:
-            atr_v = max(0.0, float(sig.get("atr", 0.0) or 0.0))
-            trail_stop = trough + atr_v * float(params.trail_atr_mult)
-            dynamic_stop = min(dynamic_stop, trail_stop)
-    elif be_armed:
-        dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
-
-    stop_hit = close >= dynamic_stop
+    stop_hit = high >= hard_stop
+    tp2_hit = low <= tp2
+    tp1_hit = low <= tp1
     short_exit = bool(sig.get("short_exit", False)) if use_signal_exit else False
-
-    pos["qty_rem"] = qty_rem
-    pos["realized_r"] = realized_r
-    pos["tp1_done"] = tp1_done
-    pos["be_armed"] = be_armed
-    pos["hard_stop"] = dynamic_stop
-
-    if short_exit or stop_hit:
-        realized_r += qty_rem * _close_remaining_r("SHORT", entry, risk, close)
-        pos["qty_rem"] = 0.0
-        pos["realized_r"] = realized_r
-        if tp1_done:
-            outcome = "TP1"
-        elif stop_hit:
-            outcome = "STOP"
-        else:
-            outcome = "EXIT"
-        reverse_decision = None
-        if allow_reverse and (decision is not None) and str(getattr(decision, "side", "")).upper() == "LONG":
-            reverse_decision = decision
-        return {
-            "closed": True,
-            "outcome": str(outcome),
-            "r_raw": float(realized_r),
-            "is_stop": bool(stop_hit),
-            "reverse_decision": reverse_decision,
-        }
-
+    if stop_hit and (tp1_hit or tp2_hit):
+        return _with_reverse({"closed": True, "outcome": "STOP", "r_raw": _close_remaining_r(side_u, entry, risk, hard_stop), "is_stop": True})
+    if stop_hit:
+        return _with_reverse({"closed": True, "outcome": "STOP", "r_raw": _close_remaining_r(side_u, entry, risk, hard_stop), "is_stop": True})
+    if tp2_hit:
+        return _with_reverse({"closed": True, "outcome": "TP2", "r_raw": _close_remaining_r(side_u, entry, risk, tp2), "is_stop": False})
+    if tp1_hit:
+        return _with_reverse({"closed": True, "outcome": "TP1", "r_raw": _close_remaining_r(side_u, entry, risk, tp1), "is_stop": False})
+    if short_exit:
+        return _with_reverse({"closed": True, "outcome": "EXIT", "r_raw": _close_remaining_r(side_u, entry, risk, close), "is_stop": False})
     return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False, "reverse_decision": None}
 
 
@@ -928,6 +759,16 @@ def main() -> int:
         "--managed-exit",
         action="store_true",
         help="Use managed exit path: TP1 partial + remaining TP2 + BE/fee-buffer stop",
+    )
+    parser.add_argument(
+        "--force-managed-tp-fallback",
+        action="store_true",
+        help="Force backtest to simulate managed TP fallback instead of native split TP on entry",
+    )
+    parser.add_argument(
+        "--live-window-signals",
+        action="store_true",
+        help="Build signals with the same rolling candle window as live runtime (slower but parity-safe)",
     )
     parser.add_argument(
         "--dump-trades-csv",
@@ -1047,9 +888,22 @@ def main() -> int:
     require_tp_sl = True
     tp1_only = not bool(args.managed_exit)
     managed_exit = bool(args.managed_exit)
+    force_managed_tp_fallback = bool(args.force_managed_tp_fallback)
     use_signal_exit = bool(cfg.params.signal_exit_enabled) and (not bool(args.ignore_signal_exit))
     invert_signal_mode = bool(args.invert_signals) or bool(args.invert_signals_swap_exits)
     inversion_mode_label = "swap_exits" if bool(args.invert_signals_swap_exits) else ("symmetric" if bool(args.invert_signals) else "off")
+    default_exit_model = "swapped_reverse" if bool(args.invert_signals_swap_exits) else "standard"
+    default_exchange_split_tp_enabled = bool(
+        managed_exit
+        and resolve_backtest_split_tp_enabled(
+            attach_tpsl_on_entry=bool(getattr(cfg, "attach_tpsl_on_entry", False)),
+            enable_close=bool(getattr(cfg.params, "enable_close", False)),
+            split_tp_on_entry=bool(getattr(cfg.params, "split_tp_on_entry", False)),
+            tp1_close_pct=float(getattr(cfg.params, "tp1_close_pct", 0.0) or 0.0),
+            force_managed_tp_fallback=force_managed_tp_fallback,
+        )
+    )
+    trace_cache_enabled = bool(args.live_window_signals) and _interleaved_trace_cache_enabled()
 
     per_inst_cap = int(cfg.params.max_open_entries)
     global_cap = int(cfg.params.max_open_entries_global)
@@ -1073,7 +927,8 @@ def main() -> int:
     print(f"insts={','.join(inst_ids)}", flush=True)
     print(
         f"bars={bars} horizon=to_end min/max/exact={min_level}/{max_level}/{exact_level} "
-        f"require_tp_sl={require_tp_sl} tp1_only={tp1_only} managed_exit={managed_exit}",
+        f"require_tp_sl={require_tp_sl} tp1_only={tp1_only} managed_exit={managed_exit} "
+        f"live_window_signals={bool(args.live_window_signals)}",
         flush=True,
     )
     print(f"signal_inversion={inversion_mode_label}", flush=True)
@@ -1121,6 +976,7 @@ def main() -> int:
         flush=True,
     )
     print(f"signal_exit_enabled={use_signal_exit}", flush=True)
+    print(f"split_tp_parity=managed_fallback_only:{force_managed_tp_fallback}", flush=True)
     print(
         f"compound: risk_per_trade={risk_frac*100:.2f}% start_equity={start_equity:.2f}",
         flush=True,
@@ -1163,16 +1019,17 @@ def main() -> int:
             continue
 
         pre_by_profile: Dict[str, Dict[str, Any]] = {}
-        try:
-            pre_by_profile[profile_by_inst.get(inst, "DEFAULT")] = _build_backtest_precalc(htf, loc, ltf, inst_params)
-            for pid in inst_profile_ids:
-                if pid == profile_by_inst.get(inst, "DEFAULT"):
-                    continue
-                pp = cfg.strategy_profiles.get(pid, cfg.params)
-                pre_by_profile[pid] = _build_backtest_precalc(htf, loc, ltf, pp)
-        except Exception as e:
-            print(f"[{inst}] precalc failed: {e}", flush=True)
-            continue
+        if not bool(args.live_window_signals):
+            try:
+                pre_by_profile[profile_by_inst.get(inst, "DEFAULT")] = _build_backtest_precalc(htf, loc, ltf, inst_params)
+                for pid in inst_profile_ids:
+                    if pid == profile_by_inst.get(inst, "DEFAULT"):
+                        continue
+                    pp = cfg.strategy_profiles.get(pid, cfg.params)
+                    pre_by_profile[pid] = _build_backtest_precalc(htf, loc, ltf, pp)
+            except Exception as e:
+                print(f"[{inst}] precalc failed: {e}", flush=True)
+                continue
         htf_ts = [c.ts_ms for c in htf]
         loc_ts = [c.ts_ms for c in loc]
         ltf_ts = [c.ts_ms for c in ltf]
@@ -1180,22 +1037,87 @@ def main() -> int:
         ts_to_i = {int(ltf_ts[i]): i for i in range(start_idx, len(ltf) - 1)}
         for i in range(start_idx, len(ltf) - 1):
             all_ts.add(int(ltf_ts[i]))
+        params_by_profile: Dict[str, Any] = {profile_by_inst.get(inst, "DEFAULT"): inst_params}
+        for pid in inst_profile_ids:
+            if pid == profile_by_inst.get(inst, "DEFAULT"):
+                continue
+            params_by_profile[pid] = cfg.strategy_profiles.get(pid, cfg.params)
+        try:
+            table_bundle = _build_backtest_signal_decision_tables(
+                cfg=cfg,
+                inst_id=inst,
+                profile_id=profile_by_inst.get(inst, "DEFAULT"),
+                inst_profile_ids=inst_profile_ids,
+                params_by_profile=params_by_profile,
+                pre_by_profile=pre_by_profile,
+                htf_candles=htf,
+                loc_candles=loc,
+                ltf_candles=ltf,
+                htf_ts=htf_ts,
+                loc_ts=loc_ts,
+                ltf_ts=ltf_ts,
+                max_level=max_level,
+                min_level=min_level,
+                exact_level=exact_level,
+                tp1_only=tp1_only,
+                start_idx=start_idx,
+                live_signal_window_limit=cfg.candle_limit if bool(args.live_window_signals) else 0,
+            )
+        except Exception as e:
+            print(f"[{inst}] table build failed: {e}", flush=True)
+            continue
+
+        signal_table = table_bundle["signal_table"]
+        decision_table = table_bundle["decision_table"]
+        table_cache_key = str(table_bundle.get("table_cache_key", "") or "")
+        trace_cache_key = ""
+        trace_cache_path = ""
+        trace_cache_store: Dict[str, Any] = {}
+        if trace_cache_enabled and table_cache_key:
+            trace_cache_key = _interleaved_trace_cache_key(
+                table_cache_key=table_cache_key,
+                params=inst_params,
+                managed_exit=managed_exit,
+                use_signal_exit=use_signal_exit,
+                exit_model=default_exit_model,
+                split_tp_enabled=default_exchange_split_tp_enabled,
+            )
+            trace_cache_path = _interleaved_trace_cache_path(cfg, inst, trace_cache_key)
+            trace_cache_store = _load_interleaved_trace_cache(trace_cache_path, trace_cache_key, inst_id=inst)
+        if invert_signal_mode:
+            inverted_signal_table: List[Optional[Dict[str, Any]]] = [None] * len(signal_table)
+            inverted_decision_table: List[Optional[Any]] = [None] * len(decision_table)
+            for i in range(start_idx, len(signal_table)):
+                sig = signal_table[i]
+                if sig is None:
+                    continue
+                inv_sig = _invert_signal_symmetric(sig)
+                inverted_signal_table[i] = inv_sig
+                inverted_decision_table[i] = resolve_entry_decision(
+                    inv_sig,
+                    max_level=inst_exec_max_level,
+                    min_level=min_level,
+                    exact_level=exact_level,
+                    tp1_r=inst_params.tp1_r_mult,
+                    tp2_r=inst_params.tp2_r_mult,
+                    tp1_only=tp1_only,
+                )
+            signal_table = inverted_signal_table
+            decision_table = inverted_decision_table
 
         data[inst] = {
-            "htf": htf,
-            "loc": loc,
             "ltf": ltf,
-            "pre_by_profile": pre_by_profile,
-            "htf_ts": htf_ts,
-            "loc_ts": loc_ts,
             "ltf_ts": ltf_ts,
-            "start_idx": start_idx,
             "ts_to_i": ts_to_i,
             "params": inst_params,
-            "profile_id": profile_by_inst.get(inst, "DEFAULT"),
-            "profile_ids": inst_profile_ids,
-            "exec_max_level": inst_exec_max_level,
-            "vote_enabled": bool(len(inst_profile_ids) > 1),
+            "signal_table": signal_table,
+            "decision_table": decision_table,
+            "table_cache_key": table_cache_key,
+            "trace_cache_key": trace_cache_key,
+            "trace_cache_path": trace_cache_path,
+            "trace_cache_store": trace_cache_store,
+            "trace_cache_dirty": False,
+            "exchange_split_tp_enabled": default_exchange_split_tp_enabled,
         }
 
     inst_ids = [x for x in inst_ids if x in data]
@@ -1205,6 +1127,23 @@ def main() -> int:
 
     timeline = sorted(all_ts)
     print(f"timeline_points={len(timeline)}", flush=True)
+
+    def _flush_trace_caches() -> None:
+        if not trace_cache_enabled:
+            return
+        for inst in inst_ids:
+            row = data.get(inst)
+            if not isinstance(row, dict):
+                continue
+            if not bool(row.get("trace_cache_dirty", False)):
+                continue
+            trace_cache_key = str(row.get("trace_cache_key", "") or "")
+            trace_cache_path = str(row.get("trace_cache_path", "") or "")
+            trace_cache_store = row.get("trace_cache_store")
+            if not trace_cache_key or not trace_cache_path or not isinstance(trace_cache_store, dict):
+                continue
+            _save_interleaved_trace_cache(trace_cache_path, trace_cache_key, inst_id=inst, trajectories=trace_cache_store)
+            row["trace_cache_dirty"] = False
 
     open_positions: Dict[str, Dict[str, Any]] = {}
     open_positions_total = 0
@@ -1454,7 +1393,7 @@ def main() -> int:
         if risk_amt <= 0:
             return False
 
-        exit_model = "swapped_reverse" if bool(args.invert_signals_swap_exits) else "standard"
+        exit_model = default_exit_model
         swap_stop_r_mult = 0.0
         candidate_loss_usdt = float(risk_amt)
         if exit_model == "swapped_reverse":
@@ -1511,13 +1450,21 @@ def main() -> int:
         pos["entry_exec_mode_intended"] = str(intended_exec_mode)
         pos["fee_rate"] = float(fee_rate_used)
         pos["slippage_bps"] = float(slippage_bps_used)
-        pos["exchange_split_tp_enabled"] = bool(
-            managed_exit
-            and bool(getattr(cfg, "attach_tpsl_on_entry", False))
-            and bool(getattr(cfg.params, "enable_close", False))
-            and bool(getattr(cfg.params, "split_tp_on_entry", False))
-            and 0.0 < float(getattr(cfg.params, "tp1_close_pct", 0.0) or 0.0) < 1.0
+        pos["exchange_split_tp_enabled"] = bool(row.get("exchange_split_tp_enabled", False))
+        trajectory = _get_or_build_interleaved_trade_trajectory(
+            row=row,
+            entry_i=int(i),
+            decision=decision,
+            params=row["params"],
+            managed_exit=managed_exit,
+            use_signal_exit=use_signal_exit,
+            exit_model=exit_model,
+            split_tp_enabled=bool(pos["exchange_split_tp_enabled"]),
+            swap_stop_r_mult=float(swap_stop_r_mult),
         )
+        if isinstance(trajectory, list):
+            pos["_trajectory_events"] = trajectory
+            pos["_trajectory_ptr"] = 0
         open_positions[inst] = pos
         open_positions_total += 1
 
@@ -1539,83 +1486,30 @@ def main() -> int:
             if i is None:
                 continue
 
-            hi_idx = bisect.bisect_right(row["htf_ts"], int(row["ltf_ts"][i])) - 1
-            li_idx = bisect.bisect_right(row["loc_ts"], int(row["ltf_ts"][i])) - 1
-            if hi_idx < 0 or li_idx < 0:
-                continue
-
             inst_params = row["params"]
-            sig = _build_backtest_signal_fast(row["pre_by_profile"][row["profile_id"]], inst_params, hi_idx + 1, li_idx + 1, i)
+            sig = row["signal_table"][i]
             if sig is None:
                 continue
-            inst_exec_max_level = int(row["exec_max_level"])
-            if bool(row.get("vote_enabled")):
-                signals_by_profile: Dict[str, Dict[str, Any]] = {row["profile_id"]: sig}
-                decisions_by_profile: Dict[str, Any] = {}
-                decisions_by_profile[row["profile_id"]] = resolve_entry_decision(
-                    sig,
-                    max_level=inst_exec_max_level,
-                    min_level=min_level,
-                    exact_level=exact_level,
-                    tp1_r=inst_params.tp1_r_mult,
-                    tp2_r=inst_params.tp2_r_mult,
-                    tp1_only=tp1_only,
-                )
-                for pid in row.get("profile_ids", []):
-                    if pid == row["profile_id"]:
-                        continue
-                    pre_other = row["pre_by_profile"].get(pid)
-                    if pre_other is None:
-                        continue
-                    p = cfg.strategy_profiles.get(pid, cfg.params)
-                    sig_other = _build_backtest_signal_fast(pre_other, p, hi_idx + 1, li_idx + 1, i)
-                    if sig_other is None:
-                        continue
-                    signals_by_profile[pid] = sig_other
-                    decisions_by_profile[pid] = resolve_entry_decision(
-                        sig_other,
-                        max_level=resolve_exec_max_level(p, inst),
-                        min_level=min_level,
-                        exact_level=exact_level,
-                        tp1_r=p.tp1_r_mult,
-                        tp2_r=p.tp2_r_mult,
-                        tp1_only=tp1_only,
-                    )
-                sig, _vote_meta = merge_entry_votes(
-                    base_signal=sig,
-                    profile_ids=[pid for pid in row.get("profile_ids", []) if pid in signals_by_profile],
-                    signals_by_profile=signals_by_profile,
-                    decisions_by_profile=decisions_by_profile,
-                    mode=cfg.strategy_profile_vote_mode,
-                    min_agree=cfg.strategy_profile_vote_min_agree,
-                    enforce_max_level=inst_exec_max_level,
-                    profile_score_map=cfg.strategy_profile_vote_score_map,
-                    level_weight=cfg.strategy_profile_vote_level_weight,
-                )
-
-            if invert_signal_mode:
-                sig = _invert_signal_symmetric(sig)
-
-            decision = resolve_entry_decision(
-                sig,
-                max_level=inst_exec_max_level,
-                min_level=min_level,
-                exact_level=exact_level,
-                tp1_r=inst_params.tp1_r_mult,
-                tp2_r=inst_params.tp2_r_mult,
-                tp1_only=tp1_only,
-            )
+            decision = row["decision_table"][i]
             existing = open_positions.get(inst)
             if existing is not None:
-                sim = _simulate_live_position_step(
-                    pos=existing,
-                    sig=sig,
-                    params=inst_params,
-                    decision=decision,
-                    allow_reverse=bool(cfg.params.allow_reverse),
-                    managed_exit=bool(managed_exit),
-                    use_signal_exit=bool(use_signal_exit),
-                )
+                if isinstance(existing.get("_trajectory_events"), list):
+                    sim = _apply_cached_trade_trajectory_step(
+                        pos=existing,
+                        current_i=int(i),
+                        decision=decision,
+                        allow_reverse=bool(cfg.params.allow_reverse),
+                    )
+                else:
+                    sim = _simulate_live_position_step(
+                        pos=existing,
+                        sig=sig,
+                        params=inst_params,
+                        decision=decision,
+                        allow_reverse=bool(cfg.params.allow_reverse),
+                        managed_exit=bool(managed_exit),
+                        use_signal_exit=bool(use_signal_exit),
+                    )
                 if bool(sim.get("closed", False)):
                     open_positions.pop(inst, None)
                     open_positions_total = max(0, open_positions_total - 1)
@@ -1668,6 +1562,7 @@ def main() -> int:
         )
 
     if not accepted:
+        _flush_trace_caches()
         text = f"【{args.title}】无有效成交信号。"
         print(text, flush=True)
         sent = send_telegram(cfg, text)
@@ -1815,6 +1710,7 @@ def main() -> int:
     print("\n=== RESULT ===", flush=True)
     print(text, flush=True)
 
+    _flush_trace_caches()
     sent = send_telegram(cfg, text)
     print(f"telegram_sent={sent}", flush=True)
     return 0

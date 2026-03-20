@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 from .models import StrategyParams
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class VariantSignalInputs:
     p: StrategyParams
     bias: str

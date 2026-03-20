@@ -129,6 +129,7 @@ TRADES_CSV=""
 SEND_TG=0
 MANAGED_EXIT=1
 PESSIMISTIC=0
+FORCE_MANAGED_TP_FALLBACK=0
 CACHE_ONLY=1
 CACHE_TTL_SECONDS=315360000
 SAVE_TAG=""
@@ -169,6 +170,8 @@ Options:
   --tp1-only                 Disable managed exit (TP1 only)
   --managed-exit             Enable managed exit (default)
   --pessimistic              Use runner built-in pessimistic fallback
+  --force-managed-tp-fallback
+                             Simulate managed TP fallback instead of native split TP
   --allow-fetch              Skip cache sufficiency precheck (may fetch from network)
   --cache-ttl-seconds N      Cache TTL override (default: 315360000)
   --save-tag NAME            Save this run as a snapshot (log+trades+summary index)
@@ -273,6 +276,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --pessimistic)
       PESSIMISTIC=1
+      shift
+      ;;
+    --force-managed-tp-fallback)
+      FORCE_MANAGED_TP_FALLBACK=1
       shift
       ;;
     --allow-fetch)
@@ -477,6 +484,9 @@ if [[ "${MANAGED_EXIT}" -eq 1 ]]; then
 fi
 if [[ "${PESSIMISTIC}" -eq 1 ]]; then
   CMD+=(--pessimistic)
+fi
+if [[ "${FORCE_MANAGED_TP_FALLBACK}" -eq 1 ]]; then
+  CMD+=(--force-managed-tp-fallback)
 fi
 if [[ -n "${TRADES_CSV}" ]]; then
   CMD+=(--dump-trades-csv "${TRADES_CSV}")

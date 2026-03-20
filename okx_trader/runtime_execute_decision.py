@@ -1783,10 +1783,43 @@ def execute_decision(
         side_txt = str(trade.get("side", "") or "").strip().lower()
         if side_txt not in {"long", "short"}:
             return
-        stop_px = float(trade.get("planned_stop", trade.get("hard_stop", 0.0)) or 0.0)
+        stop_px = float(trade.get("hard_stop", trade.get("planned_stop", 0.0)) or 0.0)
         if stop_px <= 0:
             return
         desired_stop_size = float(trade.get("remaining_size", trade.get("open_size", 0.0)) or 0.0)
+
+        try:
+            inst_meta = client.get_instrument(inst_id)
+        except Exception:
+            inst_meta = {}
+        try:
+            tick_sz = float(inst_meta.get("tickSz", 0.0) or 0.0)
+        except Exception:
+            tick_sz = 0.0
+
+        def _stop_covers_target(row: Dict[str, Any]) -> bool:
+            if not isinstance(row, dict) or not row:
+                return False
+            try:
+                live_sl_px = float(row.get("slTriggerPx", row.get("newSlTriggerPx", 0.0)) or 0.0)
+            except Exception:
+                live_sl_px = 0.0
+            if live_sl_px <= 0:
+                return False
+            stop_tol = max((tick_sz * 0.5) if tick_sz > 0 else 0.0, abs(float(stop_px)) * 1e-6, 1e-9)
+            if side_txt == "long":
+                return live_sl_px + stop_tol >= float(stop_px)
+            return live_sl_px - stop_tol <= float(stop_px)
+
+        def _stop_size_matches(row: Dict[str, Any]) -> bool:
+            if not isinstance(row, dict) or not row:
+                return False
+            if "_qty_match" in row:
+                return bool(row.get("_qty_match", False))
+            return True
+
+        needs_repair = False
+        duplicate_cleanup_needed = False
 
         ord_id = str(trade.get("entry_ord_id", "") or "").strip()
         cl_ord_id = str(trade.get("entry_cl_ord_id", "") or "").strip()
@@ -1864,10 +1897,10 @@ def execute_decision(
                     attach_row = {}
                 if isinstance(attach_row, dict) and attach_row and str(attach_row.get("slTriggerPx", "") or "").strip():
                     if _adopt_sl_row(attach_row, independent=False, adopt_reason=f"{reason}:attached_detected"):
-                        return
+                        if _stop_size_matches(attach_row) and _stop_covers_target(attach_row):
+                            return
+                        needs_repair = True
 
-        needs_repair = False
-        duplicate_cleanup_needed = False
         existing_id = str(trade.get("exchange_sl_attach_algo_id", trade.get("attach_algo_id", "")) or "").strip()
         existing_cl_id = str(trade.get("exchange_sl_attach_algo_cl_ord_id", trade.get("attach_algo_cl_ord_id", "")) or "").strip()
         lookup_stop_fn = getattr(client, "get_pending_stop_loss_order", None)
@@ -1886,7 +1919,7 @@ def execute_decision(
                 if existing_row:
                     if _adopt_sl_row(existing_row, independent=True, adopt_reason=f"{reason}:existing_detected"):
                         duplicate_cleanup_needed = int(existing_row.get("_extra_count", 0) or 0) > 0
-                        if bool(existing_row.get("_qty_match", True)):
+                        if _stop_size_matches(existing_row) and _stop_covers_target(existing_row):
                             if duplicate_cleanup_needed:
                                 _maybe_cleanup_duplicate_sl_orders(max_cancel=1)
                             return
@@ -1908,7 +1941,7 @@ def execute_decision(
                 if any_row:
                     if _adopt_sl_row(any_row, independent=True, adopt_reason=f"{reason}:existing_any"):
                         duplicate_cleanup_needed = int(any_row.get("_extra_count", 0) or 0) > 0
-                        if bool(any_row.get("_qty_match", True)):
+                        if _stop_size_matches(any_row) and _stop_covers_target(any_row):
                             if duplicate_cleanup_needed:
                                 _maybe_cleanup_duplicate_sl_orders(max_cancel=1)
                             return

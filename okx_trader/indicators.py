@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import statistics
+import math
 from typing import List, Optional, Tuple
 
 
@@ -99,10 +99,25 @@ def bollinger(
     low: List[Optional[float]] = [None] * len(values)
     if length <= 1:
         return mid, up, low
-    for i in range(length - 1, len(values)):
-        window = values[i - length + 1 : i + 1]
-        mean = sum(window) / length
-        sd = statistics.pstdev(window)
+
+    running_sum = 0.0
+    running_sum_sq = 0.0
+    for i, v in enumerate(values):
+        vv = float(v)
+        running_sum += vv
+        running_sum_sq += vv * vv
+        if i >= length:
+            old = float(values[i - length])
+            running_sum -= old
+            running_sum_sq -= old * old
+        if i < length - 1:
+            continue
+
+        mean = running_sum / length
+        variance = (running_sum_sq / length) - (mean * mean)
+        if variance < 0.0 and variance > -1e-12:
+            variance = 0.0
+        sd = math.sqrt(max(0.0, variance))
         mid[i] = mean
         up[i] = mean + mult * sd
         low[i] = mean - mult * sd

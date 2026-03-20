@@ -78,7 +78,7 @@ class ManagedExitTests(unittest.TestCase):
             signal_exit_enabled=False,
         )
         self.assertEqual(outcome, "STOP")
-        self.assertAlmostEqual(r_value, -1.2, places=6)
+        self.assertAlmostEqual(r_value, -1.0, places=6)
         self.assertEqual(held, 2)
         self.assertEqual(exit_idx, 2)
 
@@ -113,7 +113,7 @@ class ManagedExitTests(unittest.TestCase):
             signal_exit_enabled=False,
         )
         self.assertEqual(outcome, "STOP")
-        self.assertAlmostEqual(r_value, -1.2, places=6)
+        self.assertAlmostEqual(r_value, 0.0, places=6)
         self.assertEqual(held, 2)
         self.assertEqual(exit_idx, 2)
 

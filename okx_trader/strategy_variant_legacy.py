@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from .models import StrategyParams
+from .strategy_contract import VariantSignalInputs
 
 _VARIANT_CLASSIC = "classic"
 _VARIANT_BTCETH_V1 = "btceth_v1"
@@ -128,6 +129,25 @@ def resolve_variant_signal_state(
     trend_sep = abs(float(h_ema_fast) - float(h_ema_slow)) / max(abs(float(h_close)), 1e-9)
     fresh_break_long = close_f > float(prev_hhv if prev_hhv is not None else hhv)
     fresh_break_short = close_f < float(prev_llv if prev_llv is not None else llv)
+    sweep_long = False
+    sweep_short = False
+    bullish_fvg = False
+    bearish_fvg = False
+    squeeze = False
+    vol_spike_2x = False
+    bull_pattern = False
+    bear_pattern = False
+    macd_gc = False
+    macd_dc = False
+    touch_lower = False
+    touch_upper = False
+    breakout_long = False
+    breakout_short = False
+    retest_long = False
+    retest_short = False
+    ready = False
+    reversal_long = False
+    reversal_short = False
 
     if variant == _VARIANT_BTCETH_V1:
         min_trend_sep = 0.0015
@@ -1078,28 +1098,28 @@ def resolve_variant_signal_state(
         "vol_ok": bool(vol_ok),
         "fresh_break_long": bool(fresh_break_long),
         "fresh_break_short": bool(fresh_break_short),
-        "smc_sweep_long": bool(locals().get("sweep_long", False)),
-        "smc_sweep_short": bool(locals().get("sweep_short", False)),
-        "smc_bullish_fvg": bool(locals().get("bullish_fvg", False)),
-        "smc_bearish_fvg": bool(locals().get("bearish_fvg", False)),
-        "combo_squeeze": bool(locals().get("squeeze", False)),
-        "combo_vol_spike": bool(locals().get("vol_spike_2x", False)),
-        "combo_bull_pattern": bool(locals().get("bull_pattern", False)),
-        "combo_bear_pattern": bool(locals().get("bear_pattern", False)),
-        "combo_macd_gc": bool(locals().get("macd_gc", False)),
-        "combo_macd_dc": bool(locals().get("macd_dc", False)),
-        "combo_touch_lower": bool(locals().get("touch_lower", False)),
-        "combo_touch_upper": bool(locals().get("touch_upper", False)),
-        "breakout_squeeze": bool(locals().get("squeeze", False)),
-        "breakout_long": bool(locals().get("breakout_long", False)),
-        "breakout_short": bool(locals().get("breakout_short", False)),
-        "breakout_retest_long": bool(locals().get("retest_long", False)),
-        "breakout_retest_short": bool(locals().get("retest_short", False)),
-        "rbreaker_ready": bool(locals().get("ready", False)),
-        "rbreaker_breakout_long": bool(locals().get("breakout_long", False)),
-        "rbreaker_breakout_short": bool(locals().get("breakout_short", False)),
-        "rbreaker_reversal_long": bool(locals().get("reversal_long", False)),
-        "rbreaker_reversal_short": bool(locals().get("reversal_short", False)),
+        "smc_sweep_long": bool(sweep_long),
+        "smc_sweep_short": bool(sweep_short),
+        "smc_bullish_fvg": bool(bullish_fvg),
+        "smc_bearish_fvg": bool(bearish_fvg),
+        "combo_squeeze": bool(squeeze),
+        "combo_vol_spike": bool(vol_spike_2x),
+        "combo_bull_pattern": bool(bull_pattern),
+        "combo_bear_pattern": bool(bear_pattern),
+        "combo_macd_gc": bool(macd_gc),
+        "combo_macd_dc": bool(macd_dc),
+        "combo_touch_lower": bool(touch_lower),
+        "combo_touch_upper": bool(touch_upper),
+        "breakout_squeeze": bool(squeeze),
+        "breakout_long": bool(breakout_long),
+        "breakout_short": bool(breakout_short),
+        "breakout_retest_long": bool(retest_long),
+        "breakout_retest_short": bool(retest_short),
+        "rbreaker_ready": bool(ready),
+        "rbreaker_breakout_long": bool(breakout_long),
+        "rbreaker_breakout_short": bool(breakout_short),
+        "rbreaker_reversal_long": bool(reversal_long),
+        "rbreaker_reversal_short": bool(reversal_short),
         "long_entry": bool(long_entry_l1),
         "short_entry": bool(short_entry_l1),
         "long_entry_l2": bool(long_entry_l2),
@@ -1111,3 +1131,56 @@ def resolve_variant_signal_state(
         "long_stop": float(long_stop),
         "short_stop": float(short_stop),
     }
+
+
+def resolve_variant_signal_state_from_inputs(inputs: VariantSignalInputs) -> Dict[str, Any]:
+    return resolve_variant_signal_state(
+        p=inputs.p,
+        bias=inputs.bias,
+        close=inputs.close,
+        ema_value=inputs.ema_value,
+        rsi_value=inputs.rsi_value,
+        macd_hist_value=inputs.macd_hist_value,
+        atr_value=inputs.atr_value,
+        hhv=inputs.hhv,
+        llv=inputs.llv,
+        exl=inputs.exl,
+        exh=inputs.exh,
+        pb_low=inputs.pb_low,
+        pb_high=inputs.pb_high,
+        h_close=inputs.h_close,
+        h_ema_fast=inputs.h_ema_fast,
+        h_ema_slow=inputs.h_ema_slow,
+        width=inputs.width,
+        width_avg=inputs.width_avg,
+        long_location_ok=inputs.long_location_ok,
+        short_location_ok=inputs.short_location_ok,
+        pullback_long=inputs.pullback_long,
+        pullback_short=inputs.pullback_short,
+        not_chasing_long=inputs.not_chasing_long,
+        not_chasing_short=inputs.not_chasing_short,
+        prev_hhv=inputs.prev_hhv,
+        prev_llv=inputs.prev_llv,
+        current_high=inputs.current_high,
+        current_low=inputs.current_low,
+        prev_high=inputs.prev_high,
+        prev_low=inputs.prev_low,
+        prev2_high=inputs.prev2_high,
+        prev2_low=inputs.prev2_low,
+        prev3_high=inputs.prev3_high,
+        prev3_low=inputs.prev3_low,
+        current_open=inputs.current_open,
+        prev_open=inputs.prev_open,
+        prev_close=inputs.prev_close,
+        upper_band=inputs.upper_band,
+        lower_band=inputs.lower_band,
+        mid_band=inputs.mid_band,
+        prev_macd_hist=inputs.prev_macd_hist,
+        volume=inputs.volume,
+        volume_avg=inputs.volume_avg,
+        prev_day_high=inputs.prev_day_high,
+        prev_day_low=inputs.prev_day_low,
+        prev_day_close=inputs.prev_day_close,
+        day_high_so_far=inputs.day_high_so_far,
+        day_low_so_far=inputs.day_low_so_far,
+    )

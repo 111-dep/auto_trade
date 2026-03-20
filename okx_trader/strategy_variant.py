@@ -8,6 +8,9 @@ from .strategy_variant_legacy import (
     normalize_strategy_variant as _normalize_strategy_variant_legacy,
 )
 from .strategy_variant_legacy import (
+    resolve_variant_signal_state_from_inputs as _resolve_variant_signal_state_legacy_from_inputs,
+)
+from .strategy_variant_legacy import (
     resolve_variant_signal_state as _resolve_variant_signal_state_legacy,
 )
 
@@ -20,6 +23,7 @@ VariantInputResolver = Callable[[VariantSignalInputs], Dict[str, Any]]
 # If a variant is not registered, it falls back to the stable legacy resolver.
 _VARIANT_RESOLVERS: Dict[str, VariantResolver] = {}
 _VARIANT_INPUT_RESOLVERS: Dict[str, VariantInputResolver] = {}
+_VARIANT_DISPATCH_CACHE: Dict[str, tuple[Optional[VariantInputResolver], VariantResolver]] = {}
 _DEFAULT_RESOLVER: VariantResolver = _resolve_variant_signal_state_legacy
 _PLUGINS_LOAD_ATTEMPTED = False
 _PLUGINS_LOAD_ERROR: Optional[str] = None
@@ -32,26 +36,31 @@ def normalize_strategy_variant(raw: str) -> str:
 def register_variant_resolver(variant: str, resolver: VariantResolver) -> None:
     key = normalize_strategy_variant(variant)
     _VARIANT_RESOLVERS[key] = resolver
+    _VARIANT_DISPATCH_CACHE.clear()
 
 
 def register_variant_input_resolver(variant: str, resolver: VariantInputResolver) -> None:
     key = normalize_strategy_variant(variant)
     _VARIANT_INPUT_RESOLVERS[key] = resolver
+    _VARIANT_DISPATCH_CACHE.clear()
 
 
 def unregister_variant_resolver(variant: str) -> None:
     key = normalize_strategy_variant(variant)
     _VARIANT_RESOLVERS.pop(key, None)
+    _VARIANT_DISPATCH_CACHE.clear()
 
 
 def unregister_variant_input_resolver(variant: str) -> None:
     key = normalize_strategy_variant(variant)
     _VARIANT_INPUT_RESOLVERS.pop(key, None)
+    _VARIANT_DISPATCH_CACHE.clear()
 
 
 def clear_variant_resolvers() -> None:
     _VARIANT_RESOLVERS.clear()
     _VARIANT_INPUT_RESOLVERS.clear()
+    _VARIANT_DISPATCH_CACHE.clear()
 
 
 def list_variant_resolvers() -> Dict[str, str]:
@@ -76,6 +85,17 @@ def _get_variant_input_resolver(variant: str) -> Optional[VariantInputResolver]:
     return _VARIANT_INPUT_RESOLVERS.get(key)
 
 
+def _get_variant_dispatch(raw_variant: str) -> tuple[Optional[VariantInputResolver], VariantResolver]:
+    key_raw = str(raw_variant or "")
+    cached = _VARIANT_DISPATCH_CACHE.get(key_raw)
+    if cached is not None:
+        return cached
+    key = normalize_strategy_variant(key_raw)
+    resolved = (_VARIANT_INPUT_RESOLVERS.get(key), _VARIANT_RESOLVERS.get(key, _DEFAULT_RESOLVER))
+    _VARIANT_DISPATCH_CACHE[key_raw] = resolved
+    return resolved
+
+
 def _ensure_strategy_plugins_loaded() -> None:
     global _PLUGINS_LOAD_ATTEMPTED, _PLUGINS_LOAD_ERROR
     if _PLUGINS_LOAD_ATTEMPTED:
@@ -94,11 +114,11 @@ def _ensure_strategy_plugins_loaded() -> None:
 
 def resolve_variant_signal_state_from_inputs(inputs: VariantSignalInputs) -> Dict[str, Any]:
     _ensure_strategy_plugins_loaded()
-    variant = normalize_strategy_variant(getattr(inputs.p, "strategy_variant", "classic"))
-    input_resolver = _get_variant_input_resolver(variant)
+    input_resolver, resolver = _get_variant_dispatch(getattr(inputs.p, "strategy_variant", "classic"))
     if input_resolver is not None:
         return input_resolver(inputs)
-    resolver = _get_variant_resolver(variant)
+    if resolver is _DEFAULT_RESOLVER:
+        return _resolve_variant_signal_state_legacy_from_inputs(inputs)
     return resolver(**inputs.to_kwargs())
 
 
