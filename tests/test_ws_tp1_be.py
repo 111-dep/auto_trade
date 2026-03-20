@@ -13,16 +13,48 @@ class _FakeClient:
         self.algo_calls = []
         self.order_calls = []
         self.place_calls = []
+        self.stop_place_calls = []
         self.cancel_calls = []
         self.order_snapshots = {}
+        self.raise_on_amend_algo = None
+        self.raise_on_amend_order = None
 
     def amend_algo_sl(self, **kwargs):
         self.algo_calls.append(dict(kwargs))
+        if self.raise_on_amend_algo is not None:
+            raise self.raise_on_amend_algo
         return {"code": "0", "data": []}
 
     def amend_order_attached_sl(self, **kwargs):
         self.order_calls.append(dict(kwargs))
+        if self.raise_on_amend_order is not None:
+            raise self.raise_on_amend_order
         return {"code": "0", "data": []}
+
+    def place_stop_loss_order(
+        self,
+        *,
+        inst_id: str,
+        side: str,
+        stop_price: float,
+        cl_ord_id: str = "",
+        size: float = 0.0,
+    ):
+        call = {
+            "inst_id": inst_id,
+            "side": side,
+            "stop_price": float(stop_price),
+            "cl_ord_id": cl_ord_id,
+            "size": float(size),
+        }
+        self.stop_place_calls.append(call)
+        row = {
+            "algoId": f"SL-{len(self.stop_place_calls)}",
+            "algoClOrdId": cl_ord_id or f"SLCL-{len(self.stop_place_calls)}",
+            "state": "live",
+            "slTriggerPx": str(stop_price),
+        }
+        return {"code": "0", "data": [row]}
 
     def get_order(self, *, inst_id: str, ord_id: str = "", cl_ord_id: str = ""):
         key = str(cl_ord_id or ord_id or "")
@@ -280,6 +312,45 @@ class WsTp1BeTests(unittest.TestCase):
         self.assertEqual(str(trade.get("managed_tp2_order_state", "")), "live")
         self.assertTrue(str(trade.get("managed_tp2_cl_ord_id", "")))
         self.assertFalse(str(trade.get("managed_tp1_cl_ord_id", "")))
+
+    def test_ws_sync_failure_falls_back_to_independent_stop(self) -> None:
+        cfg = _cfg()
+        client = _FakeClient()
+        client.raise_on_amend_algo = RuntimeError("algo missing")
+        client.raise_on_amend_order = RuntimeError("order filled")
+        inst_state = {
+            "trade": {
+                "side": "short",
+                "entry_price": 10.0,
+                "hard_stop": 10.5,
+                "open_size": 8.0,
+                "remaining_size": 8.0,
+                "exchange_split_tp_enabled": True,
+                "exchange_tp2_size": 4.0,
+                "attach_algo_id": "ALG-1",
+                "attach_algo_cl_ord_id": "ALGCL-1",
+                "entry_ord_id": "O-5",
+                "entry_cl_ord_id": "C-5",
+            }
+        }
+        changed = handle_tp1_fill_from_position(
+            cfg=cfg,
+            client=client,  # type: ignore[arg-type]
+            inst_id="SUI-USDT-SWAP",
+            inst_state=inst_state,
+            pos_side="short",
+            pos_size=4.0,
+            event_ts_ms=1_700_000_000_000,
+        )
+        self.assertTrue(changed)
+        trade = inst_state["trade"]
+        self.assertEqual(len(client.algo_calls), 1)
+        self.assertEqual(len(client.order_calls), 1)
+        self.assertEqual(len(client.stop_place_calls), 1)
+        self.assertTrue(bool(trade.get("exchange_sl_independent")))
+        self.assertEqual(str(trade.get("exchange_sl_last_reason", "")), "tp1_be_ws_fallback")
+        expected_be = 10.0 * (1.0 - float(cfg.params.be_offset_pct) - float(cfg.params.be_fee_buffer_pct))
+        self.assertAlmostEqual(float(client.stop_place_calls[0]["stop_price"]), expected_be, places=6)
 
 
 

@@ -82,6 +82,57 @@ def _sync_ws_be_stop(
     return False, "missing attach algo id and entry order id"
 
 
+def _place_ws_fallback_be_stop(
+    *,
+    client: OKXClient,
+    inst_id: str,
+    trade: Dict[str, Any],
+    side: str,
+    new_sl: float,
+    now_ms: int,
+) -> Tuple[bool, str]:
+    place_stop_fn = getattr(client, "place_stop_loss_order", None)
+    if not callable(place_stop_fn):
+        return False, "place_stop_loss_order unavailable"
+
+    desired_stop_size = max(
+        0.0,
+        _safe_float(trade.get("remaining_size", 0.0), 0.0),
+        _safe_float(trade.get("open_size", 0.0), 0.0),
+    )
+
+    try:
+        resp = place_stop_fn(
+            inst_id=inst_id,
+            side=side,
+            stop_price=float(new_sl),
+            size=float(desired_stop_size or 0.0),
+        )
+    except Exception as e:
+        return False, str(e)
+
+    row: Dict[str, Any] = {}
+    if isinstance(resp, dict):
+        rows = resp.get("data")
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            row = rows[0]
+
+    attach_id = str(row.get("attachAlgoId", row.get("algoId", row.get("ordId", ""))) or "").strip()
+    attach_cl_id = str(row.get("attachAlgoClOrdId", row.get("algoClOrdId", row.get("clOrdId", ""))) or "").strip()
+    if attach_id:
+        trade["exchange_sl_attach_algo_id"] = attach_id
+        trade["attach_algo_id"] = attach_id
+    if attach_cl_id:
+        trade["exchange_sl_attach_algo_cl_ord_id"] = attach_cl_id
+        trade["attach_algo_cl_ord_id"] = attach_cl_id
+    trade["exchange_sl_independent"] = True
+    trade["exchange_sl_px"] = float(new_sl)
+    trade["exchange_sl_last_sync_ts_ms"] = now_ms
+    trade["exchange_sl_last_reason"] = "tp1_be_ws_fallback"
+    trade.pop("exchange_sl_last_fail_ts_ms", None)
+    return True, ""
+
+
 def handle_tp1_fill_from_position(
     *,
     cfg: Config,
@@ -159,11 +210,26 @@ def handle_tp1_fill_from_position(
             f"remain={current_pos_size:.6f} sl={target_sl:.6f}"
         )
     else:
-        trade["exchange_sl_last_fail_ts_ms"] = now_ms
-        log(
-            f"[{inst_id}] WS fast-manage: TP1 filled but BE SL sync failed ({side}): {err}",
-            level="WARN",
+        fallback_ok, fallback_err = _place_ws_fallback_be_stop(
+            client=client,
+            inst_id=inst_id,
+            trade=trade,
+            side=side,
+            new_sl=target_sl,
+            now_ms=now_ms,
         )
+        if fallback_ok:
+            log(
+                f"[{inst_id}] WS fast-manage: TP1 filled -> BE SL fallback armed ({side}) "
+                f"remain={current_pos_size:.6f} sl={target_sl:.6f}"
+            )
+        else:
+            trade["exchange_sl_last_fail_ts_ms"] = now_ms
+            log(
+                f"[{inst_id}] WS fast-manage: TP1 filled but BE SL sync failed ({side}): {err} | "
+                f"fallback_place={fallback_err}",
+                level="WARN",
+            )
 
     if bool(trade.get("managed_tp2_enabled", False)) and bool(params.tp2_close_rest) and current_pos_size > 0:
         ok_tp2, err_tp2 = ensure_managed_tp2_limit_order(
