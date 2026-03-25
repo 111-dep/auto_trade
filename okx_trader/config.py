@@ -114,6 +114,16 @@ def _normalize_strategy_params(params: StrategyParams) -> None:
         params.daily_loss_base_mode = "current"
     if params.stop_reentry_cooldown_minutes < 0:
         params.stop_reentry_cooldown_minutes = 0
+    if params.tp2_reentry_cooldown_hours < 0:
+        params.tp2_reentry_cooldown_hours = 0.0
+    if params.tp2_reentry_partial_until_hours < 0:
+        params.tp2_reentry_partial_until_hours = 0.0
+    if params.tp2_reentry_partial_until_hours < params.tp2_reentry_cooldown_hours:
+        params.tp2_reentry_partial_until_hours = params.tp2_reentry_cooldown_hours
+    if params.tp2_reentry_partial_max_level < 0:
+        params.tp2_reentry_partial_max_level = 0
+    if params.tp2_reentry_partial_max_level > 3:
+        params.tp2_reentry_partial_max_level = 3
     if params.stop_streak_freeze_count < 0:
         params.stop_streak_freeze_count = 0
     if params.stop_streak_freeze_hours < 0:
@@ -237,6 +247,9 @@ def _build_base_strategy_params() -> StrategyParams:
         ),
         daily_loss_base_mode=os.getenv("STRAT_DAILY_LOSS_BASE_MODE", "current").strip().lower(),
         stop_reentry_cooldown_minutes=int(os.getenv("STRAT_STOP_REENTRY_COOLDOWN_MINUTES", "60")),
+        tp2_reentry_cooldown_hours=float(os.getenv("STRAT_TP2_REENTRY_COOLDOWN_HOURS", "0")),
+        tp2_reentry_partial_until_hours=float(os.getenv("STRAT_TP2_REENTRY_PARTIAL_UNTIL_HOURS", "0")),
+        tp2_reentry_partial_max_level=int(os.getenv("STRAT_TP2_REENTRY_PARTIAL_MAX_LEVEL", "0")),
         stop_streak_freeze_count=int(os.getenv("STRAT_STOP_STREAK_FREEZE_COUNT", "2")),
         stop_streak_freeze_hours=int(os.getenv("STRAT_STOP_STREAK_FREEZE_HOURS", "4")),
         stop_streak_l2_only=parse_bool(os.getenv("STRAT_STOP_STREAK_L2_ONLY", "1"), True),

@@ -55,7 +55,7 @@ def _signal_high_low(sig: Dict[str, Any], close_px: float) -> Tuple[float, float
 
 
 
-_LIVE_WINDOW_TABLE_CACHE_VERSION = "live_window_tables_v1"
+_LIVE_WINDOW_TABLE_CACHE_VERSION = "live_window_tables_v2"
 _LIVE_WINDOW_TABLE_CACHE_CODE_FILES = (
     "backtest.py",
     "decision_core.py",
@@ -66,6 +66,44 @@ _LIVE_WINDOW_TABLE_CACHE_CODE_FILES = (
     "strategy_variant.py",
     "strategy_variant_legacy.py",
     "strategies/elder_tss_v1_plugin.py",
+)
+
+_SIGNAL_DECISION_PARAM_FIELDS = (
+    "strategy_variant",
+    "htf_ema_fast_len",
+    "htf_ema_slow_len",
+    "htf_rsi_len",
+    "htf_rsi_long_min",
+    "htf_rsi_short_max",
+    "loc_lookback",
+    "loc_recent_bars",
+    "loc_sr_lookback",
+    "location_fib_low",
+    "location_fib_high",
+    "location_retest_tol",
+    "break_len",
+    "exit_len",
+    "ltf_ema_len",
+    "bb_len",
+    "bb_mult",
+    "bb_width_k",
+    "rsi_len",
+    "rsi_long_min",
+    "rsi_short_max",
+    "l2_rsi_relax",
+    "l3_rsi_relax",
+    "macd_fast",
+    "macd_slow",
+    "macd_signal",
+    "pullback_lookback",
+    "pullback_tolerance",
+    "max_chase_from_ema",
+    "atr_len",
+    "atr_stop_mult",
+    "min_risk_atr_mult",
+    "min_risk_pct",
+    "tp1_r_mult",
+    "tp2_r_mult",
 )
 
 
@@ -127,6 +165,10 @@ def _build_backtest_live_table_cache_key(
     start_idx: int,
     live_signal_window_limit: int,
 ) -> str:
+    def _signal_decision_param_payload(params: StrategyParams) -> Dict[str, Any]:
+        raw = asdict(params)
+        return {key: raw.get(key) for key in _SIGNAL_DECISION_PARAM_FIELDS}
+
     payload = {
         "version": _LIVE_WINDOW_TABLE_CACHE_VERSION,
         "code_sig": _backtest_live_table_code_signature(),
@@ -134,7 +176,9 @@ def _build_backtest_live_table_cache_key(
         "inst_id": str(inst_id),
         "profile_id": str(profile_id),
         "ordered_profile_ids": list(ordered_profile_ids),
-        "profile_params": {pid: asdict(profile_params[pid]) for pid in ordered_profile_ids},
+        "profile_params": {
+            pid: _signal_decision_param_payload(profile_params[pid]) for pid in ordered_profile_ids
+        },
         "profile_vote_mode": str(getattr(cfg, "strategy_profile_vote_mode", "") or ""),
         "profile_vote_min_agree": int(getattr(cfg, "strategy_profile_vote_min_agree", 0) or 0),
         "profile_vote_score_map": dict(getattr(cfg, "strategy_profile_vote_score_map", {}) or {}),
@@ -364,7 +408,7 @@ def _simulate_live_managed_step(
             pos["be_armed"] = True
 
         if (not tp1_done) and tp1_pct > 0:
-            if close >= tp1:
+            if high >= tp1:
                 close_qty = qty_rem * tp1_pct
                 if close_qty >= qty_rem * 0.999:
                     realized_r += qty_rem * _close_remaining_r("LONG", entry, risk, close)
@@ -386,7 +430,7 @@ def _simulate_live_managed_step(
                     return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False}
 
         if use_tp2 and tp1_done and qty_rem > 0:
-            if close >= tp2:
+            if high >= tp2:
                 realized_r += qty_rem * _close_remaining_r("LONG", entry, risk, close)
                 pos["qty_rem"] = 0.0
                 pos["realized_r"] = realized_r
@@ -507,7 +551,7 @@ def _simulate_live_managed_step(
         pos["be_armed"] = True
 
     if (not tp1_done) and tp1_pct > 0:
-        if close <= tp1:
+        if low <= tp1:
             close_qty = qty_rem * tp1_pct
             if close_qty >= qty_rem * 0.999:
                 realized_r += qty_rem * _close_remaining_r("SHORT", entry, risk, close)
@@ -529,7 +573,7 @@ def _simulate_live_managed_step(
                 return {"closed": False, "outcome": "NONE", "r_raw": 0.0, "is_stop": False}
 
     if use_tp2 and tp1_done and qty_rem > 0:
-        if close <= tp2:
+        if low <= tp2:
             realized_r += qty_rem * _close_remaining_r("SHORT", entry, risk, close)
             pos["qty_rem"] = 0.0
             pos["realized_r"] = realized_r
@@ -1106,6 +1150,67 @@ def _build_daily_hlc_refs(
     return prev_day_high, prev_day_low, prev_day_close, day_high_so_far, day_low_so_far
 
 
+def _build_completed_hourly_refs(
+    ltf_candles: List[Candle],
+) -> Dict[str, List[Optional[float]]]:
+    n = len(ltf_candles)
+    hour_open: List[Optional[float]] = [None] * n
+    hour_high: List[Optional[float]] = [None] * n
+    hour_low: List[Optional[float]] = [None] * n
+    hour_close: List[Optional[float]] = [None] * n
+    hour_prev_close: List[Optional[float]] = [None] * n
+    hour_rsi_value: List[Optional[float]] = [None] * n
+
+    latest_completed_idx: Optional[int] = None
+    hourly: List[Candle] = []
+    hour_idx_by_ltf: List[Optional[int]] = [None] * n
+    groups: Dict[int, List[Candle]] = {}
+
+    for idx, candle in enumerate(ltf_candles):
+        hour_key = int(candle.ts_ms // 3_600_000)
+        group = groups.setdefault(hour_key, [])
+        group.append(candle)
+        if len(group) == 4:
+            latest_completed_idx = len(hourly)
+            hourly.append(
+                Candle(
+                    ts_ms=int(group[0].ts_ms),
+                    open=float(group[0].open),
+                    high=max(float(x.high) for x in group),
+                    low=min(float(x.low) for x in group),
+                    close=float(group[-1].close),
+                    confirm=True,
+                    volume=sum(max(0.0, float(x.volume)) for x in group),
+                )
+            )
+        hour_idx_by_ltf[idx] = latest_completed_idx
+
+    if hourly:
+        hour_rsi_line = rsi([float(c.close) for c in hourly], 14)
+        for i in range(n):
+            hour_idx = hour_idx_by_ltf[i]
+            if hour_idx is None:
+                continue
+            current = hourly[hour_idx]
+            hour_open[i] = float(current.open)
+            hour_high[i] = float(current.high)
+            hour_low[i] = float(current.low)
+            hour_close[i] = float(current.close)
+            if hour_idx >= 1:
+                hour_prev_close[i] = float(hourly[hour_idx - 1].close)
+            if hour_idx < len(hour_rsi_line) and hour_rsi_line[hour_idx] is not None:
+                hour_rsi_value[i] = float(hour_rsi_line[hour_idx])
+
+    return {
+        "hour_open": hour_open,
+        "hour_high": hour_high,
+        "hour_low": hour_low,
+        "hour_close": hour_close,
+        "hour_prev_close": hour_prev_close,
+        "hour_rsi_value": hour_rsi_value,
+    }
+
+
 def _build_backtest_precalc(
     htf_candles: List[Candle],
     loc_candles: List[Candle],
@@ -1119,7 +1224,12 @@ def _build_backtest_precalc(
 
     loc_highs = [c.high for c in loc_candles]
     loc_lows = [c.low for c in loc_candles]
+    loc_closes = [c.close for c in loc_candles]
     loc_recent_bars = max(2, p.loc_recent_bars)
+    loc_ema_fast = ema(loc_closes, 20)
+    loc_ema_slow = ema(loc_closes, 50)
+    loc_rsi_line = rsi(loc_closes, 14)
+    loc_atr_line = atr(loc_highs, loc_lows, loc_closes, 14)
 
     loc_lookback_high = _rolling_max_inclusive(loc_highs, max(1, p.loc_lookback))
     loc_lookback_low = _rolling_min_inclusive(loc_lows, max(1, p.loc_lookback))
@@ -1135,6 +1245,8 @@ def _build_backtest_precalc(
     volumes = [max(0.0, float(c.volume)) for c in ltf_candles]
 
     ema_line = ema(closes, p.ltf_ema_len)
+    ema_20_line = ema(closes, 20)
+    ema_50_line = ema(closes, 50)
     rsi_line = rsi(closes, p.rsi_len)
     _, _, macd_hist = macd(closes, p.macd_fast, p.macd_slow, p.macd_signal)
     atr_line = atr(highs, lows, closes, p.atr_len)
@@ -1152,6 +1264,7 @@ def _build_backtest_precalc(
         lows,
         closes,
     )
+    hourly_refs = _build_completed_hourly_refs(ltf_candles)
 
     bb_width: List[Optional[float]] = [None] * len(closes)
     for i in range(len(closes)):
@@ -1192,6 +1305,13 @@ def _build_backtest_precalc(
         "loc_recent_low": loc_recent_low,
         "loc_sr_ref_high": loc_sr_ref_high,
         "loc_sr_ref_low": loc_sr_ref_low,
+        "loc_highs": loc_highs,
+        "loc_lows": loc_lows,
+        "loc_closes": loc_closes,
+        "loc_ema_fast": loc_ema_fast,
+        "loc_ema_slow": loc_ema_slow,
+        "loc_rsi_line": loc_rsi_line,
+        "loc_atr_line": loc_atr_line,
         "closes": closes,
         "opens": opens,
         "highs": highs,
@@ -1199,6 +1319,8 @@ def _build_backtest_precalc(
         "volumes": volumes,
         "volume_avg": volume_avg,
         "ema_line": ema_line,
+        "ema_20_line": ema_20_line,
+        "ema_50_line": ema_50_line,
         "rsi_line": rsi_line,
         "macd_hist": macd_hist,
         "atr_line": atr_line,
@@ -1218,6 +1340,12 @@ def _build_backtest_precalc(
         "prev_day_close": prev_day_close,
         "day_high_so_far": day_high_so_far,
         "day_low_so_far": day_low_so_far,
+        "hour_open": hourly_refs["hour_open"],
+        "hour_high": hourly_refs["hour_high"],
+        "hour_low": hourly_refs["hour_low"],
+        "hour_close": hourly_refs["hour_close"],
+        "hour_prev_close": hourly_refs["hour_prev_close"],
+        "hour_rsi_value": hourly_refs["hour_rsi_value"],
     }
 
 
@@ -1245,6 +1373,8 @@ def _build_backtest_signal_fast(
     h_rsi = htf_rsi[hidx]
     if h_ema_fast is None or h_ema_slow is None or h_rsi is None:
         return None
+    prev_h_ema_fast = htf_ema_fast[hidx - 1] if hidx >= 1 else None
+    prev_h_ema_slow = htf_ema_slow[hidx - 1] if hidx >= 1 else None
 
     bias = "neutral"
     if h_close > h_ema_fast > h_ema_slow and h_rsi >= p.htf_rsi_long_min:
@@ -1284,9 +1414,20 @@ def _build_backtest_signal_fast(
 
     long_location_ok = fib_touch_long or retest_long
     short_location_ok = fib_touch_short or retest_short
+    loc_close = pre["loc_closes"][lcid]
+    loc_ema_fast = pre["loc_ema_fast"][lcid]
+    loc_ema_slow = pre["loc_ema_slow"][lcid]
+    loc_rsi_value = pre["loc_rsi_line"][lcid]
+    loc_atr_value = pre["loc_atr_line"][lcid]
+    if loc_ema_fast is None or loc_ema_slow is None or loc_rsi_value is None or loc_atr_value is None:
+        return None
+    prev_loc_ema_fast = pre["loc_ema_fast"][lcid - 1] if lcid >= 1 else None
+    prev_loc_ema_slow = pre["loc_ema_slow"][lcid - 1] if lcid >= 1 else None
 
     close = pre["closes"][i]
     em = pre["ema_line"][i]
+    em20 = pre["ema_20_line"][i]
+    em50 = pre["ema_50_line"][i]
     r = pre["rsi_line"][i]
     mh = pre["macd_hist"][i]
     a = pre["atr_line"][i]
@@ -1302,6 +1443,8 @@ def _build_backtest_signal_fast(
     width = pre["bb_width"][i]
     if (
         em is None
+        or em20 is None
+        or em50 is None
         or r is None
         or mh is None
         or a is None
@@ -1325,9 +1468,18 @@ def _build_backtest_signal_fast(
     pullback_short = float(pb_high) >= float(em) * (1.0 - p.pullback_tolerance)
     not_chasing_long = close <= float(em) * (1.0 + p.max_chase_from_ema)
     not_chasing_short = close >= float(em) * (1.0 - p.max_chase_from_ema)
+    recent_rsi_vals = [
+        float(v)
+        for v in pre["rsi_line"][max(0, i - max(1, int(p.pullback_lookback)) + 1) : i + 1]
+        if v is not None
+    ]
+    recent_rsi_min = min(recent_rsi_vals) if recent_rsi_vals else None
+    recent_rsi_max = max(recent_rsi_vals) if recent_rsi_vals else None
 
     prev_hhv = pre["hh"][i - 1] if i > 0 else None
     prev_llv = pre["ll"][i - 1] if i > 0 else None
+    prev_exl = pre["exit_low"][i - 1] if i > 0 else None
+    prev_exh = pre["exit_high"][i - 1] if i > 0 else None
     variant_inputs = VariantSignalInputs(
         p=p,
         bias=bias,
@@ -1355,6 +1507,8 @@ def _build_backtest_signal_fast(
         not_chasing_short=bool(not_chasing_short),
         prev_hhv=float(prev_hhv) if prev_hhv is not None else None,
         prev_llv=float(prev_llv) if prev_llv is not None else None,
+        prev_exl=float(prev_exl) if prev_exl is not None else None,
+        prev_exh=float(prev_exh) if prev_exh is not None else None,
         current_high=float(pre["highs"][i]) if i >= 0 else None,
         current_low=float(pre["lows"][i]) if i >= 0 else None,
         prev_high=float(pre["highs"][i - 1]) if i >= 1 else None,
@@ -1377,6 +1531,28 @@ def _build_backtest_signal_fast(
         prev_day_close=float(pre["prev_day_close"][i]) if pre["prev_day_close"][i] is not None else None,
         day_high_so_far=float(pre["day_high_so_far"][i]) if pre["day_high_so_far"][i] is not None else None,
         day_low_so_far=float(pre["day_low_so_far"][i]) if pre["day_low_so_far"][i] is not None else None,
+        prev_h_ema_fast=float(prev_h_ema_fast) if prev_h_ema_fast is not None else None,
+        prev_h_ema_slow=float(prev_h_ema_slow) if prev_h_ema_slow is not None else None,
+        recent_rsi_min=float(recent_rsi_min) if recent_rsi_min is not None else None,
+        recent_rsi_max=float(recent_rsi_max) if recent_rsi_max is not None else None,
+        prev_ema_value=float(pre["ema_20_line"][i - 1]) if i >= 1 and pre["ema_20_line"][i - 1] is not None else None,
+        ema_slow_value=float(em50) if em50 is not None else None,
+        prev_ema_slow_value=float(pre["ema_50_line"][i - 1]) if i >= 1 and pre["ema_50_line"][i - 1] is not None else None,
+        loc_close=float(loc_close),
+        loc_ema_fast=float(loc_ema_fast),
+        loc_ema_slow=float(loc_ema_slow),
+        prev_loc_ema_fast=float(prev_loc_ema_fast) if prev_loc_ema_fast is not None else None,
+        prev_loc_ema_slow=float(prev_loc_ema_slow) if prev_loc_ema_slow is not None else None,
+        loc_rsi_value=float(loc_rsi_value),
+        loc_atr_value=float(loc_atr_value),
+        loc_current_high=float(pre["loc_highs"][lcid]) if lcid >= 0 else None,
+        loc_current_low=float(pre["loc_lows"][lcid]) if lcid >= 0 else None,
+        hour_open=float(pre["hour_open"][i]) if pre["hour_open"][i] is not None else None,
+        hour_high=float(pre["hour_high"][i]) if pre["hour_high"][i] is not None else None,
+        hour_low=float(pre["hour_low"][i]) if pre["hour_low"][i] is not None else None,
+        hour_close=float(pre["hour_close"][i]) if pre["hour_close"][i] is not None else None,
+        hour_prev_close=float(pre["hour_prev_close"][i]) if pre["hour_prev_close"][i] is not None else None,
+        hour_rsi_value=float(pre["hour_rsi_value"][i]) if pre["hour_rsi_value"][i] is not None else None,
     )
     variant_state = resolve_variant_signal_state_from_inputs(variant_inputs)
     long_level = int(variant_state["long_level"])
@@ -1384,8 +1560,10 @@ def _build_backtest_signal_fast(
     long_stop = float(variant_state["long_stop"])
     short_stop = float(variant_state["short_stop"])
 
-    long_exit = close < em or close < exl or mh < 0 or bias == "short"
-    short_exit = close > em or close > exh or mh > 0 or bias == "long"
+    long_exit_default = close < em or close < exl or mh < 0 or bias == "short"
+    short_exit_default = close > em or close > exh or mh > 0 or bias == "long"
+    long_exit = bool(variant_state["long_exit"]) if "long_exit" in variant_state else bool(long_exit_default)
+    short_exit = bool(variant_state["short_exit"]) if "short_exit" in variant_state else bool(short_exit_default)
 
     return {
         "close": float(close),
@@ -1418,6 +1596,8 @@ def _build_backtest_signal_live_window(
     limit = max(1, int(candle_limit))
     if hi <= 0 or li <= 0 or i < 0:
         return None
+    if i >= len(ltf_candles):
+        return None
 
     h_start = max(0, hi - limit)
     l_start = max(0, li - limit)
@@ -1428,9 +1608,16 @@ def _build_backtest_signal_live_window(
     loc_slice = loc_candles[l_start:li]
     ltf_slice = ltf_candles[t_start:t_end]
     try:
-        return build_signals(htf_slice, loc_slice, ltf_slice, p)
+        sig = build_signals(htf_slice, loc_slice, ltf_slice, p)
     except Exception:
         return None
+    if not isinstance(sig, dict):
+        return None
+
+    c = ltf_candles[i]
+    sig["high"] = float(getattr(c, "high", sig.get("high", sig.get("close", 0.0))) or sig.get("close", 0.0))
+    sig["low"] = float(getattr(c, "low", sig.get("low", sig.get("close", 0.0))) or sig.get("close", 0.0))
+    return sig
 
 
 def _build_backtest_alignment_counts(
@@ -1438,6 +1625,9 @@ def _build_backtest_alignment_counts(
     loc_ts: List[int],
     ltf_ts: List[int],
     *,
+    htf_bar_ms: int = 0,
+    loc_bar_ms: int = 0,
+    ltf_bar_ms: int = 0,
     start_idx: int = 0,
 ) -> Tuple[List[int], List[int]]:
     htf_counts: List[int] = [0] * len(ltf_ts)
@@ -1447,12 +1637,24 @@ def _build_backtest_alignment_counts(
     htf_n = len(htf_ts)
     loc_n = len(loc_ts)
     start = max(0, int(start_idx))
+    htf_span = max(0, int(htf_bar_ms))
+    loc_span = max(0, int(loc_bar_ms))
+    ltf_span = max(0, int(ltf_bar_ms))
     for i, ts in enumerate(ltf_ts):
         ts_i = int(ts)
-        while hi < htf_n and int(htf_ts[hi]) <= ts_i:
-            hi += 1
-        while li < loc_n and int(loc_ts[li]) <= ts_i:
-            li += 1
+        signal_close_ts = ts_i + ltf_span if ltf_span > 0 else ts_i
+        if htf_span > 0:
+            while hi < htf_n and int(htf_ts[hi]) + htf_span <= signal_close_ts:
+                hi += 1
+        else:
+            while hi < htf_n and int(htf_ts[hi]) <= ts_i:
+                hi += 1
+        if loc_span > 0:
+            while li < loc_n and int(loc_ts[li]) + loc_span <= signal_close_ts:
+                li += 1
+        else:
+            while li < loc_n and int(loc_ts[li]) <= ts_i:
+                li += 1
         if i >= start:
             htf_counts[i] = hi
             loc_counts[i] = li
@@ -1526,6 +1728,9 @@ def _build_backtest_signal_decision_tables(
         htf_ts,
         loc_ts,
         ltf_ts,
+        htf_bar_ms=bar_to_seconds(cfg.htf_bar) * 1000,
+        loc_bar_ms=bar_to_seconds(cfg.loc_bar) * 1000,
+        ltf_bar_ms=bar_to_seconds(cfg.ltf_bar) * 1000,
         start_idx=start_idx,
     )
     signal_table: List[Optional[Dict[str, Any]]] = [None] * len(ltf_ts)

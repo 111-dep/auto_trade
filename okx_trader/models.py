@@ -72,6 +72,9 @@ class StrategyParams:
     daily_loss_base_usdt: float
     daily_loss_base_mode: str
     stop_reentry_cooldown_minutes: int
+    tp2_reentry_cooldown_hours: float
+    tp2_reentry_partial_until_hours: float
+    tp2_reentry_partial_max_level: int
     stop_streak_freeze_count: int
     stop_streak_freeze_hours: int
     stop_streak_l2_only: bool

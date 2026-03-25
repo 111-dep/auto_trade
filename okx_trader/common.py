@@ -125,6 +125,26 @@ def load_dotenv(path: str) -> None:
                 os.environ[key] = value
 
 
+def apply_backtest_env_overrides() -> List[str]:
+    changes: List[str] = []
+
+    ttl_raw = str(os.getenv("OKX_BACKTEST_HISTORY_CACHE_TTL_SECONDS", "") or "").strip()
+    if ttl_raw:
+        try:
+            ttl = max(0, int(float(ttl_raw)))
+        except Exception:
+            log(
+                f"Invalid OKX_BACKTEST_HISTORY_CACHE_TTL_SECONDS={ttl_raw!r}, ignore backtest TTL override.",
+                level="WARN",
+            )
+        else:
+            prev = str(os.getenv("OKX_HISTORY_CACHE_TTL_SECONDS", "") or "").strip()
+            os.environ["OKX_HISTORY_CACHE_TTL_SECONDS"] = str(ttl)
+            changes.append(f"history_cache_ttl={prev or '-'}->{ttl}")
+
+    return changes
+
+
 def bar_to_seconds(bar: str) -> int:
     s = bar.strip().lower()
     if s.endswith("m"):
@@ -133,6 +153,8 @@ def bar_to_seconds(bar: str) -> int:
         return int(s[:-1]) * 3600
     if s.endswith("d"):
         return int(s[:-1]) * 86400
+    if s.endswith("w"):
+        return int(s[:-1]) * 7 * 86400
     raise ValueError(f"Unsupported bar format: {bar}")
 
 

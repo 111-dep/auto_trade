@@ -34,6 +34,8 @@ class VariantSignalInputs:
     not_chasing_short: bool
     prev_hhv: Optional[float] = None
     prev_llv: Optional[float] = None
+    prev_exl: Optional[float] = None
+    prev_exh: Optional[float] = None
     current_high: Optional[float] = None
     current_low: Optional[float] = None
     prev_high: Optional[float] = None
@@ -56,6 +58,28 @@ class VariantSignalInputs:
     prev_day_close: Optional[float] = None
     day_high_so_far: Optional[float] = None
     day_low_so_far: Optional[float] = None
+    prev_h_ema_fast: Optional[float] = None
+    prev_h_ema_slow: Optional[float] = None
+    recent_rsi_min: Optional[float] = None
+    recent_rsi_max: Optional[float] = None
+    prev_ema_value: Optional[float] = None
+    ema_slow_value: Optional[float] = None
+    prev_ema_slow_value: Optional[float] = None
+    loc_close: Optional[float] = None
+    loc_ema_fast: Optional[float] = None
+    loc_ema_slow: Optional[float] = None
+    prev_loc_ema_fast: Optional[float] = None
+    prev_loc_ema_slow: Optional[float] = None
+    loc_rsi_value: Optional[float] = None
+    loc_atr_value: Optional[float] = None
+    loc_current_high: Optional[float] = None
+    loc_current_low: Optional[float] = None
+    hour_open: Optional[float] = None
+    hour_high: Optional[float] = None
+    hour_low: Optional[float] = None
+    hour_close: Optional[float] = None
+    hour_prev_close: Optional[float] = None
+    hour_rsi_value: Optional[float] = None
 
     def to_kwargs(self) -> Dict[str, Any]:
         return {
@@ -85,6 +109,8 @@ class VariantSignalInputs:
             "not_chasing_short": self.not_chasing_short,
             "prev_hhv": self.prev_hhv,
             "prev_llv": self.prev_llv,
+            "prev_exl": self.prev_exl,
+            "prev_exh": self.prev_exh,
             "current_high": self.current_high,
             "current_low": self.current_low,
             "prev_high": self.prev_high,
@@ -107,4 +133,26 @@ class VariantSignalInputs:
             "prev_day_close": self.prev_day_close,
             "day_high_so_far": self.day_high_so_far,
             "day_low_so_far": self.day_low_so_far,
+            "prev_h_ema_fast": self.prev_h_ema_fast,
+            "prev_h_ema_slow": self.prev_h_ema_slow,
+            "recent_rsi_min": self.recent_rsi_min,
+            "recent_rsi_max": self.recent_rsi_max,
+            "prev_ema_value": self.prev_ema_value,
+            "ema_slow_value": self.ema_slow_value,
+            "prev_ema_slow_value": self.prev_ema_slow_value,
+            "loc_close": self.loc_close,
+            "loc_ema_fast": self.loc_ema_fast,
+            "loc_ema_slow": self.loc_ema_slow,
+            "prev_loc_ema_fast": self.prev_loc_ema_fast,
+            "prev_loc_ema_slow": self.prev_loc_ema_slow,
+            "loc_rsi_value": self.loc_rsi_value,
+            "loc_atr_value": self.loc_atr_value,
+            "loc_current_high": self.loc_current_high,
+            "loc_current_low": self.loc_current_low,
+            "hour_open": self.hour_open,
+            "hour_high": self.hour_high,
+            "hour_low": self.hour_low,
+            "hour_close": self.hour_close,
+            "hour_prev_close": self.hour_prev_close,
+            "hour_rsi_value": self.hour_rsi_value,
         }

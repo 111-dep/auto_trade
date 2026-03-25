@@ -33,6 +33,7 @@ from .risk_guard import (
     rolling_loss_sum,
 )
 from .signals import compute_alert_targets
+from .tp2_reentry_guard import arm_tp2_reentry_bucket, get_tp2_reentry_gate
 from .trade_journal import append_trade_journal, append_trade_order_link
 from .runtime_order_id import build_runtime_order_cl_id
 
@@ -183,7 +184,36 @@ def execute_decision(
             root[key] = bucket
         return bucket
 
-    def _record_stop_guard(side: str, is_stop_event: bool, reason: str) -> None:
+    def _trade_tp2_target_price(trade: Any) -> float:
+        if not isinstance(trade, dict):
+            return 0.0
+        for key in (
+            "managed_tp2_target_px",
+            "exchange_tp2_px",
+            "tp2_price",
+            "tp2_px",
+        ):
+            try:
+                val = float(trade.get(key, 0.0) or 0.0)
+            except Exception:
+                val = 0.0
+            if val > 0:
+                return val
+        return 0.0
+
+    def _infer_external_close_is_tp2(side: str, exit_px: float, trade: Any) -> bool:
+        target = _trade_tp2_target_price(trade)
+        if target <= 0 or exit_px <= 0:
+            return False
+        side_k = _side_key(side)
+        tol = max(abs(target) * 0.0015, 1e-9)
+        if side_k == "long":
+            return exit_px >= (target - tol)
+        if side_k == "short":
+            return exit_px <= (target + tol)
+        return False
+
+    def _record_stop_guard(side: str, is_stop_event: bool, reason: str, *, is_tp2_event: bool = False) -> None:
         key = _side_key(side)
         if key not in {"long", "short"}:
             return
@@ -214,6 +244,30 @@ def execute_decision(
         if prev_streak > 0:
             bucket["streak"] = 0
             log(f"[{inst_id}] RiskGuard: {key} stop streak reset (reason={reason})")
+
+        tp2_cd_hours = float(max(0.0, getattr(cfg.params, "tp2_reentry_cooldown_hours", 0.0) or 0.0))
+        tp2_partial_until_hours = float(
+            max(0.0, getattr(cfg.params, "tp2_reentry_partial_until_hours", 0.0) or 0.0)
+        )
+        tp2_partial_max_level = int(max(0, getattr(cfg.params, "tp2_reentry_partial_max_level", 0) or 0))
+        if is_tp2_event and (tp2_cd_hours > 0 or tp2_partial_until_hours > 0):
+            armed = arm_tp2_reentry_bucket(
+                bucket,
+                event_ts_ms=now_ts,
+                block_hours=tp2_cd_hours,
+                partial_until_hours=tp2_partial_until_hours,
+            )
+            block_until_ts = int(armed.get("tp2_cooldown_until_ts_ms", 0) or 0)
+            partial_until_ts = int(armed.get("tp2_partial_until_ts_ms", 0) or 0)
+            parts: List[str] = []
+            if block_until_ts > now_ts:
+                parts.append(f"block={tp2_cd_hours:g}h")
+            if partial_until_ts > now_ts and 0 < tp2_partial_max_level < 3:
+                parts.append(
+                    f"partial_until={tp2_partial_until_hours:g}h(max_level={tp2_partial_max_level})"
+                )
+            if parts:
+                log(f"[{inst_id}] RiskGuard: {key} TP2 reentry armed ({', '.join(parts)}) (reason={reason})")
 
     def is_script_trade_state(trade: Any, expected_side: Optional[str] = None) -> bool:
         if not isinstance(trade, dict):
@@ -747,6 +801,35 @@ def execute_decision(
                     f"(need {cooldown_min}m, wait {remain_min}m), skip entry."
                 )
                 return False
+
+        tp2_cd_hours = float(max(0.0, getattr(cfg.params, "tp2_reentry_cooldown_hours", 0.0) or 0.0))
+        tp2_partial_until_hours = float(
+            max(0.0, getattr(cfg.params, "tp2_reentry_partial_until_hours", 0.0) or 0.0)
+        )
+        tp2_partial_max_level = int(max(0, getattr(cfg.params, "tp2_reentry_partial_max_level", 0) or 0))
+        tp2_gate = get_tp2_reentry_gate(
+            bucket,
+            now_ts_ms=now_ts,
+            planned_level=level,
+            block_hours=tp2_cd_hours,
+            partial_until_hours=tp2_partial_until_hours,
+            partial_max_level=tp2_partial_max_level,
+        )
+        if str(tp2_gate.get("status")) == "block":
+            remain_min = int(tp2_gate.get("remaining_minutes", 0) or 0)
+            log(
+                f"[{inst_id}] RiskGuard: {key} TP2 cooldown active "
+                f"({remain_min}m left), skip entry."
+            )
+            return False
+        if str(tp2_gate.get("status")) == "partial_level_cap":
+            remain_min = int(tp2_gate.get("remaining_minutes", 0) or 0)
+            required_level = int(tp2_gate.get("required_level", 0) or 0)
+            log(
+                f"[{inst_id}] RiskGuard: {key} TP2 partial cooldown active "
+                f"({remain_min}m left), only L{required_level} and stronger allowed."
+            )
+            return False
 
         freeze_count = int(max(0, cfg.params.stop_streak_freeze_count))
         freeze_hours = int(max(0, cfg.params.stop_streak_freeze_hours))
@@ -2306,10 +2389,12 @@ def execute_decision(
                     trade_ref=prev_trade,
                 )
                 stop_hit = _infer_external_close_is_stop(prev_side, close_exit_px, float(prev_stop or 0.0))
+                tp2_hit = (not stop_hit) and _infer_external_close_is_tp2(prev_side, close_exit_px, prev_trade)
                 _record_stop_guard(
                     prev_side,
                     is_stop_event=bool(stop_hit),
                     reason="external_close_or_attached_tpsl",
+                    is_tp2_event=bool(tp2_hit),
                 )
         cleanup_flat_pending_stops(prev_side, reason="pos_flat")
         clear_trade_state(reason="pos_flat")
@@ -2671,7 +2756,7 @@ def execute_decision(
                     trade_ref=trade_state,
                     order_resp=close_resp,
                 )
-                _record_stop_guard("long", is_stop_event=False, reason="tp2_full")
+                _record_stop_guard("long", is_stop_event=False, reason="tp2_full", is_tp2_event=True)
                 clear_trade_state()
                 return
 
@@ -3004,7 +3089,7 @@ def execute_decision(
                     trade_ref=trade_state,
                     order_resp=close_resp,
                 )
-                _record_stop_guard("short", is_stop_event=False, reason="tp2_full")
+                _record_stop_guard("short", is_stop_event=False, reason="tp2_full", is_tp2_event=True)
                 clear_trade_state()
                 return
 

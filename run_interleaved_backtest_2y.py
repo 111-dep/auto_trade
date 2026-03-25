@@ -29,7 +29,7 @@ from okx_trader.backtest_report import (
     update_level_perf,
 )
 from okx_trader.client_factory import create_client
-from okx_trader.common import bar_to_seconds, load_dotenv
+from okx_trader.common import apply_backtest_env_overrides, bar_to_seconds, load_dotenv, parse_bool
 from okx_trader.config import (
     get_strategy_params,
     get_strategy_profile_id,
@@ -52,6 +52,7 @@ from okx_trader.risk_guard import (
     prune_ts_deque_window,
     resolve_loss_base,
 )
+from okx_trader.tp2_reentry_guard import arm_tp2_reentry_bucket, get_tp2_reentry_gate
 
 
 def ts_fmt(ms: int) -> str:
@@ -278,6 +279,20 @@ def _apply_cached_trade_trajectory_step(*, pos: Dict[str, Any], current_i: int, 
     }
 
 
+def _select_post_close_open_decision(
+    *,
+    sim: Dict[str, Any],
+    decision: Optional[Any],
+    reopen_on_close_same_bar: bool,
+) -> Tuple[Optional[Any], bool]:
+    reverse_decision = sim.get("reverse_decision")
+    if reverse_decision is not None:
+        return reverse_decision, True
+    if reopen_on_close_same_bar and decision is not None:
+        return decision, False
+    return None, False
+
+
 def _get_or_build_interleaved_trade_trajectory(
     *,
     row: Dict[str, Any],
@@ -357,6 +372,8 @@ def dump_trades_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         "entry_ts",
         "exit_ts",
         "inst",
+        "profile_id",
+        "position_key",
         "side",
         "level",
         "entry_px",
@@ -380,6 +397,8 @@ def dump_trades_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                     "entry_ts": int(t.get("entry_ts", 0) or 0),
                     "exit_ts": int(t.get("exit_ts", 0) or 0),
                     "inst": str(t.get("inst", "")),
+                    "profile_id": str(t.get("profile_id", "")),
+                    "position_key": str(t.get("position_key", "")),
                     "side": str(t.get("side", "")),
                     "level": int(t.get("level", 0) or 0),
                     "entry_px": float(t.get("entry_px", 0.0) or 0.0),
@@ -415,6 +434,8 @@ def _new_sim_position(
     risk_amt: float,
     exit_model: str = "standard",
     swap_stop_r_mult: float = 0.0,
+    profile_id: str = "",
+    position_key: str = "",
 ) -> Dict[str, Any]:
     entry = float(decision.entry)
     stop = float(decision.stop)
@@ -442,6 +463,8 @@ def _new_sim_position(
         "trough_price": float(entry),
         "exit_model": str(exit_model or "standard"),
         "friction_stop": float(stop),
+        "profile_id": str(profile_id or ""),
+        "position_key": str(position_key or ""),
     }
     if pos["exit_model"] == "swapped_reverse":
         take_px, hard_stop_px = _reverse_swap_exit_prices(
@@ -459,6 +482,52 @@ def _new_sim_position(
         pos["swap_take_r"] = 1.0
         pos["swap_stop_r"] = max(1.0, float(swap_stop_r_mult or 1.0))
     return pos
+
+
+def _runtime_slot_key(inst: str, profile_id: str) -> str:
+    return f"{str(inst or '').strip().upper()}::{str(profile_id or '').strip().upper()}"
+
+
+def _build_interleaved_runtime_slots(
+    *,
+    inst_ids: List[str],
+    profile_ids_by_inst: Dict[str, List[str]],
+    profile_by_inst: Dict[str, str],
+    independent_profile_positions: bool,
+) -> List[Dict[str, Any]]:
+    slots: List[Dict[str, Any]] = []
+    for inst in inst_ids:
+        primary_profile_id = str(profile_by_inst.get(inst, "DEFAULT") or "DEFAULT").strip().upper()
+        inst_profile_ids = [str(x or "").strip().upper() for x in (profile_ids_by_inst.get(inst) or [primary_profile_id]) if str(x or "").strip()]
+        if primary_profile_id not in inst_profile_ids:
+            inst_profile_ids = [primary_profile_id] + [x for x in inst_profile_ids if x != primary_profile_id]
+        if not inst_profile_ids:
+            inst_profile_ids = [primary_profile_id]
+        if independent_profile_positions:
+            for pid in inst_profile_ids:
+                slot_key = _runtime_slot_key(inst, pid)
+                slots.append(
+                    {
+                        "inst": inst,
+                        "profile_id": pid,
+                        "profile_ids": [pid],
+                        "position_key": slot_key,
+                        "state_key": slot_key,
+                        "display_name": f"{inst}:{pid}",
+                    }
+                )
+            continue
+        slots.append(
+            {
+                "inst": inst,
+                "profile_id": primary_profile_id,
+                "profile_ids": inst_profile_ids,
+                "position_key": str(inst),
+                "state_key": str(inst),
+                "display_name": str(inst),
+            }
+        )
+    return slots
 
 
 def _close_remaining_r(side: str, entry: float, risk: float, close_px: float) -> float:
@@ -708,6 +777,9 @@ def main() -> int:
     parser.add_argument("--bars", type=int, default=70080, help="15m bars to evaluate (~70080 for 2 years)")
     parser.add_argument("--risk-frac", type=float, default=0.005, help="Risk fraction per trade for compounding")
     parser.add_argument("--title", default="2Y 真实顺序 TP1_ONLY（全币种）")
+    parser.add_argument("--min-level", type=int, default=None, help="Min signal level to include (1~3)")
+    parser.add_argument("--max-level", type=int, default=None, help="Max signal level to include (1~3)")
+    parser.add_argument("--exact-level", type=int, default=0, help="Exact signal level to include (1~3)")
     parser.add_argument(
         "--pessimistic",
         action="store_true",
@@ -796,9 +868,20 @@ def main() -> int:
         action="store_true",
         help="Invert signals and swap exit structure to 1R TP / original-TP1-distance stop",
     )
+    parser.add_argument(
+        "--independent-profile-positions",
+        action="store_true",
+        help=(
+            "When one instrument is mapped to multiple strategy profiles, run them as independent "
+            "sub-systems with separate positions keyed by inst+profile instead of vote-merging"
+        ),
+    )
     args = parser.parse_args()
 
     load_dotenv(args.env)
+    override_notes = apply_backtest_env_overrides()
+    if override_notes:
+        print(f"backtest_env_overrides: {'; '.join(override_notes)}", flush=True)
     cfg = read_config(None)
     client = create_client(cfg)
     run_start = time.monotonic()
@@ -812,6 +895,16 @@ def main() -> int:
         inst: (ids[0] if ids else get_strategy_profile_id(cfg, inst))
         for inst, ids in profile_ids_by_inst.items()
     }
+    independent_profile_positions = bool(args.independent_profile_positions)
+    runtime_slots = _build_interleaved_runtime_slots(
+        inst_ids=inst_ids,
+        profile_ids_by_inst=profile_ids_by_inst,
+        profile_by_inst=profile_by_inst,
+        independent_profile_positions=independent_profile_positions,
+    )
+    slots_by_inst: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for slot in runtime_slots:
+        slots_by_inst[str(slot.get("inst", ""))].append(slot)
     params_by_inst = {
         inst: cfg.strategy_profiles.get(profile_by_inst[inst], get_strategy_params(cfg, inst))
         for inst in inst_ids
@@ -884,7 +977,18 @@ def main() -> int:
     l3_inst_set = set()
     for p in all_params:
         l3_inst_set.update(str(x).strip().upper() for x in p.exec_l3_inst_ids if str(x).strip())
-    exact_level = 0
+    if args.min_level is not None:
+        min_level = max(1, min(3, int(args.min_level)))
+    if args.max_level is not None:
+        max_level = max(1, min(3, int(args.max_level)))
+    exact_level = int(args.exact_level or 0)
+    if exact_level not in {0, 1, 2, 3}:
+        exact_level = 0
+    if exact_level in {1, 2, 3}:
+        min_level = exact_level
+        max_level = exact_level
+    if min_level > max_level:
+        min_level = max_level
     require_tp_sl = True
     tp1_only = not bool(args.managed_exit)
     managed_exit = bool(args.managed_exit)
@@ -893,6 +997,7 @@ def main() -> int:
     invert_signal_mode = bool(args.invert_signals) or bool(args.invert_signals_swap_exits)
     inversion_mode_label = "swap_exits" if bool(args.invert_signals_swap_exits) else ("symmetric" if bool(args.invert_signals) else "off")
     default_exit_model = "swapped_reverse" if bool(args.invert_signals_swap_exits) else "standard"
+    reopen_on_close_same_bar = parse_bool(os.getenv("OKX_BACKTEST_REOPEN_ON_CLOSE_SAME_BAR", "1"), True)
     default_exchange_split_tp_enabled = bool(
         managed_exit
         and resolve_backtest_split_tp_enabled(
@@ -911,6 +1016,11 @@ def main() -> int:
     min_gap_minutes = int(cfg.params.min_open_interval_minutes)
     window_ms = max(1, window_hours) * 3600 * 1000
     stop_cooldown_minutes = int(max(0, cfg.params.stop_reentry_cooldown_minutes))
+    tp2_cooldown_hours = float(max(0.0, getattr(cfg.params, "tp2_reentry_cooldown_hours", 0.0) or 0.0))
+    tp2_partial_until_hours = float(
+        max(0.0, getattr(cfg.params, "tp2_reentry_partial_until_hours", 0.0) or 0.0)
+    )
+    tp2_partial_max_level = int(max(0, getattr(cfg.params, "tp2_reentry_partial_max_level", 0) or 0))
     stop_freeze_count = int(max(0, cfg.params.stop_streak_freeze_count))
     stop_freeze_hours = int(max(0, cfg.params.stop_streak_freeze_hours))
     stop_l2_only = bool(cfg.params.stop_streak_l2_only)
@@ -946,7 +1056,9 @@ def main() -> int:
             non_default_profiles.append(f"{inst}:{profile_by_inst.get(inst, 'DEFAULT')}")
     if non_default_profiles:
         print(f"profiles={','.join(non_default_profiles)}", flush=True)
-    if any(len(profile_ids_by_inst.get(inst, [])) > 1 for inst in inst_ids):
+    if independent_profile_positions:
+        print("profile_mode=independent_positions(slot=inst+profile)", flush=True)
+    elif any(len(profile_ids_by_inst.get(inst, [])) > 1 for inst in inst_ids):
         print(
             f"profile_vote: mode={cfg.strategy_profile_vote_mode} min_agree={cfg.strategy_profile_vote_min_agree}",
             flush=True,
@@ -958,7 +1070,10 @@ def main() -> int:
         flush=True,
     )
     print(
-        f"stop_guard: cooldown={stop_cooldown_minutes}m freeze={stop_freeze_count}/{stop_freeze_hours}h "
+        f"stop_guard: cooldown={stop_cooldown_minutes}m tp2_cooldown={tp2_cooldown_hours:g}h "
+        f"tp2_partial_until={tp2_partial_until_hours:g}h "
+        f"tp2_partial_max_level={tp2_partial_max_level} "
+        f"freeze={stop_freeze_count}/{stop_freeze_hours}h "
         f"l2_only={stop_l2_only}",
         flush=True,
     )
@@ -977,6 +1092,7 @@ def main() -> int:
     )
     print(f"signal_exit_enabled={use_signal_exit}", flush=True)
     print(f"split_tp_parity=managed_fallback_only:{force_managed_tp_fallback}", flush=True)
+    print(f"diag: reopen_on_close_same_bar={reopen_on_close_same_bar}", flush=True)
     print(
         f"compound: risk_per_trade={risk_frac*100:.2f}% start_equity={start_equity:.2f}",
         flush=True,
@@ -998,13 +1114,14 @@ def main() -> int:
     need_htf = int(math.ceil(need_ltf / ratio_htf)) + max_htf_ema_slow + 120
 
     data: Dict[str, Dict[str, Any]] = {}
+    row_keys_in_order: List[str] = []
+    active_inst_ids: List[str] = []
     all_ts = set()
     for idx, inst in enumerate(inst_ids, 1):
         inst_params = params_by_inst.get(inst, cfg.params)
         inst_profile_ids = profile_ids_by_inst.get(inst) or [profile_by_inst.get(inst, "DEFAULT")]
         if profile_by_inst.get(inst, "DEFAULT") not in inst_profile_ids:
             inst_profile_ids = [profile_by_inst.get(inst, "DEFAULT")] + [x for x in inst_profile_ids if x != profile_by_inst.get(inst, "DEFAULT")]
-        inst_exec_max_level = resolve_exec_max_level(inst_params, inst)
         print(f"[{idx}/{len(inst_ids)}] fetch {inst} ...", flush=True)
         try:
             htf = client.get_candles_history(inst, cfg.htf_bar, need_htf)
@@ -1042,85 +1159,112 @@ def main() -> int:
             if pid == profile_by_inst.get(inst, "DEFAULT"):
                 continue
             params_by_profile[pid] = cfg.strategy_profiles.get(pid, cfg.params)
-        try:
-            table_bundle = _build_backtest_signal_decision_tables(
-                cfg=cfg,
-                inst_id=inst,
-                profile_id=profile_by_inst.get(inst, "DEFAULT"),
-                inst_profile_ids=inst_profile_ids,
-                params_by_profile=params_by_profile,
-                pre_by_profile=pre_by_profile,
-                htf_candles=htf,
-                loc_candles=loc,
-                ltf_candles=ltf,
-                htf_ts=htf_ts,
-                loc_ts=loc_ts,
-                ltf_ts=ltf_ts,
-                max_level=max_level,
-                min_level=min_level,
-                exact_level=exact_level,
-                tp1_only=tp1_only,
-                start_idx=start_idx,
-                live_signal_window_limit=cfg.candle_limit if bool(args.live_window_signals) else 0,
+        inst_rows_added = 0
+        for slot in slots_by_inst.get(inst, []):
+            slot_profile_id = str(slot.get("profile_id", profile_by_inst.get(inst, "DEFAULT")) or profile_by_inst.get(inst, "DEFAULT"))
+            slot_profile_ids = list(slot.get("profile_ids", [slot_profile_id]) or [slot_profile_id])
+            slot_params = params_by_profile.get(slot_profile_id, cfg.strategy_profiles.get(slot_profile_id, cfg.params))
+            slot_exec_max_level = resolve_exec_max_level(slot_params, inst)
+            slot_split_tp_enabled = bool(
+                managed_exit
+                and resolve_backtest_split_tp_enabled(
+                    attach_tpsl_on_entry=bool(getattr(cfg, "attach_tpsl_on_entry", False)),
+                    enable_close=bool(getattr(slot_params, "enable_close", False)),
+                    split_tp_on_entry=bool(getattr(slot_params, "split_tp_on_entry", False)),
+                    tp1_close_pct=float(getattr(slot_params, "tp1_close_pct", 0.0) or 0.0),
+                    force_managed_tp_fallback=force_managed_tp_fallback,
+                )
             )
-        except Exception as e:
-            print(f"[{inst}] table build failed: {e}", flush=True)
-            continue
-
-        signal_table = table_bundle["signal_table"]
-        decision_table = table_bundle["decision_table"]
-        table_cache_key = str(table_bundle.get("table_cache_key", "") or "")
-        trace_cache_key = ""
-        trace_cache_path = ""
-        trace_cache_store: Dict[str, Any] = {}
-        if trace_cache_enabled and table_cache_key:
-            trace_cache_key = _interleaved_trace_cache_key(
-                table_cache_key=table_cache_key,
-                params=inst_params,
-                managed_exit=managed_exit,
-                use_signal_exit=use_signal_exit,
-                exit_model=default_exit_model,
-                split_tp_enabled=default_exchange_split_tp_enabled,
-            )
-            trace_cache_path = _interleaved_trace_cache_path(cfg, inst, trace_cache_key)
-            trace_cache_store = _load_interleaved_trace_cache(trace_cache_path, trace_cache_key, inst_id=inst)
-        if invert_signal_mode:
-            inverted_signal_table: List[Optional[Dict[str, Any]]] = [None] * len(signal_table)
-            inverted_decision_table: List[Optional[Any]] = [None] * len(decision_table)
-            for i in range(start_idx, len(signal_table)):
-                sig = signal_table[i]
-                if sig is None:
-                    continue
-                inv_sig = _invert_signal_symmetric(sig)
-                inverted_signal_table[i] = inv_sig
-                inverted_decision_table[i] = resolve_entry_decision(
-                    inv_sig,
-                    max_level=inst_exec_max_level,
+            try:
+                table_bundle = _build_backtest_signal_decision_tables(
+                    cfg=cfg,
+                    inst_id=inst,
+                    profile_id=slot_profile_id,
+                    inst_profile_ids=slot_profile_ids,
+                    params_by_profile=params_by_profile,
+                    pre_by_profile=pre_by_profile,
+                    htf_candles=htf,
+                    loc_candles=loc,
+                    ltf_candles=ltf,
+                    htf_ts=htf_ts,
+                    loc_ts=loc_ts,
+                    ltf_ts=ltf_ts,
+                    max_level=max_level,
                     min_level=min_level,
                     exact_level=exact_level,
-                    tp1_r=inst_params.tp1_r_mult,
-                    tp2_r=inst_params.tp2_r_mult,
                     tp1_only=tp1_only,
+                    start_idx=start_idx,
+                    live_signal_window_limit=cfg.candle_limit if bool(args.live_window_signals) else 0,
                 )
-            signal_table = inverted_signal_table
-            decision_table = inverted_decision_table
+            except Exception as e:
+                print(f"[{inst}:{slot_profile_id}] table build failed: {e}", flush=True)
+                continue
 
-        data[inst] = {
-            "ltf": ltf,
-            "ltf_ts": ltf_ts,
-            "ts_to_i": ts_to_i,
-            "params": inst_params,
-            "signal_table": signal_table,
-            "decision_table": decision_table,
-            "table_cache_key": table_cache_key,
-            "trace_cache_key": trace_cache_key,
-            "trace_cache_path": trace_cache_path,
-            "trace_cache_store": trace_cache_store,
-            "trace_cache_dirty": False,
-            "exchange_split_tp_enabled": default_exchange_split_tp_enabled,
-        }
+            signal_table = table_bundle["signal_table"]
+            decision_table = table_bundle["decision_table"]
+            table_cache_key = str(table_bundle.get("table_cache_key", "") or "")
+            trace_cache_key = ""
+            trace_cache_path = ""
+            trace_cache_store: Dict[str, Any] = {}
+            if trace_cache_enabled and table_cache_key:
+                trace_cache_key = _interleaved_trace_cache_key(
+                    table_cache_key=table_cache_key,
+                    params=slot_params,
+                    managed_exit=managed_exit,
+                    use_signal_exit=use_signal_exit,
+                    exit_model=default_exit_model,
+                    split_tp_enabled=slot_split_tp_enabled,
+                )
+                trace_cache_path = _interleaved_trace_cache_path(cfg, inst, trace_cache_key)
+                trace_cache_store = _load_interleaved_trace_cache(trace_cache_path, trace_cache_key, inst_id=inst)
+            if invert_signal_mode:
+                inverted_signal_table: List[Optional[Dict[str, Any]]] = [None] * len(signal_table)
+                inverted_decision_table: List[Optional[Any]] = [None] * len(decision_table)
+                for i in range(start_idx, len(signal_table)):
+                    sig = signal_table[i]
+                    if sig is None:
+                        continue
+                    inv_sig = _invert_signal_symmetric(sig)
+                    inverted_signal_table[i] = inv_sig
+                    inverted_decision_table[i] = resolve_entry_decision(
+                        inv_sig,
+                        max_level=slot_exec_max_level,
+                        min_level=min_level,
+                        exact_level=exact_level,
+                        tp1_r=slot_params.tp1_r_mult,
+                        tp2_r=slot_params.tp2_r_mult,
+                        tp1_only=tp1_only,
+                    )
+                signal_table = inverted_signal_table
+                decision_table = inverted_decision_table
 
-    inst_ids = [x for x in inst_ids if x in data]
+            row_key = str(slot.get("position_key", inst) or inst)
+            data[row_key] = {
+                "inst": inst,
+                "profile_id": slot_profile_id,
+                "profile_ids": slot_profile_ids,
+                "position_key": row_key,
+                "state_key": str(slot.get("state_key", row_key) or row_key),
+                "display_name": str(slot.get("display_name", row_key) or row_key),
+                "ltf": ltf,
+                "ltf_ts": ltf_ts,
+                "ts_to_i": ts_to_i,
+                "params": slot_params,
+                "signal_table": signal_table,
+                "decision_table": decision_table,
+                "table_cache_key": table_cache_key,
+                "trace_cache_key": trace_cache_key,
+                "trace_cache_path": trace_cache_path,
+                "trace_cache_store": trace_cache_store,
+                "trace_cache_dirty": False,
+                "exchange_split_tp_enabled": slot_split_tp_enabled,
+            }
+            row_keys_in_order.append(row_key)
+            inst_rows_added += 1
+        if inst_rows_added > 0:
+            active_inst_ids.append(inst)
+
+    inst_ids = list(active_inst_ids)
     if not inst_ids:
         print("No instrument has enough history for backtest.")
         return 1
@@ -1131,8 +1275,8 @@ def main() -> int:
     def _flush_trace_caches() -> None:
         if not trace_cache_enabled:
             return
-        for inst in inst_ids:
-            row = data.get(inst)
+        for row_key in row_keys_in_order:
+            row = data.get(row_key)
             if not isinstance(row, dict):
                 continue
             if not bool(row.get("trace_cache_dirty", False)):
@@ -1142,7 +1286,12 @@ def main() -> int:
             trace_cache_store = row.get("trace_cache_store")
             if not trace_cache_key or not trace_cache_path or not isinstance(trace_cache_store, dict):
                 continue
-            _save_interleaved_trace_cache(trace_cache_path, trace_cache_key, inst_id=inst, trajectories=trace_cache_store)
+            _save_interleaved_trace_cache(
+                trace_cache_path,
+                trace_cache_key,
+                inst_id=str(row.get("inst", row_key) or row_key),
+                trajectories=trace_cache_store,
+            )
             row["trace_cache_dirty"] = False
 
     open_positions: Dict[str, Dict[str, Any]] = {}
@@ -1157,8 +1306,9 @@ def main() -> int:
     max_concurrent = 0
 
     global_open_ts: Deque[int] = deque()
-    inst_open_ts: Dict[str, Deque[int]] = {inst: deque() for inst in inst_ids}
-    inst_last_open_ts: Dict[str, int | None] = {inst: None for inst in inst_ids}
+    state_keys = [str(data[row_key].get("state_key", row_key) or row_key) for row_key in row_keys_in_order]
+    inst_open_ts: Dict[str, Deque[int]] = {state_key: deque() for state_key in state_keys}
+    inst_last_open_ts: Dict[str, int | None] = {state_key: None for state_key in state_keys}
 
     # (close_ts, loss_usdt)
     loss_events: Deque[Tuple[int, float]] = deque()
@@ -1189,31 +1339,48 @@ def main() -> int:
             "none": 0.0,
         }
     )
+    by_profile_stats: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(
+        lambda: {
+            "n": 0.0,
+            "win": 0.0,
+            "r_sum": 0.0,
+            "r_raw_sum": 0.0,
+            "friction_r_sum": 0.0,
+            "tp1": 0.0,
+            "tp2": 0.0,
+            "stop": 0.0,
+            "none": 0.0,
+        }
+    )
     skip_gap = 0
     skip_inst_cap = 0
     skip_global_cap = 0
     skip_unresolved = 0
     skip_loss_guard = 0
     skip_stop_guard = 0
+    skip_tp2_cooldown = 0
+    skip_tp2_partial = 0
     skip_l3_side_cap = 0
     stop_guard: Dict[str, Dict[str, Dict[str, int]]] = {
-        inst: {"long": {}, "short": {}} for inst in inst_ids
+        state_key: {"long": {}, "short": {}} for state_key in state_keys
     }
 
-    def _sg_bucket(inst: str, side: str) -> Dict[str, int]:
+    def _sg_bucket(state_key: str, side: str) -> Dict[str, Any]:
         side_k = str(side).strip().lower()
         if side_k not in {"long", "short"}:
             side_k = "long"
-        one = stop_guard.setdefault(inst, {"long": {}, "short": {}})
+        one = stop_guard.setdefault(state_key, {"long": {}, "short": {}})
         b = one.get(side_k)
         if not isinstance(b, dict):
             b = {}
             one[side_k] = b
         return b
 
-    def _sg_record(inst: str, side: str, is_stop: bool, event_ts: int) -> None:
-        b = _sg_bucket(inst, side)
+    def _sg_record(state_key: str, side: str, outcome: str, event_ts: int) -> None:
+        b = _sg_bucket(state_key, side)
         prev = int(b.get("streak", 0) or 0)
+        outcome_k = str(outcome or "").strip().upper()
+        is_stop = outcome_k == "STOP"
         if is_stop:
             streak = prev + 1
             b["streak"] = streak
@@ -1223,15 +1390,37 @@ def main() -> int:
             return
         if prev > 0:
             b["streak"] = 0
+        if outcome_k == "TP2" and (tp2_cooldown_hours > 0 or tp2_partial_until_hours > 0):
+            arm_tp2_reentry_bucket(
+                b,
+                event_ts_ms=int(event_ts),
+                block_hours=tp2_cooldown_hours,
+                partial_until_hours=tp2_partial_until_hours,
+            )
 
-    def _sg_allow(inst: str, side: str, level: int, now_ts: int) -> bool:
-        nonlocal skip_stop_guard
-        b = _sg_bucket(inst, side)
+    def _sg_allow(state_key: str, side: str, level: int, now_ts: int) -> bool:
+        nonlocal skip_stop_guard, skip_tp2_cooldown, skip_tp2_partial
+        b = _sg_bucket(state_key, side)
         last_stop_ts = int(b.get("last_stop_ts_ms", 0) or 0)
         if stop_cooldown_minutes > 0 and last_stop_ts > 0:
             if int(now_ts) - last_stop_ts < stop_cooldown_minutes * 60 * 1000:
                 skip_stop_guard += 1
                 return False
+        tp2_gate = get_tp2_reentry_gate(
+            b,
+            now_ts_ms=int(now_ts),
+            planned_level=int(level),
+            block_hours=tp2_cooldown_hours,
+            partial_until_hours=tp2_partial_until_hours,
+            partial_max_level=tp2_partial_max_level,
+        )
+        tp2_status = str(tp2_gate.get("status") or "")
+        if tp2_status == "block":
+            skip_tp2_cooldown += 1
+            return False
+        if tp2_status == "partial_level_cap":
+            skip_tp2_partial += 1
+            return False
         freeze_until_ts = int(b.get("freeze_until_ts_ms", 0) or 0)
         if freeze_until_ts > int(now_ts):
             if stop_l2_only:
@@ -1272,6 +1461,9 @@ def main() -> int:
         entry_exec_mode_used = str(pos.get("entry_exec_mode", "market") or "market")
         fee_rate_used = max(0.0, float(pos.get("fee_rate", fee_rate) or fee_rate))
         slippage_bps_used = max(0.0, float(pos.get("slippage_bps", slippage_bps) or slippage_bps))
+        profile_id = str(pos.get("profile_id", "") or "")
+        position_key = str(pos.get("position_key", "") or "")
+        state_key = str(pos.get("state_key", position_key or inst) or inst)
 
         r_adj, friction_r = apply_execution_penalty_r(
             r_raw=float(r_raw),
@@ -1291,6 +1483,8 @@ def main() -> int:
         accepted.append(
             {
                 "inst": inst,
+                "profile_id": profile_id,
+                "position_key": position_key,
                 "entry_ts": int(entry_ts),
                 "exit_ts": int(exit_ts),
                 "r": float(r_adj),
@@ -1316,28 +1510,39 @@ def main() -> int:
         st["friction_r_sum"] += float(friction_r)
         total_raw_r += float(r_raw)
         total_friction_r += float(friction_r)
+        pst = by_profile_stats[(inst, profile_id)]
+        pst["n"] += 1.0
+        pst["r_sum"] += float(r_adj)
+        pst["r_raw_sum"] += float(r_raw)
+        pst["friction_r_sum"] += float(friction_r)
         by_side[str(side)] += 1
         by_entry_exec_mode[entry_exec_mode_used] += 1
         update_level_perf(level_perf, int(level), str(outcome_k), float(r_adj))
 
         if outcome_k in {"TP1", "TP2"}:
             st["win"] += 1.0
+            pst["win"] += 1.0
         if outcome_k == "TP2":
             st["tp2"] += 1.0
             st["tp1"] += 1.0
+            pst["tp2"] += 1.0
+            pst["tp1"] += 1.0
             tp2_count += 1
             tp1_count += 1
         elif outcome_k == "TP1":
             st["tp1"] += 1.0
+            pst["tp1"] += 1.0
             tp1_count += 1
         elif outcome_k == "STOP":
             st["stop"] += 1.0
+            pst["stop"] += 1.0
             stop_count += 1
         else:
             st["none"] += 1.0
+            pst["none"] += 1.0
             none_count += 1
 
-        _sg_record(inst, side, bool(is_stop), int(exit_ts))
+        _sg_record(state_key, side, outcome_k, int(exit_ts))
 
         if equity > peak_equity:
             peak_equity = equity
@@ -1348,13 +1553,13 @@ def main() -> int:
             max_dd_peak_ts = peak_ts
             max_dd_trough_ts = int(exit_ts)
 
-    def _can_open(inst: str, side: str, level: int, ts: int, candidate_loss_usdt: float = 0.0) -> bool:
+    def _can_open(state_key: str, side: str, level: int, ts: int, candidate_loss_usdt: float = 0.0) -> bool:
         nonlocal skip_gap, skip_inst_cap, skip_global_cap, skip_loss_guard, skip_l3_side_cap
         prune_ts_deque_window(global_open_ts, ts, window_ms)
-        q_inst = inst_open_ts[inst]
+        q_inst = inst_open_ts[state_key]
         prune_ts_deque_window(q_inst, ts, window_ms)
 
-        last_ts = inst_last_open_ts.get(inst)
+        last_ts = inst_last_open_ts.get(state_key)
         remain_min = min_open_gap_remaining_minutes(ts, last_ts, min_gap_minutes)
         if remain_min > 0:
             skip_gap += 1
@@ -1369,7 +1574,7 @@ def main() -> int:
             if _count_open_l3_side_positions(open_positions, side) >= l3_side_cap:
                 skip_l3_side_cap += 1
                 return False
-        if not _sg_allow(inst, side, level, int(ts)):
+        if not _sg_allow(state_key, side, level, int(ts)):
             return False
 
         if loss_limit_pct > 0:
@@ -1389,6 +1594,9 @@ def main() -> int:
             return False
         side = str(decision.side)
         level = int(decision.level)
+        position_key = str(row.get("position_key", inst) or inst)
+        state_key = str(row.get("state_key", position_key) or position_key)
+        profile_id = str(row.get("profile_id", "") or "")
         risk_amt = max(0.0, float(equity) * risk_frac)
         if risk_amt <= 0:
             return False
@@ -1402,10 +1610,10 @@ def main() -> int:
             swap_stop_r_mult = max(1.0, float(swap_stop_r_mult))
             candidate_loss_usdt = float(risk_amt) * float(swap_stop_r_mult)
 
-        if not _can_open(inst, side, level, ts, candidate_loss_usdt=float(candidate_loss_usdt)):
+        if not _can_open(state_key, side, level, ts, candidate_loss_usdt=float(candidate_loss_usdt)):
             return False
         if miss_prob > 0:
-            miss_key = f"{inst}|{int(ts)}|{side}|{int(level)}|{'rev' if is_reverse else 'std'}"
+            miss_key = f"{position_key}|{int(ts)}|{side}|{int(level)}|{'rev' if is_reverse else 'std'}"
             if stable_u01(miss_key) < miss_prob:
                 skip_miss += 1
                 return False
@@ -1423,7 +1631,7 @@ def main() -> int:
         if intended_exec_mode == "limit":
             no_fill = False
             if miss_prob > 0:
-                no_fill_key = f"{inst}|{int(ts)}|{side}|{int(level)}|limit_nofill|{'rev' if is_reverse else 'std'}"
+                no_fill_key = f"{position_key}|{int(ts)}|{side}|{int(level)}|limit_nofill|{'rev' if is_reverse else 'std'}"
                 no_fill = stable_u01(no_fill_key) < miss_prob
             if no_fill:
                 resolved_limit_fallback_mode = resolve_entry_limit_fallback_mode_for_params(cfg.params, int(level))
@@ -1445,7 +1653,10 @@ def main() -> int:
             risk_amt=float(risk_amt),
             exit_model=exit_model,
             swap_stop_r_mult=float(swap_stop_r_mult),
+            profile_id=profile_id,
+            position_key=position_key,
         )
+        pos["state_key"] = state_key
         pos["entry_exec_mode"] = str(effective_exec_mode)
         pos["entry_exec_mode_intended"] = str(intended_exec_mode)
         pos["fee_rate"] = float(fee_rate_used)
@@ -1465,13 +1676,13 @@ def main() -> int:
         if isinstance(trajectory, list):
             pos["_trajectory_events"] = trajectory
             pos["_trajectory_ptr"] = 0
-        open_positions[inst] = pos
+        open_positions[position_key] = pos
         open_positions_total += 1
 
-        q_inst = inst_open_ts[inst]
+        q_inst = inst_open_ts[state_key]
         q_inst.append(ts)
         global_open_ts.append(ts)
-        inst_last_open_ts[inst] = ts
+        inst_last_open_ts[state_key] = ts
         by_level[int(level)] += 1
         if open_positions_total > max_concurrent:
             max_concurrent = open_positions_total
@@ -1480,8 +1691,10 @@ def main() -> int:
     for step, ts in enumerate(timeline, 1):
         prune_loss_deque_window(loss_events, ts, loss_window_ms)
 
-        for inst in inst_ids:
-            row = data[inst]
+        for row_key in row_keys_in_order:
+            row = data[row_key]
+            inst = str(row.get("inst", row_key) or row_key)
+            position_key = str(row.get("position_key", row_key) or row_key)
             i = row["ts_to_i"].get(ts)
             if i is None:
                 continue
@@ -1491,7 +1704,7 @@ def main() -> int:
             if sig is None:
                 continue
             decision = row["decision_table"][i]
-            existing = open_positions.get(inst)
+            existing = open_positions.get(position_key)
             if existing is not None:
                 if isinstance(existing.get("_trajectory_events"), list):
                     sim = _apply_cached_trade_trajectory_step(
@@ -1511,7 +1724,7 @@ def main() -> int:
                         use_signal_exit=bool(use_signal_exit),
                     )
                 if bool(sim.get("closed", False)):
-                    open_positions.pop(inst, None)
+                    open_positions.pop(position_key, None)
                     open_positions_total = max(0, open_positions_total - 1)
                     _record_close(
                         inst=inst,
@@ -1521,9 +1734,20 @@ def main() -> int:
                         r_raw=float(sim.get("r_raw", 0.0) or 0.0),
                         is_stop=bool(sim.get("is_stop", False)),
                     )
-                    rev = sim.get("reverse_decision")
-                    if rev is not None:
-                        _try_open(inst, row, int(ts), int(i), rev, is_reverse=True)
+                    reopen_decision, reopen_is_reverse = _select_post_close_open_decision(
+                        sim=sim,
+                        decision=decision,
+                        reopen_on_close_same_bar=reopen_on_close_same_bar,
+                    )
+                    if reopen_decision is not None:
+                        _try_open(
+                            inst,
+                            row,
+                            int(ts),
+                            int(i),
+                            reopen_decision,
+                            is_reverse=bool(reopen_is_reverse),
+                        )
                 continue
 
             _try_open(inst, row, int(ts), int(i), decision, is_reverse=False)
@@ -1534,11 +1758,13 @@ def main() -> int:
                 flush=True,
             )
 
-    for inst in list(inst_ids):
-        pos = open_positions.get(inst)
+    for row_key in list(row_keys_in_order):
+        row = data[row_key]
+        inst = str(row.get("inst", row_key) or row_key)
+        position_key = str(row.get("position_key", row_key) or row_key)
+        pos = open_positions.get(position_key)
         if pos is None:
             continue
-        row = data[inst]
         last_i = len(row["ltf"]) - 1
         if last_i < 0:
             continue
@@ -1550,7 +1776,7 @@ def main() -> int:
         if qty_rem > 0:
             r_raw += qty_rem * _close_remaining_r(str(pos.get("side", "")), entry, risk, close_px)
         outcome = "TP1" if bool(pos.get("tp1_done", False)) else "NONE"
-        open_positions.pop(inst, None)
+        open_positions.pop(position_key, None)
         open_positions_total = max(0, open_positions_total - 1)
         _record_close(
             inst=inst,
@@ -1569,7 +1795,7 @@ def main() -> int:
         print(f"telegram_sent={sent}", flush=True)
         return 0
 
-    accepted.sort(key=lambda x: (x["exit_ts"], x["entry_ts"]))
+    accepted.sort(key=lambda x: (x["exit_ts"], x["entry_ts"], x.get("profile_id", ""), x.get("position_key", "")))
     dump_trades_csv(args.dump_trades_csv, accepted)
     signals = len(accepted)
     wins = sum(1 for t in accepted if t["outcome"] in {"TP1", "TP2"})
@@ -1655,6 +1881,8 @@ def main() -> int:
     summary.append(f"完成时间：{dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
     summary.append(f"区间：{ts_fmt(start_ts)} -> {ts_fmt(end_ts)}（{period_days:.1f}天）")
     summary.append(f"标的：{','.join(inst_ids)}")
+    if independent_profile_positions:
+        summary.append("仓位模式：independent_profiles（slot=inst+profile，共享权益池，允许同向叠加/多空对冲）")
     summary.append(
         f"层级控制：base_exec_max={max_level} "
         f"l3_whitelist={','.join(sorted(l3_inst_set)) if l3_inst_set else '-'}"
@@ -1663,6 +1891,9 @@ def main() -> int:
         f"约束：min_gap={min_gap_minutes}m inst_cap={per_inst_cap}/24h global_cap={global_cap}/24h "
         f"loss_guard={loss_limit_pct*100:.2f}%({loss_base_mode},projected) "
         f"l3_side_cap={(l3_side_cap if l3_side_cap > 0 else '-')} "
+        f"tp2_cd={tp2_cooldown_hours:g}h "
+        f"tp2_partial_until={tp2_partial_until_hours:g}h "
+        f"tp2_partial_max_level={tp2_partial_max_level} "
         f"tp1_only={tp1_only} managed_exit={managed_exit} inversion={inversion_mode_label}"
     )
     summary.append(
@@ -1689,7 +1920,9 @@ def main() -> int:
         f"levels：L1={by_level.get(1,0)} L2={by_level.get(2,0)} L3={by_level.get(3,0)} "
         f"skip_gap={skip_gap} skip_inst_cap={skip_inst_cap} skip_global_cap={skip_global_cap} "
         f"skip_loss_guard={skip_loss_guard} skip_stop_guard={skip_stop_guard} "
-        f"skip_l3_side_cap={skip_l3_side_cap} skip_miss={skip_miss} skip_unresolved={skip_unresolved}"
+        f"skip_tp2_cooldown={skip_tp2_cooldown} skip_tp2_partial={skip_tp2_partial} "
+        f"skip_l3_side_cap={skip_l3_side_cap} "
+        f"skip_miss={skip_miss} skip_unresolved={skip_unresolved}"
     )
     summary.append(
         f"entry_modes：market={by_entry_exec_mode.get('market',0)} "
@@ -1705,6 +1938,14 @@ def main() -> int:
         win = int(st["win"])
         avg_inst_r = st["r_sum"] / st["n"]
         summary.append(f"- {inst}: {n}单 胜率={win/n*100:.1f}% avgR={avg_inst_r:.3f}")
+    if independent_profile_positions:
+        for (inst, profile_id), st in sorted(by_profile_stats.items()):
+            if not st or st["n"] <= 0:
+                continue
+            n = int(st["n"])
+            win = int(st["win"])
+            avg_profile_r = st["r_sum"] / st["n"]
+            summary.append(f"- {inst}@{profile_id}: {n}单 胜率={win/n*100:.1f}% avgR={avg_profile_r:.3f}")
 
     text = "\n".join(summary)
     print("\n=== RESULT ===", flush=True)

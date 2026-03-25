@@ -17,8 +17,24 @@ _VARIANT_BTCETH_CANDLE_MACD_V1 = "btceth_candle_macd_v1"
 _VARIANT_ELDER_TSS_V1 = "elder_tss_v1"
 _VARIANT_R_BREAKER_V1 = "r_breaker_v1"
 _VARIANT_RANGE_REVERSION_V1 = "range_reversion_v1"
+_VARIANT_RANGE_REVERSION_V2 = "range_reversion_v2"
+_VARIANT_RANGE_REVERSION_V3 = "range_reversion_v3"
 _VARIANT_RIGHT_REVERSAL_V1 = "right_reversal_v1"
 _VARIANT_XAU_SIBI_V1 = "xau_sibi_v1"
+_VARIANT_EMA_PULLBACK_4H_V1 = "ema_pullback_4h_v1"
+_VARIANT_MTF_EMA_TREND_V1 = "mtf_ema_trend_v1"
+_VARIANT_MTF_EMA_TREND_V2 = "mtf_ema_trend_v2"
+_VARIANT_MTF_EMA_TREND_V3 = "mtf_ema_trend_v3"
+_VARIANT_MTF_EMA_TREND_V4 = "mtf_ema_trend_v4"
+_VARIANT_DAILY_SR_ZONES_V1 = "daily_sr_zones_v1"
+_VARIANT_DAILY_SR_ZONES_V2 = "daily_sr_zones_v2"
+_VARIANT_MTF_RESONANCE_V2 = "mtf_resonance_v2"
+_VARIANT_MTF_RESONANCE_V3 = "mtf_resonance_v3"
+_VARIANT_MTF_RESONANCE_V4 = "mtf_resonance_v4"
+_VARIANT_DAILY_EMA_5813_V1 = "daily_ema_5813_v1"
+_VARIANT_TURTLE_DONCHIAN_V1 = "turtle_donchian_v1"
+_VARIANT_RSI2_REVERSION_V1 = "rsi2_reversion_v1"
+_VARIANT_BOLLINGER_TREND_REVERSION_V1 = "bollinger_trend_reversion_v1"
 
 
 def normalize_strategy_variant(raw: str) -> str:
@@ -46,10 +62,49 @@ def normalize_strategy_variant(raw: str) -> str:
         return _VARIANT_R_BREAKER_V1
     if key in {"range_reversion_v1", "range_reversion", "range_revert", "rr"}:
         return _VARIANT_RANGE_REVERSION_V1
+    if key in {"range_reversion_v2", "range_reversion_active", "range_revert_v2", "rr2"}:
+        return _VARIANT_RANGE_REVERSION_V2
+    if key in {"range_reversion_v3", "range_reversion_asym", "range_revert_v3", "rr3"}:
+        return _VARIANT_RANGE_REVERSION_V3
     if key in {"right_reversal_v1", "right_reversal", "rightside_reversal", "rrv1"}:
         return _VARIANT_RIGHT_REVERSAL_V1
     if key in {"xau_sibi_v1", "xau_sibi", "sibi", "fvg_pullback_v1", "xau_fvg"}:
         return _VARIANT_XAU_SIBI_V1
+    if key in {"ema_pullback_4h_v1", "ema_pullback_4h", "4h_ema_pullback", "ema_pb_4h", "ema4h"}:
+        return _VARIANT_EMA_PULLBACK_4H_V1
+    if key in {"mtf_ema_trend_v1", "mtf_ema_trend", "ema_trend_mtf", "ema_mtf"}:
+        return _VARIANT_MTF_EMA_TREND_V1
+    if key in {"mtf_ema_trend_v2", "mtf_ema_trend2", "ema_trend_mtf_v2", "ema_mtf_v2"}:
+        return _VARIANT_MTF_EMA_TREND_V2
+    if key in {"mtf_ema_trend_v3", "mtf_ema_trend3", "ema_trend_mtf_v3", "ema_mtf_v3", "trend_active_v1"}:
+        return _VARIANT_MTF_EMA_TREND_V3
+    if key in {"mtf_ema_trend_v4", "mtf_ema_trend4", "ema_trend_mtf_v4", "ema_mtf_v4", "trend_active_v2"}:
+        return _VARIANT_MTF_EMA_TREND_V4
+    if key in {"daily_sr_zones_v1", "daily_sr_zones", "sr_zones_daily", "sr_daily", "sr_zone_v1"}:
+        return _VARIANT_DAILY_SR_ZONES_V1
+    if key in {"daily_sr_zones_v2", "daily_sr_zones_relaxed", "sr_zones_relaxed", "sr_zone_v2"}:
+        return _VARIANT_DAILY_SR_ZONES_V2
+    if key in {"mtf_resonance_v2", "mtf_v2", "btc_mtf_v2", "resonance_v2"}:
+        return _VARIANT_MTF_RESONANCE_V2
+    if key in {"mtf_resonance_v3", "mtf_v3", "btc_mtf_v3", "resonance_v3"}:
+        return _VARIANT_MTF_RESONANCE_V3
+    if key in {"mtf_resonance_v4", "mtf_v4", "btc_mtf_v4", "resonance_v4"}:
+        return _VARIANT_MTF_RESONANCE_V4
+    if key in {"daily_ema_5813_v1", "daily_ema_5813", "ema_5813", "ema5813", "ema_5_8_13"}:
+        return _VARIANT_DAILY_EMA_5813_V1
+    if key in {"turtle_donchian_v1", "turtle_donchian", "turtle", "donchian", "turtle_v1"}:
+        return _VARIANT_TURTLE_DONCHIAN_V1
+    if key in {"rsi2_reversion_v1", "rsi2_reversion", "connors_rsi2", "rsi2", "rsi2_mr"}:
+        return _VARIANT_RSI2_REVERSION_V1
+    if key in {
+        "bollinger_trend_reversion_v1",
+        "bollinger_trend_reversion",
+        "bollinger_reversion",
+        "bollinger_mr",
+        "bb_reversion",
+        "bb_mr",
+    }:
+        return _VARIANT_BOLLINGER_TREND_REVERSION_V1
     if key in {"btceth_smc_a2", "btc_eth_smc_a2", "smc_a2"}:
         return _VARIANT_BTCETH_SMC_A2
     if key in {"btceth_smc_a1", "btc_eth_smc_a1", "smc_a1", "smc_plus", "smc_a_plus"}:

@@ -8,7 +8,16 @@ from typing import Optional
 
 from .alerts import run_test_alert, send_telegram
 from .backtest import build_backtest_telegram_summary, run_backtest, run_backtest_compare
-from .common import load_dotenv, log, parse_backtest_levels, parse_bool, parse_inst_ids, round_size, set_log_level
+from .common import (
+    apply_backtest_env_overrides,
+    load_dotenv,
+    log,
+    parse_backtest_levels,
+    parse_bool,
+    parse_inst_ids,
+    round_size,
+    set_log_level,
+)
 from .client_factory import create_client
 from .config import read_config
 from .instance_lock import SingleInstanceLock
@@ -93,6 +102,10 @@ def main() -> int:
     args = parser.parse_args()
 
     load_dotenv(args.env)
+    if args.backtest:
+        override_notes = apply_backtest_env_overrides()
+        if override_notes:
+            log(f"Backtest env overrides: {'; '.join(override_notes)}")
     cfg = read_config(args.state_file)
     set_log_level(cfg.log_level)
 
@@ -281,6 +294,9 @@ def main() -> int:
             f"be_fee_buf={cfg.params.be_fee_buffer_pct} "
             f"auto_tighten_stop={cfg.params.auto_tighten_stop} "
             f"stop_cooldown={cfg.params.stop_reentry_cooldown_minutes}m "
+            f"tp2_cooldown={cfg.params.tp2_reentry_cooldown_hours:g}h "
+            f"tp2_partial_until={cfg.params.tp2_reentry_partial_until_hours:g}h "
+            f"tp2_partial_max_level={cfg.params.tp2_reentry_partial_max_level} "
             f"stop_freeze={cfg.params.stop_streak_freeze_count}/{cfg.params.stop_streak_freeze_hours}h "
             f"stop_l2_only={cfg.params.stop_streak_l2_only} "
             f"exec_max_level={cfg.params.exec_max_level} "

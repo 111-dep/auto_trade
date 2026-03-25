@@ -316,6 +316,60 @@ class LiveParityStepTests(unittest.TestCase):
         self.assertEqual(stop_out["outcome"], "TP1")
         self.assertTrue(stop_out["is_stop"])
 
+    def test_tp1_partial_then_short_tp2_on_intrabar_low(self) -> None:
+        params = _params()
+        short_decision = EntryDecision(
+            side="SHORT",
+            level=2,
+            entry=100.0,
+            stop=105.0,
+            risk=5.0,
+            tp1=92.5,
+            tp2=87.5,
+        )
+        pos = _new_sim_position(decision=short_decision, entry_ts=1, entry_i=1, risk_amt=10.0)
+
+        hit_tp1 = _simulate_live_position_step(
+            pos=pos,
+            sig={
+                "close": 92.0,
+                "high": 100.0,
+                "low": 91.8,
+                "atr": 1.0,
+                "long_stop": 97.0,
+                "short_stop": 105.0,
+                "long_exit": False,
+                "short_exit": False,
+            },
+            params=params,
+            decision=None,
+            allow_reverse=False,
+            managed_exit=True,
+        )
+        self.assertFalse(hit_tp1["closed"])
+        self.assertTrue(pos["tp1_done"])
+
+        hit_tp2 = _simulate_live_position_step(
+            pos=pos,
+            sig={
+                "close": 88.0,
+                "high": 90.0,
+                "low": 87.4,
+                "atr": 1.0,
+                "long_stop": 97.0,
+                "short_stop": 104.5,
+                "long_exit": False,
+                "short_exit": False,
+            },
+            params=params,
+            decision=None,
+            allow_reverse=False,
+            managed_exit=True,
+        )
+        self.assertTrue(hit_tp2["closed"])
+        self.assertEqual(hit_tp2["outcome"], "TP2")
+        self.assertFalse(hit_tp2["is_stop"])
+
     def test_split_tp_same_bar_stop_first_is_conservative(self) -> None:
         params = _params()
         long_decision = EntryDecision(

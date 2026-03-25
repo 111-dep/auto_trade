@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from okx_trader.backtest import (
+    _build_backtest_live_table_cache_key,
     _build_backtest_alignment_counts,
     _build_backtest_precalc,
     _build_backtest_signal_decision_tables,
@@ -16,6 +17,7 @@ from okx_trader.backtest import (
 from okx_trader.config import read_config
 from okx_trader.models import Candle
 from okx_trader.signals import build_signals
+from copy import deepcopy
 
 
 class BacktestTableTests(unittest.TestCase):
@@ -31,19 +33,33 @@ class BacktestTableTests(unittest.TestCase):
             k, v = s.split("=", 1)
             os.environ[k.strip()] = v.strip()
 
-    def test_alignment_counts_match_bisect_right(self) -> None:
+    def test_alignment_counts_match_close_aligned_bar_completion(self) -> None:
         htf_ts = [1000, 4000, 7000]
         loc_ts = [500, 2500, 4500, 6500]
         ltf_ts = [0, 500, 1500, 2500, 3500, 4500, 5500, 7500]
+        htf_bar_ms = 4000
+        loc_bar_ms = 2000
+        ltf_bar_ms = 1000
 
-        got_htf, got_loc = _build_backtest_alignment_counts(htf_ts, loc_ts, ltf_ts, start_idx=2)
+        got_htf, got_loc = _build_backtest_alignment_counts(
+            htf_ts,
+            loc_ts,
+            ltf_ts,
+            htf_bar_ms=htf_bar_ms,
+            loc_bar_ms=loc_bar_ms,
+            ltf_bar_ms=ltf_bar_ms,
+            start_idx=2,
+        )
         want_htf = [0] * len(ltf_ts)
         want_loc = [0] * len(ltf_ts)
+        htf_close_ts = [ts + htf_bar_ms for ts in htf_ts]
+        loc_close_ts = [ts + loc_bar_ms for ts in loc_ts]
         for i, ts in enumerate(ltf_ts):
             if i < 2:
                 continue
-            want_htf[i] = bisect.bisect_right(htf_ts, ts)
-            want_loc[i] = bisect.bisect_right(loc_ts, ts)
+            signal_close_ts = ts + ltf_bar_ms
+            want_htf[i] = bisect.bisect_right(htf_close_ts, signal_close_ts)
+            want_loc[i] = bisect.bisect_right(loc_close_ts, signal_close_ts)
 
         self.assertEqual(got_htf, want_htf)
         self.assertEqual(got_loc, want_loc)
@@ -100,8 +116,9 @@ class BacktestTableTests(unittest.TestCase):
         got = tables["signal_table"][target_i]
         self.assertIsNotNone(got)
 
-        hi = bisect.bisect_right(htf_ts, ltf_ts[target_i])
-        li = bisect.bisect_right(loc_ts, ltf_ts[target_i])
+        signal_close_ts = ltf_ts[target_i] + 15 * 60 * 1000
+        hi = bisect.bisect_right([ts + 4 * 3600 * 1000 for ts in htf_ts], signal_close_ts)
+        li = bisect.bisect_right([ts + 3600 * 1000 for ts in loc_ts], signal_close_ts)
         want = build_signals(
             htf[max(0, hi - cfg.candle_limit) : hi],
             loc[max(0, li - cfg.candle_limit) : li],
@@ -122,6 +139,27 @@ class BacktestTableTests(unittest.TestCase):
             "short_exit",
         ]:
             self.assertEqual(got.get(key), want.get(key), msg=key)
+
+        self.assertEqual(got.get("high"), ltf[target_i].high)
+        self.assertEqual(got.get("low"), ltf[target_i].low)
+
+    def test_alignment_excludes_in_progress_higher_timeframes(self) -> None:
+        htf_ts = [0, 4_000]
+        loc_ts = [0, 1_000, 2_000, 3_000, 4_000]
+        ltf_ts = [4_000]
+
+        got_htf, got_loc = _build_backtest_alignment_counts(
+            htf_ts,
+            loc_ts,
+            ltf_ts,
+            htf_bar_ms=4_000,
+            loc_bar_ms=1_000,
+            ltf_bar_ms=1_000,
+            start_idx=0,
+        )
+
+        self.assertEqual(got_htf, [1])
+        self.assertEqual(got_loc, [5])
 
     def test_live_window_signal_tables_use_disk_cache_on_repeat(self) -> None:
         self._load_env_file()
@@ -206,6 +244,67 @@ class BacktestTableTests(unittest.TestCase):
             target_i = start_idx + 10
             self.assertEqual(first['signal_table'][target_i], second['signal_table'][target_i])
             self.assertEqual(first['decision_table'][target_i], second['decision_table'][target_i])
+
+    def test_live_window_cache_key_ignores_tp2_reentry_schedule_params(self) -> None:
+        self._load_env_file()
+        cfg = read_config(None)
+        params = deepcopy(cfg.params)
+        params_alt = deepcopy(cfg.params)
+        params_alt.tp2_reentry_cooldown_hours = 1.0
+        params_alt.tp2_reentry_partial_until_hours = 4.0
+        params_alt.tp2_reentry_partial_max_level = 2
+
+        base_ts = 1_700_000_000_000
+
+        def _mk(ts_ms: int, value: float) -> Candle:
+            close = float(value + math.sin(ts_ms / 86_400_000.0) * 0.25)
+            return Candle(
+                ts_ms=int(ts_ms),
+                open=float(close - 0.1),
+                high=float(close + 0.2),
+                low=float(close - 0.2),
+                close=close,
+                confirm=True,
+                volume=float(500.0 + (ts_ms % 11) * 5.0),
+            )
+
+        htf = [_mk(base_ts + i * 4 * 3600 * 1000, 100.0 + i * 0.05) for i in range(520)]
+        loc = [_mk(base_ts + i * 3600 * 1000, 100.0 + i * 0.02) for i in range(2200)]
+        ltf = [_mk(base_ts + i * 15 * 60 * 1000, 100.0 + i * 0.01) for i in range(5000)]
+
+        key_one = _build_backtest_live_table_cache_key(
+            cfg=cfg,
+            inst_id="BTC-USDT-SWAP",
+            profile_id="DEFAULT",
+            ordered_profile_ids=["DEFAULT"],
+            profile_params={"DEFAULT": params},
+            htf_candles=htf,
+            loc_candles=loc,
+            ltf_candles=ltf,
+            max_level=3,
+            min_level=1,
+            exact_level=0,
+            tp1_only=False,
+            start_idx=4200,
+            live_signal_window_limit=cfg.candle_limit,
+        )
+        key_two = _build_backtest_live_table_cache_key(
+            cfg=cfg,
+            inst_id="BTC-USDT-SWAP",
+            profile_id="DEFAULT",
+            ordered_profile_ids=["DEFAULT"],
+            profile_params={"DEFAULT": params_alt},
+            htf_candles=htf,
+            loc_candles=loc,
+            ltf_candles=ltf,
+            max_level=3,
+            min_level=1,
+            exact_level=0,
+            tp1_only=False,
+            start_idx=4200,
+            live_signal_window_limit=cfg.candle_limit,
+        )
+        self.assertEqual(key_one, key_two)
 
 
 

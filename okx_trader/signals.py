@@ -46,6 +46,57 @@ def _prev_utc_day_hlc_and_today_range(
     return prev_hi, prev_lo, prev_close, today_hi, today_lo
 
 
+def _latest_completed_hour_context(
+    candles: List[Candle],
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+    if not candles:
+        return None, None, None, None, None, None
+
+    groups: Dict[int, List[Candle]] = {}
+    ordered: List[int] = []
+    for candle in candles:
+        hour_key = int(candle.ts_ms // 3_600_000)
+        if hour_key not in groups:
+            groups[hour_key] = []
+            ordered.append(hour_key)
+        groups[hour_key].append(candle)
+
+    hourly: List[Candle] = []
+    for hour_key in ordered:
+        parts = groups.get(hour_key) or []
+        if len(parts) != 4:
+            continue
+        hourly.append(
+            Candle(
+                ts_ms=int(parts[0].ts_ms),
+                open=float(parts[0].open),
+                high=max(float(x.high) for x in parts),
+                low=min(float(x.low) for x in parts),
+                close=float(parts[-1].close),
+                confirm=True,
+                volume=sum(max(0.0, float(x.volume)) for x in parts),
+            )
+        )
+
+    if not hourly:
+        return None, None, None, None, None, None
+
+    idx = len(hourly) - 1
+    closes = [float(c.close) for c in hourly]
+    hour_rsi = rsi(closes, 14)
+    current = hourly[idx]
+    prev_close = float(hourly[idx - 1].close) if idx >= 1 else None
+    rsi_value = float(hour_rsi[idx]) if idx < len(hour_rsi) and hour_rsi[idx] is not None else None
+    return (
+        float(current.open),
+        float(current.high),
+        float(current.low),
+        float(current.close),
+        prev_close,
+        rsi_value,
+    )
+
+
 def build_signals(
     htf_candles: List[Candle], loc_candles: List[Candle], ltf_candles: List[Candle], p: StrategyParams
 ) -> Dict[str, Any]:
@@ -80,6 +131,8 @@ def build_signals(
     h_rsi = htf_rsi_line[hidx]
     if None in {h_ema_fast, h_ema_slow, h_rsi}:
         raise RuntimeError("HTF indicators are not ready yet")
+    prev_h_ema_fast = htf_ema_fast[hidx - 1] if hidx >= 1 else None
+    prev_h_ema_slow = htf_ema_slow[hidx - 1] if hidx >= 1 else None
 
     bias = "neutral"
     if h_close > h_ema_fast > h_ema_slow and h_rsi >= p.htf_rsi_long_min:
@@ -89,7 +142,12 @@ def build_signals(
 
     loc_highs = [c.high for c in loc_candles]
     loc_lows = [c.low for c in loc_candles]
+    loc_closes = [c.close for c in loc_candles]
     lcid = len(loc_candles) - 1
+    loc_ema_fast_line = ema(loc_closes, 20)
+    loc_ema_slow_line = ema(loc_closes, 50)
+    loc_rsi_line = rsi(loc_closes, 14)
+    loc_atr_line = atr(loc_highs, loc_lows, loc_closes, 14)
 
     loc_start = max(0, len(loc_candles) - p.loc_lookback)
     loc_high = max(loc_highs[loc_start:])
@@ -126,6 +184,15 @@ def build_signals(
 
     long_location_ok = fib_touch_long or retest_long
     short_location_ok = fib_touch_short or retest_short
+    loc_close = loc_closes[lcid]
+    loc_ema_fast = loc_ema_fast_line[lcid]
+    loc_ema_slow = loc_ema_slow_line[lcid]
+    loc_rsi_value = loc_rsi_line[lcid]
+    loc_atr_value = loc_atr_line[lcid]
+    if None in {loc_ema_fast, loc_ema_slow, loc_rsi_value, loc_atr_value}:
+        raise RuntimeError("LOC indicators are not ready yet")
+    prev_loc_ema_fast = loc_ema_fast_line[lcid - 1] if lcid >= 1 else None
+    prev_loc_ema_slow = loc_ema_slow_line[lcid - 1] if lcid >= 1 else None
 
     closes = [c.close for c in ltf_candles]
     opens = [c.open for c in ltf_candles]
@@ -146,6 +213,8 @@ def build_signals(
             vol_sum -= float(vol_q.popleft())
 
     ema_line = ema(closes, p.ltf_ema_len)
+    ema_20_line = ema(closes, 20)
+    ema_50_line = ema(closes, 50)
     rsi_line = rsi(closes, p.rsi_len)
     _, _, macd_hist = macd(closes, p.macd_fast, p.macd_slow, p.macd_signal)
     atr_line = atr(highs, lows, closes, p.atr_len)
@@ -158,6 +227,8 @@ def build_signals(
     idx = len(ltf_candles) - 1
     close = closes[idx]
     em = ema_line[idx]
+    em20 = ema_20_line[idx]
+    em50 = ema_50_line[idx]
     r = rsi_line[idx]
     mh = macd_hist[idx]
     a = atr_line[idx]
@@ -168,7 +239,7 @@ def build_signals(
     exl = exit_low[idx]
     exh = exit_high[idx]
 
-    if None in {em, r, mh, a, upper, lower, hhv, llv, exl, exh, bb_mid[idx]}:
+    if None in {em, em20, em50, r, mh, a, upper, lower, hhv, llv, exl, exh, bb_mid[idx]}:
         raise RuntimeError("LTF indicators are not ready yet")
 
     width = (upper - lower) / bb_mid[idx] if bb_mid[idx] else 0.0
@@ -185,6 +256,9 @@ def build_signals(
     recent_highs = highs[pb_start : idx + 1]
     recent_pullback_low = min(recent_lows) if recent_lows else close
     recent_pullback_high = max(recent_highs) if recent_highs else close
+    recent_rsi_vals = [float(v) for v in rsi_line[pb_start : idx + 1] if v is not None]
+    recent_rsi_min = min(recent_rsi_vals) if recent_rsi_vals else None
+    recent_rsi_max = max(recent_rsi_vals) if recent_rsi_vals else None
     pullback_long = recent_pullback_low <= em * (1.0 + p.pullback_tolerance)
     pullback_short = recent_pullback_high >= em * (1.0 - p.pullback_tolerance)
     not_chasing_long = close <= em * (1.0 + p.max_chase_from_ema)
@@ -192,8 +266,13 @@ def build_signals(
 
     prev_hhv = hh[idx - 1] if idx > 0 else None
     prev_llv = ll[idx - 1] if idx > 0 else None
+    prev_exl = exit_low[idx - 1] if idx > 0 else None
+    prev_exh = exit_high[idx - 1] if idx > 0 else None
     prev_day_high, prev_day_low, prev_day_close, day_high_so_far, day_low_so_far = _prev_utc_day_hlc_and_today_range(
         ltf_candles, idx
+    )
+    hour_open, hour_high, hour_low, hour_close, hour_prev_close, hour_rsi_value = _latest_completed_hour_context(
+        ltf_candles
     )
     variant_inputs = VariantSignalInputs(
         p=p,
@@ -222,6 +301,8 @@ def build_signals(
         not_chasing_short=bool(not_chasing_short),
         prev_hhv=float(prev_hhv) if prev_hhv is not None else None,
         prev_llv=float(prev_llv) if prev_llv is not None else None,
+        prev_exl=float(prev_exl) if prev_exl is not None else None,
+        prev_exh=float(prev_exh) if prev_exh is not None else None,
         current_high=float(highs[idx]) if idx >= 0 else None,
         current_low=float(lows[idx]) if idx >= 0 else None,
         prev_high=float(highs[idx - 1]) if idx >= 1 else None,
@@ -244,6 +325,28 @@ def build_signals(
         prev_day_close=float(prev_day_close) if prev_day_close is not None else None,
         day_high_so_far=float(day_high_so_far) if day_high_so_far is not None else None,
         day_low_so_far=float(day_low_so_far) if day_low_so_far is not None else None,
+        prev_h_ema_fast=float(prev_h_ema_fast) if prev_h_ema_fast is not None else None,
+        prev_h_ema_slow=float(prev_h_ema_slow) if prev_h_ema_slow is not None else None,
+        recent_rsi_min=float(recent_rsi_min) if recent_rsi_min is not None else None,
+        recent_rsi_max=float(recent_rsi_max) if recent_rsi_max is not None else None,
+        prev_ema_value=float(ema_20_line[idx - 1]) if idx >= 1 and ema_20_line[idx - 1] is not None else None,
+        ema_slow_value=float(em50) if em50 is not None else None,
+        prev_ema_slow_value=float(ema_50_line[idx - 1]) if idx >= 1 and ema_50_line[idx - 1] is not None else None,
+        loc_close=float(loc_close),
+        loc_ema_fast=float(loc_ema_fast),
+        loc_ema_slow=float(loc_ema_slow),
+        prev_loc_ema_fast=float(prev_loc_ema_fast) if prev_loc_ema_fast is not None else None,
+        prev_loc_ema_slow=float(prev_loc_ema_slow) if prev_loc_ema_slow is not None else None,
+        loc_rsi_value=float(loc_rsi_value),
+        loc_atr_value=float(loc_atr_value),
+        loc_current_high=float(loc_candles[lcid].high) if lcid >= 0 else None,
+        loc_current_low=float(loc_candles[lcid].low) if lcid >= 0 else None,
+        hour_open=float(hour_open) if hour_open is not None else None,
+        hour_high=float(hour_high) if hour_high is not None else None,
+        hour_low=float(hour_low) if hour_low is not None else None,
+        hour_close=float(hour_close) if hour_close is not None else None,
+        hour_prev_close=float(hour_prev_close) if hour_prev_close is not None else None,
+        hour_rsi_value=float(hour_rsi_value) if hour_rsi_value is not None else None,
     )
     variant_state = resolve_variant_signal_state_from_inputs(variant_inputs)
 
@@ -256,8 +359,10 @@ def build_signals(
     long_level = int(variant_state["long_level"])
     short_level = int(variant_state["short_level"])
 
-    long_exit = close < em or close < exl or mh < 0 or bias == "short"
-    short_exit = close > em or close > exh or mh > 0 or bias == "long"
+    long_exit_default = close < em or close < exl or mh < 0 or bias == "short"
+    short_exit_default = close > em or close > exh or mh > 0 or bias == "long"
+    long_exit = bool(variant_state["long_exit"]) if "long_exit" in variant_state else bool(long_exit_default)
+    short_exit = bool(variant_state["short_exit"]) if "short_exit" in variant_state else bool(short_exit_default)
 
     long_stop = float(variant_state["long_stop"])
     short_stop = float(variant_state["short_stop"])
