@@ -11,6 +11,7 @@ import os
 import pickle
 import time
 import traceback
+from bisect import bisect_left, bisect_right
 from collections import defaultdict, deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
@@ -29,7 +30,13 @@ from okx_trader.backtest_report import (
     update_level_perf,
 )
 from okx_trader.client_factory import create_client
-from okx_trader.common import apply_backtest_env_overrides, bar_to_seconds, load_dotenv, parse_bool
+from okx_trader.common import (
+    apply_backtest_env_overrides,
+    bar_to_seconds,
+    load_dotenv,
+    parse_bool,
+    resolve_backtest_live_window_signals,
+)
 from okx_trader.config import (
     get_strategy_params,
     get_strategy_profile_id,
@@ -44,6 +51,7 @@ from okx_trader.entry_exec_policy import (
     resolve_entry_exec_mode,
     resolve_entry_limit_fallback_mode_for_params,
 )
+from okx_trader.pa_oral_baseline import is_pa_oral_baseline_variant
 from okx_trader.risk_guard import (
     is_open_limit_reached,
     min_open_gap_remaining_minutes,
@@ -166,12 +174,27 @@ def _save_interleaved_trace_cache(path: str, trace_cache_key: str, *, inst_id: s
         print(f"[{inst_id}] trace cache save failed: {e}", flush=True)
 
 
-def _trajectory_candidate_key(*, entry_i: int, decision: Any, exit_model: str, split_tp_enabled: bool) -> str:
+def _trajectory_candidate_key(
+    *,
+    entry_i: int,
+    decision: Any,
+    exit_model: str,
+    split_tp_enabled: bool,
+    entry_sig: Optional[Dict[str, Any]] = None,
+) -> str:
+    sig_local = entry_sig if isinstance(entry_sig, dict) else {}
     raw = (
         f"{int(entry_i)}|{str(getattr(decision, 'side', '')).upper()}|{int(getattr(decision, 'level', 0) or 0)}|"
         f"{repr(float(getattr(decision, 'entry', 0.0) or 0.0))}|{repr(float(getattr(decision, 'stop', 0.0) or 0.0))}|"
         f"{repr(float(getattr(decision, 'tp1', 0.0) or 0.0))}|{repr(float(getattr(decision, 'tp2', 0.0) or 0.0))}|"
-        f"{str(exit_model or 'standard')}|{1 if bool(split_tp_enabled) else 0}"
+        f"{str(exit_model or 'standard')}|{1 if bool(split_tp_enabled) else 0}|"
+        f"{1 if bool(getattr(decision, 'include_start_bar', False)) else 0}|"
+        f"{repr(float(sig_local.get('tp1_close_pct_override', 0.0) or 0.0))}|"
+        f"{1 if bool(sig_local.get('tp2_close_rest_override', False)) else 0}|"
+        f"{repr(float(sig_local.get('be_trigger_r_mult_override', 0.0) or 0.0))}|"
+        f"{1 if bool(sig_local.get('auto_tighten_stop_override', False)) else 0}|"
+        f"{1 if bool(sig_local.get('trail_after_tp1_override', False)) else 0}|"
+        f"{1 if bool(sig_local.get('signal_exit_enabled_override', False)) else 0}"
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -198,6 +221,7 @@ def _build_interleaved_trade_trajectory(
     use_signal_exit: bool,
     exit_model: str,
     split_tp_enabled: bool,
+    entry_sig: Optional[Dict[str, Any]] = None,
     swap_stop_r_mult: float = 0.0,
 ) -> List[Dict[str, Any]]:
     pos = _new_sim_position(
@@ -208,9 +232,11 @@ def _build_interleaved_trade_trajectory(
         exit_model=exit_model,
         swap_stop_r_mult=float(swap_stop_r_mult),
     )
+    _apply_entry_signal_overrides_to_pos(pos=pos, sig=entry_sig, params=params, use_signal_exit=use_signal_exit)
     pos["exchange_split_tp_enabled"] = bool(split_tp_enabled)
     out: List[Dict[str, Any]] = []
-    for i in range(int(entry_i) + 1, max(int(entry_i) + 1, len(signal_table) - 1)):
+    loop_start = int(entry_i) if bool(getattr(decision, "include_start_bar", False)) else int(entry_i) + 1
+    for i in range(loop_start, max(loop_start, len(signal_table) - 1)):
         sig = signal_table[i]
         if sig is None:
             continue
@@ -303,6 +329,7 @@ def _get_or_build_interleaved_trade_trajectory(
     use_signal_exit: bool,
     exit_model: str,
     split_tp_enabled: bool,
+    entry_sig: Optional[Dict[str, Any]] = None,
     swap_stop_r_mult: float = 0.0,
 ) -> Optional[List[Dict[str, Any]]]:
     trace_store = row.get("trace_cache_store")
@@ -313,6 +340,7 @@ def _get_or_build_interleaved_trade_trajectory(
         decision=decision,
         exit_model=exit_model,
         split_tp_enabled=split_tp_enabled,
+        entry_sig=entry_sig,
     )
     cached = trace_store.get(candidate_key)
     if isinstance(cached, list):
@@ -328,6 +356,7 @@ def _get_or_build_interleaved_trade_trajectory(
         use_signal_exit=use_signal_exit,
         exit_model=exit_model,
         split_tp_enabled=split_tp_enabled,
+        entry_sig=entry_sig,
         swap_stop_r_mult=swap_stop_r_mult,
     )
     trace_store[candidate_key] = trajectory
@@ -484,6 +513,18 @@ def _new_sim_position(
     return pos
 
 
+def _apply_entry_signal_overrides_to_pos(*, pos: Dict[str, Any], sig: Optional[Dict[str, Any]], params: Any, use_signal_exit: bool) -> None:
+    sig_local = sig if isinstance(sig, dict) else {}
+    pos["tp1_close_pct"] = float(sig_local.get("tp1_close_pct_override", getattr(params, "tp1_close_pct", 0.5)) or getattr(params, "tp1_close_pct", 0.5))
+    pos["tp2_close_rest"] = bool(sig_local.get("tp2_close_rest_override", getattr(params, "tp2_close_rest", False)))
+    pos["be_trigger_r_mult"] = float(
+        sig_local.get("be_trigger_r_mult_override", getattr(params, "be_trigger_r_mult", 1.0)) or getattr(params, "be_trigger_r_mult", 1.0)
+    )
+    pos["auto_tighten_stop"] = bool(sig_local.get("auto_tighten_stop_override", getattr(params, "auto_tighten_stop", True)))
+    pos["trail_after_tp1"] = bool(sig_local.get("trail_after_tp1_override", getattr(params, "trail_after_tp1", True)))
+    pos["signal_exit_enabled_override"] = bool(sig_local.get("signal_exit_enabled_override", use_signal_exit))
+
+
 def _runtime_slot_key(inst: str, profile_id: str) -> str:
     return f"{str(inst or '').strip().upper()}::{str(profile_id or '').strip().upper()}"
 
@@ -633,6 +674,57 @@ def _sum_open_positions_potential_loss(open_positions: Dict[str, Dict[str, Any]]
     return total
 
 
+def _open_risk_cap_allows(
+    open_positions: Dict[str, Dict[str, Any]],
+    *,
+    equity: float,
+    candidate_loss_usdt: float,
+    max_open_risk_frac: float,
+) -> bool:
+    limit_frac = max(0.0, float(max_open_risk_frac or 0.0))
+    if limit_frac <= 0.0:
+        return True
+    limit_val = max(0.0, float(equity)) * limit_frac
+    projected_open_risk = _sum_open_positions_potential_loss(open_positions) + max(0.0, float(candidate_loss_usdt))
+    return projected_open_risk <= limit_val + 1e-12
+
+
+def _resolve_interleaved_window_bounds(
+    ltf_ts: List[int],
+    *,
+    bars: int,
+    start_ts_ms: int = 0,
+    end_ts_ms: int = 0,
+) -> Tuple[int, int, int]:
+    if not ltf_ts:
+        return 0, 0, -1
+
+    final_close_i = len(ltf_ts) - 1
+    end_ts_ms = max(0, int(end_ts_ms or 0))
+    if end_ts_ms > 0:
+        final_close_i = min(len(ltf_ts) - 1, bisect_right(ltf_ts, end_ts_ms) - 1)
+    if final_close_i < 0:
+        return 0, 0, -1
+
+    timeline_end_exclusive = max(0, final_close_i)
+    start_ts_ms = max(0, int(start_ts_ms or 0))
+    if start_ts_ms > 0:
+        start_idx = bisect_left(ltf_ts, start_ts_ms)
+    else:
+        start_idx = max(0, len(ltf_ts) - max(1, int(bars)))
+    start_idx = max(0, min(start_idx, timeline_end_exclusive))
+    return start_idx, timeline_end_exclusive, final_close_i
+
+
+def _clip_entry_decision_to_window(decision: Optional[Any], *, max_entry_i: int) -> Optional[Any]:
+    if decision is None:
+        return None
+    entry_idx = int(getattr(decision, "entry_idx", 0) or 0)
+    if entry_idx > int(max_entry_i):
+        return None
+    return decision
+
+
 def _count_open_l3_side_positions(open_positions: Dict[str, Dict[str, Any]], side: str) -> int:
     side_u = str(side or '').strip().upper()
     if side_u not in {'LONG', 'SHORT'}:
@@ -683,6 +775,8 @@ def _simulate_live_position_step(
         out["reverse_decision"] = reverse_decision
         return out
 
+    signal_exit_enabled_eff = bool(pos.get("signal_exit_enabled_override", use_signal_exit))
+
     exit_model = str(pos.get("exit_model", "standard") or "standard")
     if exit_model == "swapped_reverse":
         swap_take_px = float(pos.get("swap_take_px", tp1) or tp1)
@@ -691,7 +785,7 @@ def _simulate_live_position_step(
         if side_u == "LONG":
             stop_hit = low <= swap_stop_px
             tp_hit = high >= swap_take_px
-            long_exit = bool(sig.get("long_exit", False)) if use_signal_exit else False
+            long_exit = bool(sig.get("long_exit", False)) if signal_exit_enabled_eff else False
             if stop_hit and tp_hit:
                 return _with_reverse({"closed": True, "outcome": "STOP", "r_raw": _close_remaining_r(side_u, entry, risk, swap_stop_px), "is_stop": True})
             if stop_hit:
@@ -704,7 +798,7 @@ def _simulate_live_position_step(
 
         stop_hit = high >= swap_stop_px
         tp_hit = low <= swap_take_px
-        short_exit = bool(sig.get("short_exit", False)) if use_signal_exit else False
+        short_exit = bool(sig.get("short_exit", False)) if signal_exit_enabled_eff else False
         if stop_hit and tp_hit:
             return _with_reverse({"closed": True, "outcome": "STOP", "r_raw": _close_remaining_r(side_u, entry, risk, swap_stop_px), "is_stop": True})
         if stop_hit:
@@ -724,15 +818,15 @@ def _simulate_live_position_step(
             tp2=tp2,
             pos=pos,
             sig=sig,
-            tp1_close_pct=float(params.tp1_close_pct),
-            tp2_close_rest=bool(params.tp2_close_rest),
-            be_trigger_r_mult=float(params.be_trigger_r_mult),
+            tp1_close_pct=float(pos.get("tp1_close_pct", getattr(params, "tp1_close_pct", 0.5)) or getattr(params, "tp1_close_pct", 0.5)),
+            tp2_close_rest=bool(pos.get("tp2_close_rest", getattr(params, "tp2_close_rest", False))),
+            be_trigger_r_mult=float(pos.get("be_trigger_r_mult", getattr(params, "be_trigger_r_mult", 1.0)) or getattr(params, "be_trigger_r_mult", 1.0)),
             be_offset_pct=float(params.be_offset_pct),
             be_fee_buffer_pct=float(params.be_fee_buffer_pct),
-            auto_tighten_stop=bool(getattr(params, "auto_tighten_stop", True)),
-            trail_after_tp1=bool(getattr(params, "trail_after_tp1", True)),
+            auto_tighten_stop=bool(pos.get("auto_tighten_stop", getattr(params, "auto_tighten_stop", True))),
+            trail_after_tp1=bool(pos.get("trail_after_tp1", getattr(params, "trail_after_tp1", True))),
             trail_atr_mult=float(getattr(params, "trail_atr_mult", 0.0)),
-            signal_exit_enabled=bool(use_signal_exit),
+            signal_exit_enabled=bool(signal_exit_enabled_eff),
             split_tp_enabled=bool(pos.get("exchange_split_tp_enabled", False)),
         )
         return _with_reverse(res)
@@ -741,7 +835,7 @@ def _simulate_live_position_step(
         stop_hit = low <= hard_stop
         tp2_hit = high >= tp2
         tp1_hit = high >= tp1
-        long_exit = bool(sig.get("long_exit", False)) if use_signal_exit else False
+        long_exit = bool(sig.get("long_exit", False)) if signal_exit_enabled_eff else False
         if stop_hit and (tp1_hit or tp2_hit):
             return _with_reverse({"closed": True, "outcome": "STOP", "r_raw": _close_remaining_r(side_u, entry, risk, hard_stop), "is_stop": True})
         if stop_hit:
@@ -757,7 +851,7 @@ def _simulate_live_position_step(
     stop_hit = high >= hard_stop
     tp2_hit = low <= tp2
     tp1_hit = low <= tp1
-    short_exit = bool(sig.get("short_exit", False)) if use_signal_exit else False
+    short_exit = bool(sig.get("short_exit", False)) if signal_exit_enabled_eff else False
     if stop_hit and (tp1_hit or tp2_hit):
         return _with_reverse({"closed": True, "outcome": "STOP", "r_raw": _close_remaining_r(side_u, entry, risk, hard_stop), "is_stop": True})
     if stop_hit:
@@ -775,7 +869,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="2Y interleaved portfolio backtest")
     parser.add_argument("--env", default="/home/dandan/Workspace/test/okx_trade_suite/okx_auto_trader.env")
     parser.add_argument("--bars", type=int, default=70080, help="15m bars to evaluate (~70080 for 2 years)")
+    parser.add_argument("--start-ts-ms", type=int, default=0, help="Optional inclusive UTC ms timestamp for evaluation window start")
+    parser.add_argument("--end-ts-ms", type=int, default=0, help="Optional inclusive UTC ms timestamp for evaluation window end")
     parser.add_argument("--risk-frac", type=float, default=0.005, help="Risk fraction per trade for compounding")
+    parser.add_argument(
+        "--max-open-risk-frac",
+        type=float,
+        default=0.0,
+        help="Hard cap on summed remaining stop risk across all open positions (0.06=6%%, values >=1 treated as percent)",
+    )
     parser.add_argument("--title", default="2Y 真实顺序 TP1_ONLY（全币种）")
     parser.add_argument("--min-level", type=int, default=None, help="Min signal level to include (1~3)")
     parser.add_argument("--max-level", type=int, default=None, help="Max signal level to include (1~3)")
@@ -837,10 +939,18 @@ def main() -> int:
         action="store_true",
         help="Force backtest to simulate managed TP fallback instead of native split TP on entry",
     )
+    parser.set_defaults(live_window_signals=None)
     parser.add_argument(
         "--live-window-signals",
+        dest="live_window_signals",
         action="store_true",
         help="Build signals with the same rolling candle window as live runtime (slower but parity-safe)",
+    )
+    parser.add_argument(
+        "--fast-signals",
+        dest="live_window_signals",
+        action="store_false",
+        help="Use fast precomputed signal path instead of live-window signal rebuild",
     )
     parser.add_argument(
         "--dump-trades-csv",
@@ -884,6 +994,7 @@ def main() -> int:
         print(f"backtest_env_overrides: {'; '.join(override_notes)}", flush=True)
     cfg = read_config(None)
     client = create_client(cfg)
+    args.live_window_signals = resolve_backtest_live_window_signals(args.live_window_signals)
     run_start = time.monotonic()
 
     inst_ids = list(cfg.inst_ids)
@@ -911,9 +1022,18 @@ def main() -> int:
     }
 
     bars = max(1200, int(args.bars))
+    start_ts_ms = max(0, int(args.start_ts_ms or 0))
+    end_ts_ms = max(0, int(args.end_ts_ms or 0))
+    if start_ts_ms > 0 and end_ts_ms > 0 and start_ts_ms > end_ts_ms:
+        print("start_ts_ms must be <= end_ts_ms", flush=True)
+        return 2
     risk_frac = max(0.0, float(args.risk_frac))
     if risk_frac <= 0:
         risk_frac = 0.005
+    max_open_risk_frac = max(0.0, float(args.max_open_risk_frac or 0.0))
+    if max_open_risk_frac >= 1.0:
+        max_open_risk_frac = max_open_risk_frac / 100.0
+    max_open_risk_frac = clamp01(max_open_risk_frac)
 
     fee_rate = max(0.0, float(args.fee_rate))
     slippage_bps = max(0.0, float(args.slippage_bps))
@@ -1032,6 +1152,12 @@ def main() -> int:
     l3_side_cap = max(0, int(args.l3_side_cap))
 
     start_equity = loss_base_fixed if loss_base_fixed > 0 else 1000.0
+    ltf_s = bar_to_seconds(cfg.ltf_bar)
+    loc_s = bar_to_seconds(cfg.loc_bar)
+    htf_s = bar_to_seconds(cfg.htf_bar)
+    if start_ts_ms > 0 and end_ts_ms > 0:
+        requested_bars = int(math.ceil((end_ts_ms - start_ts_ms) / float(ltf_s * 1000))) + 1
+        bars = max(1200, requested_bars)
 
     print("=== 2Y Interleaved Portfolio Backtest ===", flush=True)
     print(f"insts={','.join(inst_ids)}", flush=True)
@@ -1066,9 +1192,16 @@ def main() -> int:
     print(
         f"constraints: min_gap={min_gap_minutes}m inst_cap={per_inst_cap}/24h global_cap={global_cap}/24h "
         f"loss_guard={loss_limit_pct*100:.2f}%({loss_base_mode},projected) "
+        f"open_risk_cap={(f'{max_open_risk_frac*100:.2f}%' if max_open_risk_frac > 0 else '-')} "
         f"l3_side_cap={(l3_side_cap if l3_side_cap > 0 else '-')}",
         flush=True,
     )
+    if start_ts_ms > 0 or end_ts_ms > 0:
+        print(
+            f"requested_window={ts_fmt(start_ts_ms) if start_ts_ms > 0 else '-'} -> "
+            f"{ts_fmt(end_ts_ms) if end_ts_ms > 0 else '-'}",
+            flush=True,
+        )
     print(
         f"stop_guard: cooldown={stop_cooldown_minutes}m tp2_cooldown={tp2_cooldown_hours:g}h "
         f"tp2_partial_until={tp2_partial_until_hours:g}h "
@@ -1098,9 +1231,6 @@ def main() -> int:
         flush=True,
     )
 
-    ltf_s = bar_to_seconds(cfg.ltf_bar)
-    loc_s = bar_to_seconds(cfg.loc_bar)
-    htf_s = bar_to_seconds(cfg.htf_bar)
     ratio_loc = max(1, int(math.ceil(loc_s / ltf_s)))
     ratio_htf = max(1, int(math.ceil(htf_s / ltf_s)))
     need_ltf = bars + 300
@@ -1136,7 +1266,11 @@ def main() -> int:
             continue
 
         pre_by_profile: Dict[str, Dict[str, Any]] = {}
-        if not bool(args.live_window_signals):
+        needs_oral_precalc = any(
+            is_pa_oral_baseline_variant(getattr(cfg.strategy_profiles.get(pid, inst_params), "strategy_variant", ""))
+            for pid in inst_profile_ids
+        )
+        if (not bool(args.live_window_signals)) or needs_oral_precalc:
             try:
                 pre_by_profile[profile_by_inst.get(inst, "DEFAULT")] = _build_backtest_precalc(htf, loc, ltf, inst_params)
                 for pid in inst_profile_ids:
@@ -1150,9 +1284,17 @@ def main() -> int:
         htf_ts = [c.ts_ms for c in htf]
         loc_ts = [c.ts_ms for c in loc]
         ltf_ts = [c.ts_ms for c in ltf]
-        start_idx = max(0, len(ltf) - bars)
-        ts_to_i = {int(ltf_ts[i]): i for i in range(start_idx, len(ltf) - 1)}
-        for i in range(start_idx, len(ltf) - 1):
+        start_idx, timeline_end_exclusive, final_close_i = _resolve_interleaved_window_bounds(
+            ltf_ts,
+            bars=bars,
+            start_ts_ms=start_ts_ms,
+            end_ts_ms=end_ts_ms,
+        )
+        if final_close_i < 0:
+            print(f"[{inst}] skip empty window", flush=True)
+            continue
+        ts_to_i = {int(ltf_ts[i]): i for i in range(start_idx, timeline_end_exclusive)}
+        for i in range(start_idx, timeline_end_exclusive):
             all_ts.add(int(ltf_ts[i]))
         params_by_profile: Dict[str, Any] = {profile_by_inst.get(inst, "DEFAULT"): inst_params}
         for pid in inst_profile_ids:
@@ -1202,6 +1344,11 @@ def main() -> int:
 
             signal_table = table_bundle["signal_table"]
             decision_table = table_bundle["decision_table"]
+            for i in range(start_idx, timeline_end_exclusive):
+                decision_table[i] = _clip_entry_decision_to_window(
+                    decision_table[i],
+                    max_entry_i=final_close_i,
+                )
             table_cache_key = str(table_bundle.get("table_cache_key", "") or "")
             trace_cache_key = ""
             trace_cache_path = ""
@@ -1258,6 +1405,9 @@ def main() -> int:
                 "trace_cache_store": trace_cache_store,
                 "trace_cache_dirty": False,
                 "exchange_split_tp_enabled": slot_split_tp_enabled,
+                "window_start_i": int(start_idx),
+                "window_timeline_end_exclusive": int(timeline_end_exclusive),
+                "window_last_i": int(final_close_i),
             }
             row_keys_in_order.append(row_key)
             inst_rows_added += 1
@@ -1271,6 +1421,23 @@ def main() -> int:
 
     timeline = sorted(all_ts)
     print(f"timeline_points={len(timeline)}", flush=True)
+    effective_window_start_ts = int(timeline[0]) if timeline else 0
+    row_window_last_ts: List[int] = []
+    for row_key in row_keys_in_order:
+        row = data.get(row_key)
+        if not isinstance(row, dict):
+            continue
+        last_i = int(row.get("window_last_i", -1))
+        ltf_ts = row.get("ltf_ts") or []
+        if 0 <= last_i < len(ltf_ts):
+            row_window_last_ts.append(int(ltf_ts[last_i]))
+    effective_window_end_ts = max(row_window_last_ts) if row_window_last_ts else (int(timeline[-1]) if timeline else 0)
+    if not timeline:
+        text = f"【{args.title}】窗口内无可评估K线。"
+        print(text, flush=True)
+        sent = send_telegram(cfg, text)
+        print(f"telegram_sent={sent}", flush=True)
+        return 0
 
     def _flush_trace_caches() -> None:
         if not trace_cache_enabled:
@@ -1356,6 +1523,7 @@ def main() -> int:
     skip_inst_cap = 0
     skip_global_cap = 0
     skip_unresolved = 0
+    skip_open_risk_cap = 0
     skip_loss_guard = 0
     skip_stop_guard = 0
     skip_tp2_cooldown = 0
@@ -1554,7 +1722,7 @@ def main() -> int:
             max_dd_trough_ts = int(exit_ts)
 
     def _can_open(state_key: str, side: str, level: int, ts: int, candidate_loss_usdt: float = 0.0) -> bool:
-        nonlocal skip_gap, skip_inst_cap, skip_global_cap, skip_loss_guard, skip_l3_side_cap
+        nonlocal skip_gap, skip_inst_cap, skip_global_cap, skip_open_risk_cap, skip_loss_guard, skip_l3_side_cap
         prune_ts_deque_window(global_open_ts, ts, window_ms)
         q_inst = inst_open_ts[state_key]
         prune_ts_deque_window(q_inst, ts, window_ms)
@@ -1575,6 +1743,15 @@ def main() -> int:
                 skip_l3_side_cap += 1
                 return False
         if not _sg_allow(state_key, side, level, int(ts)):
+            return False
+
+        if not _open_risk_cap_allows(
+            open_positions,
+            equity=float(equity),
+            candidate_loss_usdt=float(candidate_loss_usdt),
+            max_open_risk_frac=float(max_open_risk_frac),
+        ):
+            skip_open_risk_cap += 1
             return False
 
         if loss_limit_pct > 0:
@@ -1656,6 +1833,8 @@ def main() -> int:
             profile_id=profile_id,
             position_key=position_key,
         )
+        entry_sig = row["signal_table"][i] if 0 <= int(i) < len(row["signal_table"]) else None
+        _apply_entry_signal_overrides_to_pos(pos=pos, sig=entry_sig, params=row["params"], use_signal_exit=use_signal_exit)
         pos["state_key"] = state_key
         pos["entry_exec_mode"] = str(effective_exec_mode)
         pos["entry_exec_mode_intended"] = str(intended_exec_mode)
@@ -1671,6 +1850,7 @@ def main() -> int:
             use_signal_exit=use_signal_exit,
             exit_model=exit_model,
             split_tp_enabled=bool(pos["exchange_split_tp_enabled"]),
+            entry_sig=entry_sig,
             swap_stop_r_mult=float(swap_stop_r_mult),
         )
         if isinstance(trajectory, list):
@@ -1686,6 +1866,34 @@ def main() -> int:
         by_level[int(level)] += 1
         if open_positions_total > max_concurrent:
             max_concurrent = open_positions_total
+        if bool(getattr(decision, "include_start_bar", False)) and isinstance(entry_sig, dict):
+            sim_now = _apply_cached_trade_trajectory_step(
+                pos=pos,
+                current_i=int(i),
+                decision=None,
+                allow_reverse=False,
+            )
+            if not bool(sim_now.get("closed", False)) and not isinstance(trajectory, list):
+                sim_now = _simulate_live_position_step(
+                    pos=pos,
+                    sig=entry_sig,
+                    params=row["params"],
+                    decision=None,
+                    allow_reverse=False,
+                    managed_exit=bool(managed_exit),
+                    use_signal_exit=bool(use_signal_exit),
+                )
+            if bool(sim_now.get("closed", False)):
+                open_positions.pop(position_key, None)
+                open_positions_total = max(0, open_positions_total - 1)
+                _record_close(
+                    inst=inst,
+                    pos=pos,
+                    exit_ts=int(ts),
+                    outcome=str(sim_now.get("outcome", "NONE")),
+                    r_raw=float(sim_now.get("r_raw", 0.0) or 0.0),
+                    is_stop=bool(sim_now.get("is_stop", False)),
+                )
         return True
 
     for step, ts in enumerate(timeline, 1):
@@ -1765,7 +1973,7 @@ def main() -> int:
         pos = open_positions.get(position_key)
         if pos is None:
             continue
-        last_i = len(row["ltf"]) - 1
+        last_i = int(row.get("window_last_i", len(row["ltf"]) - 1))
         if last_i < 0:
             continue
         close_px = float(row["ltf"][last_i].close)
@@ -1828,6 +2036,9 @@ def main() -> int:
     start_ts = min(t["entry_ts"] for t in accepted)
     end_ts = max(t["exit_ts"] for t in accepted)
     period_days = (end_ts - start_ts) / 1000 / 86400
+    window_report_start_ts = int(start_ts_ms or effective_window_start_ts or start_ts)
+    window_report_end_ts = int(end_ts_ms or effective_window_end_ts or end_ts)
+    window_period_days = (window_report_end_ts - window_report_start_ts) / 1000 / 86400 if window_report_end_ts >= window_report_start_ts else 0.0
     elapsed_s = float(time.monotonic() - run_start)
     level_perf_final = finalize_level_perf(level_perf)
 
@@ -1879,7 +2090,8 @@ def main() -> int:
     summary: List[str] = []
     summary.append(f"【{args.title}】")
     summary.append(f"完成时间：{dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    summary.append(f"区间：{ts_fmt(start_ts)} -> {ts_fmt(end_ts)}（{period_days:.1f}天）")
+    summary.append(f"回测窗口：{ts_fmt(window_report_start_ts)} -> {ts_fmt(window_report_end_ts)}（{window_period_days:.1f}天）")
+    summary.append(f"成交跨度：{ts_fmt(start_ts)} -> {ts_fmt(end_ts)}（{period_days:.1f}天）")
     summary.append(f"标的：{','.join(inst_ids)}")
     if independent_profile_positions:
         summary.append("仓位模式：independent_profiles（slot=inst+profile，共享权益池，允许同向叠加/多空对冲）")
@@ -1890,6 +2102,7 @@ def main() -> int:
     summary.append(
         f"约束：min_gap={min_gap_minutes}m inst_cap={per_inst_cap}/24h global_cap={global_cap}/24h "
         f"loss_guard={loss_limit_pct*100:.2f}%({loss_base_mode},projected) "
+        f"open_risk_cap={(f'{max_open_risk_frac*100:.2f}%' if max_open_risk_frac > 0 else '-')} "
         f"l3_side_cap={(l3_side_cap if l3_side_cap > 0 else '-')} "
         f"tp2_cd={tp2_cooldown_hours:g}h "
         f"tp2_partial_until={tp2_partial_until_hours:g}h "
@@ -1919,7 +2132,7 @@ def main() -> int:
     summary.append(
         f"levels：L1={by_level.get(1,0)} L2={by_level.get(2,0)} L3={by_level.get(3,0)} "
         f"skip_gap={skip_gap} skip_inst_cap={skip_inst_cap} skip_global_cap={skip_global_cap} "
-        f"skip_loss_guard={skip_loss_guard} skip_stop_guard={skip_stop_guard} "
+        f"skip_open_risk_cap={skip_open_risk_cap} skip_loss_guard={skip_loss_guard} skip_stop_guard={skip_stop_guard} "
         f"skip_tp2_cooldown={skip_tp2_cooldown} skip_tp2_partial={skip_tp2_partial} "
         f"skip_l3_side_cap={skip_l3_side_cap} "
         f"skip_miss={skip_miss} skip_unresolved={skip_unresolved}"

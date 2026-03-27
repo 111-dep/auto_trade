@@ -22,6 +22,7 @@ from .managed_tp2 import (
 )
 from .models import Config, PositionState
 from .okx_client import calc_order_size as okx_calc_order_size
+from .pa_oral_baseline import PA_ORAL_BASELINE_V1
 from .risk_guard import (
     is_open_limit_reached,
     min_open_gap_remaining_minutes,
@@ -89,7 +90,7 @@ def execute_decision(
             sig["htf_ema_slow"],
             sig["htf_rsi"],
             profile_id,
-            sig.get("strategy_variant", "classic"),
+            sig.get("strategy_variant", PA_ORAL_BASELINE_V1),
             exec_max_level,
             entry_side or "NONE",
             entry_level,
@@ -935,6 +936,16 @@ def execute_decision(
         atr_value = float(sig["atr"])
         min_gap = min_risk(entry_price, atr_value)
         size_val = max(0.0, float(opened_size or 0.0))
+        bar_ms = max(60_000, int(bar_to_seconds(cfg.ltf_bar)) * 1000)
+        signal_ts_ms = int(sig["signal_ts_ms"])
+        entry_bar_ts_ms = signal_ts_ms + bar_ms if bool(sig.get("signal_confirm", True)) else signal_ts_ms
+        tp1_r_mult = float(sig.get("tp1_r_override", cfg.params.tp1_r_mult) or cfg.params.tp1_r_mult)
+        tp2_r_mult = float(sig.get("tp2_r_override", cfg.params.tp2_r_mult) or cfg.params.tp2_r_mult)
+        tp1_close_pct = float(sig.get("tp1_close_pct_override", cfg.params.tp1_close_pct) or cfg.params.tp1_close_pct)
+        be_trigger_r_mult = float(
+            sig.get("be_trigger_r_mult_override", cfg.params.be_trigger_r_mult) or cfg.params.be_trigger_r_mult
+        )
+        max_hold_bars = int(sig.get("max_hold_bars", 0) or 0)
 
         if side == "long":
             stop = min(float(suggested_stop), entry_price - min_gap)
@@ -948,13 +959,25 @@ def execute_decision(
                 "be_armed": False,
                 "peak_price": entry_price,
                 "trough_price": entry_price,
-                "created_ts_ms": int(sig["signal_ts_ms"]),
+                "created_ts_ms": signal_ts_ms,
+                "entry_bar_ts_ms": entry_bar_ts_ms,
                 "inst_id": inst_id,
                 "managed_by": "script",
                 "open_size": size_val,
                 "remaining_size": size_val,
                 "realized_size": 0.0,
                 "realized_pnl_usdt": 0.0,
+                "tp1_r_mult": tp1_r_mult,
+                "tp2_r_mult": tp2_r_mult,
+                "tp1_close_pct": tp1_close_pct,
+                "tp2_close_rest": bool(sig.get("tp2_close_rest_override", cfg.params.tp2_close_rest)),
+                "be_trigger_r_mult": be_trigger_r_mult,
+                "auto_tighten_stop": bool(sig.get("auto_tighten_stop_override", cfg.params.auto_tighten_stop)),
+                "trail_after_tp1": bool(sig.get("trail_after_tp1_override", cfg.params.trail_after_tp1)),
+                "signal_exit_enabled": bool(
+                    sig.get("signal_exit_enabled_override", cfg.params.signal_exit_enabled)
+                ),
+                "max_hold_bars": max_hold_bars,
             }
             return
 
@@ -969,14 +992,52 @@ def execute_decision(
             "be_armed": False,
             "peak_price": entry_price,
             "trough_price": entry_price,
-            "created_ts_ms": int(sig["signal_ts_ms"]),
+            "created_ts_ms": signal_ts_ms,
+            "entry_bar_ts_ms": entry_bar_ts_ms,
             "inst_id": inst_id,
             "managed_by": "script",
             "open_size": size_val,
             "remaining_size": size_val,
             "realized_size": 0.0,
             "realized_pnl_usdt": 0.0,
+            "tp1_r_mult": tp1_r_mult,
+            "tp2_r_mult": tp2_r_mult,
+            "tp1_close_pct": tp1_close_pct,
+            "tp2_close_rest": bool(sig.get("tp2_close_rest_override", cfg.params.tp2_close_rest)),
+            "be_trigger_r_mult": be_trigger_r_mult,
+            "auto_tighten_stop": bool(sig.get("auto_tighten_stop_override", cfg.params.auto_tighten_stop)),
+            "trail_after_tp1": bool(sig.get("trail_after_tp1_override", cfg.params.trail_after_tp1)),
+            "signal_exit_enabled": bool(
+                sig.get("signal_exit_enabled_override", cfg.params.signal_exit_enabled)
+            ),
+            "max_hold_bars": max_hold_bars,
         }
+
+    def trade_bool(trade: Dict[str, Any], key: str, default: bool) -> bool:
+        return bool(trade.get(key, default))
+
+    def trade_float(trade: Dict[str, Any], key: str, default: float) -> float:
+        try:
+            return float(trade.get(key, default) or default)
+        except Exception:
+            return float(default)
+
+    def trade_int(trade: Dict[str, Any], key: str, default: int) -> int:
+        try:
+            return int(trade.get(key, default) or default)
+        except Exception:
+            return int(default)
+
+    def trade_max_hold_reached(trade: Dict[str, Any]) -> bool:
+        max_hold_bars = trade_int(trade, "max_hold_bars", 0)
+        if max_hold_bars <= 0:
+            return False
+        bar_ms = max(60_000, int(bar_to_seconds(cfg.ltf_bar)) * 1000)
+        entry_bar_ts_ms = trade_int(trade, "entry_bar_ts_ms", trade_int(trade, "created_ts_ms", 0))
+        if entry_bar_ts_ms <= 0:
+            return False
+        held_bars = max(0, (int(sig["signal_ts_ms"]) - entry_bar_ts_ms) // bar_ms)
+        return held_bars >= max_hold_bars
 
     def ensure_trade_state_for_position() -> None:
         current = state.get("trade")
@@ -2130,13 +2191,19 @@ def execute_decision(
         planned_stop: float,
         planned_level: int,
     ) -> tuple[float, Dict[str, Any], Dict[str, Any], str]:
+        tp_r_override = None
+        if "tp2_r_override" in sig:
+            try:
+                tp_r_override = float(sig.get("tp2_r_override"))
+            except Exception:
+                tp_r_override = None
         return place_open_leg(
             entry_side=entry_side,
             size=size,
             planned_stop=planned_stop,
             planned_level=planned_level,
             action_tag="open",
-            tp_r_override=None,
+            tp_r_override=tp_r_override,
         )
 
     def open_long() -> float:
@@ -2422,8 +2489,8 @@ def execute_decision(
                     "LONG",
                     entry_price=entry_px,
                     stop_price=stop_px,
-                    tp1_r=cfg.params.tp1_r_mult,
-                    tp2_r=cfg.params.tp2_r_mult,
+                    tp1_r=trade_float(trade_ref or {}, "tp1_r_mult", cfg.params.tp1_r_mult),
+                    tp2_r=trade_float(trade_ref or {}, "tp2_r_mult", cfg.params.tp2_r_mult),
                 )
                 journal_trade_event(
                     event_type="OPEN",
@@ -2463,8 +2530,8 @@ def execute_decision(
                     "SHORT",
                     entry_price=entry_px,
                     stop_price=stop_px,
-                    tp1_r=cfg.params.tp1_r_mult,
-                    tp2_r=cfg.params.tp2_r_mult,
+                    tp1_r=trade_float(trade_ref or {}, "tp1_r_mult", cfg.params.tp1_r_mult),
+                    tp2_r=trade_float(trade_ref or {}, "tp2_r_mult", cfg.params.tp2_r_mult),
                 )
                 journal_trade_event(
                     event_type="OPEN",
@@ -2535,6 +2602,14 @@ def execute_decision(
         managed_tp2_enabled = bool(trade_state.get("managed_tp2_enabled", False))
         external_tp1_mode = has_external_tp1_fill_mode(trade_state)
         ensure_post_open_exchange_sl(trade_state, reason="loop_long")
+        tp1_r_mult_eff = trade_float(trade_state, "tp1_r_mult", cfg.params.tp1_r_mult)
+        tp2_r_mult_eff = trade_float(trade_state, "tp2_r_mult", cfg.params.tp2_r_mult)
+        tp1_close_pct_eff = min(max(trade_float(trade_state, "tp1_close_pct", cfg.params.tp1_close_pct), 0.0), 1.0)
+        tp2_close_rest_eff = trade_bool(trade_state, "tp2_close_rest", cfg.params.tp2_close_rest)
+        be_trigger_r_mult_eff = max(0.0, trade_float(trade_state, "be_trigger_r_mult", cfg.params.be_trigger_r_mult))
+        auto_tighten_stop_eff = trade_bool(trade_state, "auto_tighten_stop", cfg.params.auto_tighten_stop)
+        trail_after_tp1_eff = trade_bool(trade_state, "trail_after_tp1", cfg.params.trail_after_tp1)
+        signal_exit_enabled_eff = trade_bool(trade_state, "signal_exit_enabled", cfg.params.signal_exit_enabled)
 
         if external_tp1_mode and (not trade_state.get("tp1_done", False)):
             expected_tp2_size = float(trade_state.get("exchange_tp2_size", 0.0) or 0.0)
@@ -2565,7 +2640,7 @@ def execute_decision(
                         exit_px=float(sig["close"]),
                         close_size=closed_est,
                     )
-                    tp1_px = entry + risk * cfg.params.tp1_r_mult
+                    tp1_px = entry + risk * tp1_r_mult_eff
                     journal_trade_event(
                         event_type="PARTIAL_CLOSE",
                         side="long",
@@ -2609,14 +2684,14 @@ def execute_decision(
             if not ok_tp1 and err_tp1 not in {"filled", "live", "partially_filled", "tp1_already_done"}:
                 log(f"[{inst_id}] Managed TP1 ensure warning (long loop): {err_tp1}", level="WARN")
 
-        if cfg.params.auto_tighten_stop and (not trade_state.get("be_armed", False)) and float(sig["close"]) >= entry + risk * cfg.params.be_trigger_r_mult:
+        if auto_tighten_stop_eff and (not trade_state.get("be_armed", False)) and float(sig["close"]) >= entry + risk * be_trigger_r_mult_eff:
             trade_state["be_armed"] = True
             log("Management: BE armed (long).")
 
-        if (not external_tp1_mode) and (not trade_state.get("tp1_done", False)) and cfg.params.tp1_close_pct > 0:
-            tp1_price = entry + risk * cfg.params.tp1_r_mult
+        if (not external_tp1_mode) and (not trade_state.get("tp1_done", False)) and tp1_close_pct_eff > 0:
+            tp1_price = entry + risk * tp1_r_mult_eff
             if float(sig["close"]) >= tp1_price:
-                pct = min(max(cfg.params.tp1_close_pct, 0.0), 1.0)
+                pct = tp1_close_pct_eff
                 close_size = pos.size * pct
                 if close_size >= pos.size * 0.999:
                     closed_sz, close_resp = close_long(pos.size, action_tag="tp1_full")
@@ -2719,7 +2794,7 @@ def execute_decision(
                     )
                     return
 
-        if cfg.params.tp2_close_rest and trade_state.get("tp1_done", False):
+        if tp2_close_rest_eff and trade_state.get("tp1_done", False):
             if managed_tp2_enabled and pos.size > 0:
                 ok_tp2, err_tp2 = ensure_managed_tp2_limit_order(
                     cfg=cfg,
@@ -2732,7 +2807,7 @@ def execute_decision(
                 )
                 if not ok_tp2 and err_tp2 not in {"filled", "live", "partially_filled"}:
                     log(f"[{inst_id}] Managed TP2 ensure warning (long loop): {err_tp2}", level="WARN")
-            tp2_price = entry + risk * cfg.params.tp2_r_mult
+            tp2_price = entry + risk * tp2_r_mult_eff
             if float(sig["close"]) >= tp2_price and pos.size > 0:
                 closed_sz, close_resp = close_long(pos.size, action_tag="tp2_full")
                 pnl_usdt = record_script_realized_loss(
@@ -2761,12 +2836,12 @@ def execute_decision(
                 return
 
         dynamic_stop = float(trade_state.get("hard_stop", sig["long_stop"]))
-        if cfg.params.auto_tighten_stop:
+        if auto_tighten_stop_eff:
             dynamic_stop = max(dynamic_stop, float(sig["long_stop"]))
             if trade_state.get("be_armed", False):
                 be_total_offset = max(0.0, float(cfg.params.be_offset_pct) + float(cfg.params.be_fee_buffer_pct))
                 dynamic_stop = max(dynamic_stop, entry * (1.0 + be_total_offset))
-            if (not cfg.params.trail_after_tp1) or trade_state.get("tp1_done", False):
+            if (not trail_after_tp1_eff) or trade_state.get("tp1_done", False):
                 trail_stop = peak - float(sig["atr"]) * cfg.params.trail_atr_mult
                 dynamic_stop = max(dynamic_stop, trail_stop)
         elif trade_state.get("be_armed", False):
@@ -2781,7 +2856,7 @@ def execute_decision(
         )
 
         stop_hit = float(sig["close"]) <= dynamic_stop
-        signal_exit_hit = bool(cfg.params.signal_exit_enabled) and bool(sig.get("long_exit", False))
+        signal_exit_hit = bool(signal_exit_enabled_eff) and bool(sig.get("long_exit", False))
         if signal_exit_hit or stop_hit:
             closed_sz, close_resp = close_long(pos.size, action_tag="close_exit")
             close_reason = "long_stop" if stop_hit else "long_exit"
@@ -2830,8 +2905,8 @@ def execute_decision(
                         "SHORT",
                         entry_price=entry_px,
                         stop_price=stop_px,
-                        tp1_r=cfg.params.tp1_r_mult,
-                        tp2_r=cfg.params.tp2_r_mult,
+                        tp1_r=trade_float(state["trade"], "tp1_r_mult", cfg.params.tp1_r_mult),
+                        tp2_r=trade_float(state["trade"], "tp2_r_mult", cfg.params.tp2_r_mult),
                     )
                     journal_trade_event(
                         event_type="OPEN",
@@ -2847,6 +2922,30 @@ def execute_decision(
                         order_resp=entry_order_resp,
                         trade_id=trade_id,
                     )
+        elif trade_max_hold_reached(trade_state):
+            closed_sz, close_resp = close_long(pos.size, action_tag="close_time")
+            pnl_usdt = record_script_realized_loss(
+                side="long",
+                entry_px=entry,
+                exit_px=float(sig["close"]),
+                close_size=closed_sz,
+                reason="long_time",
+            )
+            journal_trade_event(
+                event_type="CLOSE",
+                side="long",
+                size=closed_sz,
+                reason="long_time",
+                entry_px=entry,
+                exit_px=float(sig["close"]),
+                stop_px=float(dynamic_stop),
+                pnl_usdt=float(pnl_usdt),
+                entry_level_value=int(trade_state.get("entry_level", 0) or 0),
+                trade_ref=trade_state,
+                order_resp=close_resp,
+            )
+            _record_stop_guard("long", is_stop_event=False, reason="long_time")
+            clear_trade_state()
         else:
             log(
                 "Action: HOLD LONG | stop={:.2f} entry={:.2f} risk={:.2f} tp1_done={} be={}".format(
@@ -2868,6 +2967,14 @@ def execute_decision(
         managed_tp2_enabled = bool(trade_state.get("managed_tp2_enabled", False))
         external_tp1_mode = has_external_tp1_fill_mode(trade_state)
         ensure_post_open_exchange_sl(trade_state, reason="loop_short")
+        tp1_r_mult_eff = trade_float(trade_state, "tp1_r_mult", cfg.params.tp1_r_mult)
+        tp2_r_mult_eff = trade_float(trade_state, "tp2_r_mult", cfg.params.tp2_r_mult)
+        tp1_close_pct_eff = min(max(trade_float(trade_state, "tp1_close_pct", cfg.params.tp1_close_pct), 0.0), 1.0)
+        tp2_close_rest_eff = trade_bool(trade_state, "tp2_close_rest", cfg.params.tp2_close_rest)
+        be_trigger_r_mult_eff = max(0.0, trade_float(trade_state, "be_trigger_r_mult", cfg.params.be_trigger_r_mult))
+        auto_tighten_stop_eff = trade_bool(trade_state, "auto_tighten_stop", cfg.params.auto_tighten_stop)
+        trail_after_tp1_eff = trade_bool(trade_state, "trail_after_tp1", cfg.params.trail_after_tp1)
+        signal_exit_enabled_eff = trade_bool(trade_state, "signal_exit_enabled", cfg.params.signal_exit_enabled)
 
         if external_tp1_mode and (not trade_state.get("tp1_done", False)):
             expected_tp2_size = float(trade_state.get("exchange_tp2_size", 0.0) or 0.0)
@@ -2898,7 +3005,7 @@ def execute_decision(
                         exit_px=float(sig["close"]),
                         close_size=closed_est,
                     )
-                    tp1_px = entry - risk * cfg.params.tp1_r_mult
+                    tp1_px = entry - risk * tp1_r_mult_eff
                     journal_trade_event(
                         event_type="PARTIAL_CLOSE",
                         side="short",
@@ -2942,14 +3049,14 @@ def execute_decision(
             if not ok_tp1 and err_tp1 not in {"filled", "live", "partially_filled", "tp1_already_done"}:
                 log(f"[{inst_id}] Managed TP1 ensure warning (short loop): {err_tp1}", level="WARN")
 
-        if cfg.params.auto_tighten_stop and (not trade_state.get("be_armed", False)) and float(sig["close"]) <= entry - risk * cfg.params.be_trigger_r_mult:
+        if auto_tighten_stop_eff and (not trade_state.get("be_armed", False)) and float(sig["close"]) <= entry - risk * be_trigger_r_mult_eff:
             trade_state["be_armed"] = True
             log("Management: BE armed (short).")
 
-        if (not external_tp1_mode) and (not trade_state.get("tp1_done", False)) and cfg.params.tp1_close_pct > 0:
-            tp1_price = entry - risk * cfg.params.tp1_r_mult
+        if (not external_tp1_mode) and (not trade_state.get("tp1_done", False)) and tp1_close_pct_eff > 0:
+            tp1_price = entry - risk * tp1_r_mult_eff
             if float(sig["close"]) <= tp1_price:
-                pct = min(max(cfg.params.tp1_close_pct, 0.0), 1.0)
+                pct = tp1_close_pct_eff
                 close_size = pos.size * pct
                 if close_size >= pos.size * 0.999:
                     closed_sz, close_resp = close_short(pos.size, action_tag="tp1_full")
@@ -3052,7 +3159,7 @@ def execute_decision(
                     )
                     return
 
-        if cfg.params.tp2_close_rest and trade_state.get("tp1_done", False):
+        if tp2_close_rest_eff and trade_state.get("tp1_done", False):
             if managed_tp2_enabled and pos.size > 0:
                 ok_tp2, err_tp2 = ensure_managed_tp2_limit_order(
                     cfg=cfg,
@@ -3065,7 +3172,7 @@ def execute_decision(
                 )
                 if not ok_tp2 and err_tp2 not in {"filled", "live", "partially_filled"}:
                     log(f"[{inst_id}] Managed TP2 ensure warning (short loop): {err_tp2}", level="WARN")
-            tp2_price = entry - risk * cfg.params.tp2_r_mult
+            tp2_price = entry - risk * tp2_r_mult_eff
             if float(sig["close"]) <= tp2_price and pos.size > 0:
                 closed_sz, close_resp = close_short(pos.size, action_tag="tp2_full")
                 pnl_usdt = record_script_realized_loss(
@@ -3094,12 +3201,12 @@ def execute_decision(
                 return
 
         dynamic_stop = float(trade_state.get("hard_stop", sig["short_stop"]))
-        if cfg.params.auto_tighten_stop:
+        if auto_tighten_stop_eff:
             dynamic_stop = min(dynamic_stop, float(sig["short_stop"]))
             if trade_state.get("be_armed", False):
                 be_total_offset = max(0.0, float(cfg.params.be_offset_pct) + float(cfg.params.be_fee_buffer_pct))
                 dynamic_stop = min(dynamic_stop, entry * (1.0 - be_total_offset))
-            if (not cfg.params.trail_after_tp1) or trade_state.get("tp1_done", False):
+            if (not trail_after_tp1_eff) or trade_state.get("tp1_done", False):
                 trail_stop = trough + float(sig["atr"]) * cfg.params.trail_atr_mult
                 dynamic_stop = min(dynamic_stop, trail_stop)
         elif trade_state.get("be_armed", False):
@@ -3114,7 +3221,7 @@ def execute_decision(
         )
 
         stop_hit = float(sig["close"]) >= dynamic_stop
-        signal_exit_hit = bool(cfg.params.signal_exit_enabled) and bool(sig.get("short_exit", False))
+        signal_exit_hit = bool(signal_exit_enabled_eff) and bool(sig.get("short_exit", False))
         if signal_exit_hit or stop_hit:
             closed_sz, close_resp = close_short(pos.size, action_tag="close_exit")
             close_reason = "short_stop" if stop_hit else "short_exit"
@@ -3163,8 +3270,8 @@ def execute_decision(
                         "LONG",
                         entry_price=entry_px,
                         stop_price=stop_px,
-                        tp1_r=cfg.params.tp1_r_mult,
-                        tp2_r=cfg.params.tp2_r_mult,
+                        tp1_r=trade_float(state["trade"], "tp1_r_mult", cfg.params.tp1_r_mult),
+                        tp2_r=trade_float(state["trade"], "tp2_r_mult", cfg.params.tp2_r_mult),
                     )
                     journal_trade_event(
                         event_type="OPEN",
@@ -3180,6 +3287,30 @@ def execute_decision(
                         order_resp=entry_order_resp,
                         trade_id=trade_id,
                     )
+        elif trade_max_hold_reached(trade_state):
+            closed_sz, close_resp = close_short(pos.size, action_tag="close_time")
+            pnl_usdt = record_script_realized_loss(
+                side="short",
+                entry_px=entry,
+                exit_px=float(sig["close"]),
+                close_size=closed_sz,
+                reason="short_time",
+            )
+            journal_trade_event(
+                event_type="CLOSE",
+                side="short",
+                size=closed_sz,
+                reason="short_time",
+                entry_px=entry,
+                exit_px=float(sig["close"]),
+                stop_px=float(dynamic_stop),
+                pnl_usdt=float(pnl_usdt),
+                entry_level_value=int(trade_state.get("entry_level", 0) or 0),
+                trade_ref=trade_state,
+                order_resp=close_resp,
+            )
+            _record_stop_guard("short", is_stop_event=False, reason="short_time")
+            clear_trade_state()
         else:
             log(
                 "Action: HOLD SHORT | stop={:.2f} entry={:.2f} risk={:.2f} tp1_done={} be={}".format(

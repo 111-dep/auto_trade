@@ -10,14 +10,13 @@
 - `okx_client.py`: OKX API 客户端、仓位解析、下单数量计算
 - `binance_um_client.py`: Binance USDⓈ-M / USDC 永续客户端（当前为 one-way + 轮询管理版）
 - `client_factory.py`: 按 `EXCHANGE_PROVIDER` 选择交易所客户端
-- `signals.py`: 三层信号引擎（4H/1H/15m）与止损/目标计算
+- `signals.py`: 当前只保留 `pa_oral_baseline_v1` 的信号组装入口
 - `state_store.py`: 本地状态持久化与日统计
 - `alerts.py`: Telegram/邮件/本地提醒与信号提醒组装
 - `runtime.py`: 实时轮询执行与策略管理
 - `backtest.py`: 回测引擎、进度显示、结果汇总
 - `main.py`: CLI 入口与流程编排
-- `strategy_variant.py`: 策略变体分发/注册层（可扩展入口）
-- `strategy_variant_legacy.py`: 历史策略实现（当前默认逻辑）
+- `strategy_variant.py`: 只保留 oral PA 的策略名规范化与防误用保护
 
 兼容性：
 

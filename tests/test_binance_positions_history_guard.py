@@ -52,7 +52,7 @@ class BinancePositionsHistoryGuardTests(unittest.TestCase):
             "htf_ema_fast": 99.0,
             "htf_ema_slow": 98.0,
             "htf_rsi": 60.0,
-            "strategy_variant": "classic",
+            "strategy_variant": "pa_oral_baseline_v1",
             "location_long_ok": True,
             "location_short_ok": False,
             "fib_touch_long": True,

@@ -150,6 +150,7 @@ class ManagedExitTests(unittest.TestCase):
         self.assertAlmostEqual(r_value, -1.0, places=6)
         self.assertEqual(held, 1)
         self.assertEqual(exit_idx, 1)
+
     def test_long_tp1_then_be_stop(self) -> None:
         candles = [
             _c(0, 100, 100, 100, 100),
@@ -203,6 +204,55 @@ class ManagedExitTests(unittest.TestCase):
         self.assertAlmostEqual(r_value, 2.0, places=6)
         self.assertEqual(held, 2)
         self.assertEqual(exit_idx, 2)
+
+    def test_next_open_entry_can_stop_on_entry_bar(self) -> None:
+        candles = [
+            _c(0, 100, 100, 100, 100),
+            _c(1, 100, 101, 94.5, 96),
+            _c(2, 96, 97, 95, 96),
+        ]
+        outcome, r_value, held, exit_idx = eval_signal_outcome(
+            side="LONG",
+            entry=100.0,
+            stop=95.0,
+            tp1=110.0,
+            tp2=110.0,
+            ltf_candles=candles,
+            start_idx=1,
+            horizon_bars=2,
+            managed_exit=False,
+            include_start_bar=True,
+        )
+        self.assertEqual(outcome, "STOP")
+        self.assertAlmostEqual(r_value, -1.0, places=6)
+        self.assertEqual(held, 0)
+        self.assertEqual(exit_idx, 1)
+
+    def test_time_exit_closes_at_bar_close_after_limit(self) -> None:
+        candles = [
+            _c(0, 100, 100, 100, 100),
+            _c(1, 100, 101, 99.5, 100.2),
+            _c(2, 100.2, 101.0, 99.8, 100.4),
+            _c(3, 100.4, 101.2, 100.0, 100.6),
+            _c(4, 100.6, 101.1, 100.1, 100.8),
+        ]
+        outcome, r_value, held, exit_idx = eval_signal_outcome(
+            side="LONG",
+            entry=100.0,
+            stop=95.0,
+            tp1=120.0,
+            tp2=120.0,
+            ltf_candles=candles,
+            start_idx=1,
+            horizon_bars=4,
+            managed_exit=False,
+            include_start_bar=True,
+            max_hold_bars=2,
+        )
+        self.assertEqual(outcome, "TIME")
+        self.assertAlmostEqual(r_value, (100.6 - 100.0) / 5.0, places=6)
+        self.assertEqual(held, 2)
+        self.assertEqual(exit_idx, 3)
 
 
 if __name__ == "__main__":

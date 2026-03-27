@@ -8,6 +8,7 @@ from typing import Dict, Optional
 from .common import parse_bool, parse_csv, parse_inst_ids
 from .entry_exec_policy import normalize_entry_exec_mode, normalize_entry_limit_fallback_mode
 from .models import Config, StrategyParams
+from .pa_oral_baseline import PA_ORAL_BASELINE_V1
 from .strategy_variant import normalize_strategy_variant
 
 
@@ -83,7 +84,7 @@ def _parse_float_env(
 
 
 def _normalize_strategy_params(params: StrategyParams) -> None:
-    params.strategy_variant = normalize_strategy_variant(getattr(params, "strategy_variant", "classic"))
+    params.strategy_variant = normalize_strategy_variant(getattr(params, "strategy_variant", PA_ORAL_BASELINE_V1))
     if params.min_open_interval_minutes < 0:
         params.min_open_interval_minutes = 0
     if params.leverage < 0:
@@ -174,7 +175,7 @@ def _normalize_strategy_params(params: StrategyParams) -> None:
 
 def _build_base_strategy_params() -> StrategyParams:
     return StrategyParams(
-        strategy_variant=os.getenv("STRAT_VARIANT", "classic").strip(),
+        strategy_variant=os.getenv("STRAT_VARIANT", PA_ORAL_BASELINE_V1).strip(),
         htf_ema_fast_len=int(os.getenv("STRAT_HTF_EMA_FAST_LEN", "50")),
         htf_ema_slow_len=int(os.getenv("STRAT_HTF_EMA_SLOW_LEN", "200")),
         htf_rsi_len=int(os.getenv("STRAT_HTF_RSI_LEN", "14")),
@@ -470,6 +471,18 @@ def _parse_strategy_profile_vote_fallback_profiles(raw: str) -> list[str]:
     return out
 
 
+def _parse_strategy_allowed_variants(raw: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in parse_csv(raw):
+        variant = normalize_strategy_variant(item)
+        if variant in seen:
+            continue
+        seen.add(variant)
+        out.append(variant)
+    return out
+
+
 def _parse_profile_override_value(
     env_key: str,
     raw_value: str,
@@ -618,6 +631,7 @@ def read_config(state_file_override: Optional[str]) -> Config:
     strategy_profile_vote_fallback_profiles = _parse_strategy_profile_vote_fallback_profiles(
         os.getenv("STRAT_PROFILE_VOTE_FALLBACK_PROFILES", "")
     )
+    strategy_allowed_variants = _parse_strategy_allowed_variants(os.getenv("STRAT_ALLOWED_VARIANTS", ""))
     strategy_profiles: Dict[str, StrategyParams] = {"DEFAULT": params}
     profile_ids_needed = set(strategy_profile_map.values())
     for id_list in strategy_profile_vote_map.values():
@@ -736,6 +750,7 @@ def read_config(state_file_override: Optional[str]) -> Config:
         strategy_profile_vote_level_weight=strategy_profile_vote_level_weight,
         strategy_profile_vote_fallback_profiles=strategy_profile_vote_fallback_profiles,
         strategy_profiles=strategy_profiles,
+        strategy_allowed_variants=strategy_allowed_variants,
         exchange_provider=exchange_provider,
         binance_quote_asset=binance_quote_asset,
         binance_recv_window=binance_recv_window,
@@ -847,5 +862,13 @@ def read_config(state_file_override: Optional[str]) -> Config:
     _normalize_strategy_params(cfg.params)
     for profile_id, profile_params in cfg.strategy_profiles.items():
         _normalize_strategy_params(profile_params)
+        if cfg.strategy_allowed_variants:
+            variant = normalize_strategy_variant(getattr(profile_params, "strategy_variant", PA_ORAL_BASELINE_V1))
+            if variant not in cfg.strategy_allowed_variants:
+                allowed = ", ".join(cfg.strategy_allowed_variants)
+                raise ValueError(
+                    f"Profile {profile_id} uses unsupported strategy variant {variant}. "
+                    f"Allowed variants: {allowed}"
+                )
         cfg.strategy_profiles[profile_id] = profile_params
     return cfg

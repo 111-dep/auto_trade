@@ -47,6 +47,10 @@ class VariantSignalInputs:
     current_open: Optional[float] = None
     prev_open: Optional[float] = None
     prev_close: Optional[float] = None
+    prev2_open: Optional[float] = None
+    prev2_close: Optional[float] = None
+    prev3_open: Optional[float] = None
+    prev3_close: Optional[float] = None
     upper_band: Optional[float] = None
     lower_band: Optional[float] = None
     mid_band: Optional[float] = None
@@ -63,6 +67,9 @@ class VariantSignalInputs:
     recent_rsi_min: Optional[float] = None
     recent_rsi_max: Optional[float] = None
     prev_ema_value: Optional[float] = None
+    prev2_ema_value: Optional[float] = None
+    prev3_ema_value: Optional[float] = None
+    prev5_ema_value: Optional[float] = None
     ema_slow_value: Optional[float] = None
     prev_ema_slow_value: Optional[float] = None
     loc_close: Optional[float] = None
@@ -122,6 +129,10 @@ class VariantSignalInputs:
             "current_open": self.current_open,
             "prev_open": self.prev_open,
             "prev_close": self.prev_close,
+            "prev2_open": self.prev2_open,
+            "prev2_close": self.prev2_close,
+            "prev3_open": self.prev3_open,
+            "prev3_close": self.prev3_close,
             "upper_band": self.upper_band,
             "lower_band": self.lower_band,
             "mid_band": self.mid_band,
@@ -138,6 +149,9 @@ class VariantSignalInputs:
             "recent_rsi_min": self.recent_rsi_min,
             "recent_rsi_max": self.recent_rsi_max,
             "prev_ema_value": self.prev_ema_value,
+            "prev2_ema_value": self.prev2_ema_value,
+            "prev3_ema_value": self.prev3_ema_value,
+            "prev5_ema_value": self.prev5_ema_value,
             "ema_slow_value": self.ema_slow_value,
             "prev_ema_slow_value": self.prev_ema_slow_value,
             "loc_close": self.loc_close,

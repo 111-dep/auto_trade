@@ -24,7 +24,7 @@ def _base_row() -> dict:
         "event_ord_id": "222",
         "event_cl_ord_id": "ATLBTC...CLOSE",
         "profile_id": "BTCETH",
-        "strategy_variant": "btceth_smc_a2",
+        "strategy_variant": "pa_oral_baseline_v1",
     }
 
 

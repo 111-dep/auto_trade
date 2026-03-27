@@ -15,6 +15,7 @@ from .common import (
     parse_backtest_levels,
     parse_bool,
     parse_inst_ids,
+    resolve_backtest_live_window_signals,
     round_size,
     set_log_level,
 )
@@ -86,6 +87,19 @@ def main() -> int:
         "--bt-managed-exit",
         action="store_true",
         help="Backtest managed exit: TP1 partial + remaining TP2 + BE/fee-buffer stop",
+    )
+    parser.set_defaults(bt_live_window_signals=None)
+    parser.add_argument(
+        "--bt-live-window-signals",
+        dest="bt_live_window_signals",
+        action="store_true",
+        help="Build backtest signals with the same rolling candle window as live runtime",
+    )
+    parser.add_argument(
+        "--bt-fast-signals",
+        dest="bt_live_window_signals",
+        action="store_false",
+        help="Use fast precomputed signal path in backtest (faster, but less parity-safe)",
     )
     parser.add_argument(
         "--bt-send-telegram",
@@ -172,6 +186,7 @@ def main() -> int:
             bt_require_tp_sl = bool(args.bt_require_tp_sl)
             bt_tp1_only = bool(args.bt_tp1_only)
             bt_managed_exit = bool(args.bt_managed_exit)
+            bt_live_window_signals = resolve_backtest_live_window_signals(args.bt_live_window_signals)
             inst_ids = parse_inst_ids(args.bt_inst_ids) or cfg.inst_ids
             compare_levels = parse_backtest_levels(args.bt_compare_levels)
 
@@ -201,6 +216,7 @@ def main() -> int:
                         bt_require_tp_sl=bt_require_tp_sl,
                         bt_tp1_only=bt_tp1_only,
                         bt_managed_exit=bt_managed_exit,
+                        bt_live_window_signals=bt_live_window_signals,
                     )
                     results = [one]
                 else:
@@ -219,6 +235,7 @@ def main() -> int:
                         bt_require_tp_sl=bt_require_tp_sl,
                         bt_tp1_only=bt_tp1_only,
                         bt_managed_exit=bt_managed_exit,
+                        bt_live_window_signals=bt_live_window_signals,
                     )
             else:
                 max_level = cfg.alert_max_level if max_level_cli <= 0 else max_level_cli
@@ -236,6 +253,7 @@ def main() -> int:
                     bt_require_tp_sl=bt_require_tp_sl,
                     bt_tp1_only=bt_tp1_only,
                     bt_managed_exit=bt_managed_exit,
+                    bt_live_window_signals=bt_live_window_signals,
                 )
                 results = [one]
 

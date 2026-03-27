@@ -189,6 +189,7 @@ class Config:
     strategy_profile_vote_level_weight: float
     strategy_profile_vote_fallback_profiles: List[str]
     strategy_profiles: Dict[str, StrategyParams]
+    strategy_allowed_variants: List[str]
     exchange_provider: str
     binance_quote_asset: str
     binance_recv_window: int

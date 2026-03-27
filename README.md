@@ -235,15 +235,15 @@ tail -f "$ROOT/trade_journal_order_links.csv"
 
 ```env
 STRAT_PROFILE_INST_GROUPS=BTCETH:BTC-USDT-SWAP;ALT:SOL-USDT-SWAP,DOGE-USDT-SWAP
-STRAT_PROFILE_BTCETH_VARIANT=btceth_smc_a2
-STRAT_PROFILE_ALT_VARIANT=classic
+STRAT_PROFILE_BTCETH_VARIANT=pa_oral_baseline_v1
+STRAT_PROFILE_ALT_VARIANT=pa_oral_baseline_v1
 ```
 
 ### 5.2 按“币种 -> 策略”兼容映射
 
 ```env
 STRAT_PROFILE_MAP=BTC-USDT-SWAP:BTCETH
-STRAT_PROFILE_BTCETH_VARIANT=btceth_smc_a2
+STRAT_PROFILE_BTCETH_VARIANT=pa_oral_baseline_v1
 ```
 
 ### 5.3 同币多策略投票

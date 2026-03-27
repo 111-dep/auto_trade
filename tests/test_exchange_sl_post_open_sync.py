@@ -117,7 +117,7 @@ class ExchangeStopSyncTests(unittest.TestCase):
             "htf_ema_fast": 95.0,
             "htf_ema_slow": 97.0,
             "htf_rsi": 44.0,
-            "strategy_variant": "classic",
+            "strategy_variant": "pa_oral_baseline_v1",
             "location_long_ok": False,
             "location_short_ok": True,
             "fib_touch_long": False,

@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import unittest
 
+from okx_trader.decision_core import EntryDecision
 from run_interleaved_backtest_2y import (
+    _clip_entry_decision_to_window,
     _count_open_l3_side_positions,
+    _open_risk_cap_allows,
     _position_potential_loss_usdt,
+    _resolve_interleaved_window_bounds,
     _sum_open_positions_potential_loss,
 )
 
@@ -68,6 +72,60 @@ class ProjectedOpenRiskTests(unittest.TestCase):
         }
         # BTC contributes 10, ETH contributes 0 (hard_stop above entry on long).
         self.assertAlmostEqual(_sum_open_positions_potential_loss(open_positions), 10.0, places=6)
+
+    def test_open_risk_cap_allows_exact_boundary(self) -> None:
+        open_positions = {
+            "BTC-USDT-SWAP": {
+                "side": "LONG",
+                "entry": 100.0,
+                "risk": 5.0,
+                "hard_stop": 95.0,
+                "qty_rem": 1.0,
+                "risk_amt": 10.0,
+            }
+        }
+        self.assertTrue(
+            _open_risk_cap_allows(
+                open_positions,
+                equity=1000.0,
+                candidate_loss_usdt=50.0,
+                max_open_risk_frac=0.06,
+            )
+        )
+        self.assertFalse(
+            _open_risk_cap_allows(
+                open_positions,
+                equity=1000.0,
+                candidate_loss_usdt=50.0001,
+                max_open_risk_frac=0.06,
+            )
+        )
+
+    def test_resolve_interleaved_window_bounds_with_explicit_range(self) -> None:
+        ltf_ts = [0, 900_000, 1_800_000, 2_700_000, 3_600_000, 4_500_000]
+        start_idx, timeline_end_exclusive, final_close_i = _resolve_interleaved_window_bounds(
+            ltf_ts,
+            bars=6,
+            start_ts_ms=900_000,
+            end_ts_ms=3_600_000,
+        )
+        self.assertEqual(start_idx, 1)
+        self.assertEqual(timeline_end_exclusive, 4)
+        self.assertEqual(final_close_i, 4)
+
+    def test_clip_entry_decision_to_window(self) -> None:
+        decision = EntryDecision(
+            side="LONG",
+            level=1,
+            entry=100.0,
+            stop=95.0,
+            risk=5.0,
+            tp1=110.0,
+            tp2=120.0,
+            entry_idx=5,
+        )
+        self.assertIsNone(_clip_entry_decision_to_window(decision, max_entry_i=4))
+        self.assertIs(_clip_entry_decision_to_window(decision, max_entry_i=5), decision)
 
     def test_count_open_l3_same_side_positions(self) -> None:
         open_positions = {

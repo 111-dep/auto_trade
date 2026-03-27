@@ -73,7 +73,7 @@ class ConfigProfileGroupsTests(unittest.TestCase):
         env = {
             "OKX_INST_IDS": "BTC-USDT-SWAP,SOL-USDT-SWAP",
             "STRAT_PROFILE_VOTE_INST_GROUPS": "DEFAULT+RIGHTREV:SOL-USDT-SWAP",
-            "STRAT_PROFILE_RIGHTREV_VARIANT": "right_reversal_v1",
+            "STRAT_PROFILE_RIGHTREV_VARIANT": "pa_oral_baseline_v1",
             "STRAT_PROFILE_VOTE_FALLBACK_PROFILES": "RIGHTREV",
         }
         with patch.dict(os.environ, env, clear=True):
@@ -93,6 +93,17 @@ class ConfigProfileGroupsTests(unittest.TestCase):
         self.assertFalse(cfg.params.split_tp_on_entry)
         self.assertTrue(cfg.strategy_profiles["BTCETH"].split_tp_on_entry)
         self.assertFalse(cfg.strategy_profiles["DEFAULT"].split_tp_on_entry)
+
+    def test_allowed_variants_rejects_profile_outside_whitelist(self) -> None:
+        env = {
+            "OKX_INST_IDS": "BTC-USDT-SWAP",
+            "STRAT_ALLOWED_VARIANTS": "pa_oral_baseline_v1",
+            "STRAT_PROFILE_INST_GROUPS": "ALT:BTC-USDT-SWAP",
+            "STRAT_PROFILE_ALT_VARIANT": "right_reversal_v1",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaisesRegex(ValueError, "Unsupported strategy variant|unsupported strategy variant"):
+                read_config(None)
 
 
 if __name__ == "__main__":

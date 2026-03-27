@@ -4,7 +4,7 @@ import datetime as dt
 import hashlib
 import math
 import os
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 _LOG_LEVEL_MAP = {
     "DEBUG": 10,
@@ -143,6 +143,15 @@ def apply_backtest_env_overrides() -> List[str]:
             changes.append(f"history_cache_ttl={prev or '-'}->{ttl}")
 
     return changes
+
+
+def resolve_backtest_live_window_signals(cli_value: Optional[bool] = None) -> bool:
+    if cli_value is not None:
+        return bool(cli_value)
+    raw = str(os.getenv("OKX_BACKTEST_LIVE_WINDOW_SIGNALS", "") or "").strip()
+    if raw:
+        return parse_bool(raw, True)
+    return True
 
 
 def bar_to_seconds(bar: str) -> int:

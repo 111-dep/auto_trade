@@ -5,9 +5,25 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from .indicators import atr, bollinger, ema, macd, rolling_high, rolling_low, rsi
 from .models import Candle, StrategyParams
+from .pa_oral_baseline import PA_ORAL_BASELINE_V1, build_pa_oral_signal_snapshot, is_pa_oral_baseline_variant
 from .signal_contract import SignalSnapshot
 from .strategy_contract import VariantSignalInputs
 from .strategy_variant import resolve_variant_signal_state_from_inputs
+
+_VARIANT_SIGNAL_EXTRA_KEYS = (
+    "entry_on_next_open",
+    "max_stop_pct",
+    "tp1_r_override",
+    "tp2_r_override",
+    "tp1_only_override",
+    "tp1_close_pct_override",
+    "tp2_close_rest_override",
+    "be_trigger_r_mult_override",
+    "auto_tighten_stop_override",
+    "trail_after_tp1_override",
+    "signal_exit_enabled_override",
+    "max_hold_bars",
+)
 
 
 def _prev_utc_day_hlc_and_today_range(
@@ -100,6 +116,22 @@ def _latest_completed_hour_context(
 def build_signals(
     htf_candles: List[Candle], loc_candles: List[Candle], ltf_candles: List[Candle], p: StrategyParams
 ) -> Dict[str, Any]:
+    if is_pa_oral_baseline_variant(getattr(p, "strategy_variant", "")):
+        oral = build_pa_oral_signal_snapshot(htf_candles=htf_candles, ltf_candles=ltf_candles)
+        oral_payload = {
+            "signal_ts_ms": int(ltf_candles[-1].ts_ms) if ltf_candles else 0,
+            "signal_confirm": bool(ltf_candles[-1].confirm) if ltf_candles else True,
+            "htf_ts_ms": int(htf_candles[-1].ts_ms) if htf_candles else 0,
+            "loc_ts_ms": int(loc_candles[-1].ts_ms) if loc_candles else 0,
+        }
+        oral_payload.update(dict(oral))
+        return SignalSnapshot.from_dict(oral_payload).to_dict()
+
+    raise RuntimeError(
+        f"Unsupported strategy variant {getattr(p, 'strategy_variant', '')}. "
+        f"Only {PA_ORAL_BASELINE_V1} is available."
+    )
+
     min_htf = max(p.htf_ema_slow_len + 2, p.htf_rsi_len + 2)
     min_loc = max(p.loc_lookback + 2, p.loc_recent_bars + 2, p.loc_sr_lookback + p.loc_recent_bars + 2)
     min_ltf = max(
@@ -314,6 +346,10 @@ def build_signals(
         current_open=float(opens[idx]) if idx >= 0 else None,
         prev_open=float(opens[idx - 1]) if idx >= 1 else None,
         prev_close=float(closes[idx - 1]) if idx >= 1 else None,
+        prev2_open=float(opens[idx - 2]) if idx >= 2 else None,
+        prev2_close=float(closes[idx - 2]) if idx >= 2 else None,
+        prev3_open=float(opens[idx - 3]) if idx >= 3 else None,
+        prev3_close=float(closes[idx - 3]) if idx >= 3 else None,
         upper_band=float(upper) if upper is not None else None,
         lower_band=float(lower) if lower is not None else None,
         mid_band=float(bb_mid[idx]) if bb_mid[idx] is not None else None,
@@ -330,6 +366,9 @@ def build_signals(
         recent_rsi_min=float(recent_rsi_min) if recent_rsi_min is not None else None,
         recent_rsi_max=float(recent_rsi_max) if recent_rsi_max is not None else None,
         prev_ema_value=float(ema_20_line[idx - 1]) if idx >= 1 and ema_20_line[idx - 1] is not None else None,
+        prev2_ema_value=float(ema_line[idx - 2]) if idx >= 2 and ema_line[idx - 2] is not None else None,
+        prev3_ema_value=float(ema_line[idx - 3]) if idx >= 3 and ema_line[idx - 3] is not None else None,
+        prev5_ema_value=float(ema_line[idx - 5]) if idx >= 5 and ema_line[idx - 5] is not None else None,
         ema_slow_value=float(em50) if em50 is not None else None,
         prev_ema_slow_value=float(ema_50_line[idx - 1]) if idx >= 1 and ema_50_line[idx - 1] is not None else None,
         loc_close=float(loc_close),
@@ -384,7 +423,7 @@ def build_signals(
         "htf_ema_fast": h_ema_fast,
         "htf_ema_slow": h_ema_slow,
         "htf_rsi": h_rsi,
-        "strategy_variant": str(variant_state.get("variant", "classic")),
+        "strategy_variant": str(variant_state.get("variant", PA_ORAL_BASELINE_V1)),
         "trend_sep": float(variant_state.get("trend_sep", 0.0)),
         "loc_high": loc_high,
         "loc_low": loc_low,
@@ -439,6 +478,9 @@ def build_signals(
         "long_exit": bool(long_exit),
         "short_exit": bool(short_exit),
     }
+    for key in _VARIANT_SIGNAL_EXTRA_KEYS:
+        if key in variant_state:
+            payload[key] = variant_state[key]
     return SignalSnapshot.from_dict(payload).to_dict()
 
 
